@@ -214,4 +214,4 @@ Based on StarDist:
 
 ## Contact
 
-Issues and questions: [GitHub Issues](https://github.com/YOUR_USERNAME/Multi-Nuclear-Stardist-2D-3D/issues)
+mayurovm@gmail.com
