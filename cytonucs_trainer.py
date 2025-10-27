@@ -57,13 +57,13 @@ class CytoNucsTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     @tf.function
-    def train_step(self, x_batch, y_batch):
+    def train_step(self, x_batch, y_batch_dict):
         """
         Single training step.
 
         Args:
             x_batch: (B, Z, Y, X, C) input images
-            y_batch: dict with target maps and instances
+            y_batch_dict: dict with target maps (already converted to tensors)
 
         Returns:
             loss: scalar loss value
@@ -72,8 +72,9 @@ class CytoNucsTrainer:
             # Forward pass
             y_pred = self.model.keras_model(x_batch, training=True)
 
-            # Compute loss (assignments handled separately in numpy)
-            loss = self.loss_fn(y_batch, y_pred, assignments=None)
+            # Compute loss
+            # Note: assignments are in y_batch but not tensors, passed separately
+            loss = self.loss_fn(y_batch_dict, y_pred, assignments=None)
 
         # Backward pass
         gradients = tape.gradient(loss, self.model.keras_model.trainable_variables)
@@ -162,6 +163,52 @@ class CytoNucsTrainer:
             self.history['lr'].append(float(self.optimizer.learning_rate.numpy()))
 
             print(f"Train Loss: {train_loss:.4f}")
+            # ========== ДОБАВИТЬ ЭТО ==========
+            # Детальный мониторинг компонентов loss (каждую 1 эпоху)
+            if (epoch + 1) % 1 == 0:
+                try:
+                    # Получить один батч для анализа
+                    x_sample, y_sample = train_generator[0]
+                    x_sample_tf = tf.convert_to_tensor(x_sample, dtype=tf.float32)
+                    y_sample_tf = {
+                        k: tf.convert_to_tensor(v, dtype=tf.float32)
+                        for k, v in y_sample.items()
+                        if k not in ['nucleus_instances', 'cytoplasm_instances', 'assignments']
+                    }
+                    y_pred_sample = self.model.keras_model(x_sample_tf, training=False)
+
+                    # Вычислить компоненты loss
+                    loss_nuc = self.loss_fn.stardist_loss(
+                        y_sample_tf['nucleus_prob'], y_pred_sample['nucleus_prob'],
+                        y_sample_tf['nucleus_dist'], y_pred_sample['nucleus_dist'], 'nucleus'
+                    )
+                    loss_cyto = self.loss_fn.stardist_loss(
+                        y_sample_tf['cytoplasm_prob'], y_pred_sample['cytoplasm_prob'],
+                        y_sample_tf['cytoplasm_dist'], y_pred_sample['cytoplasm_dist'], 'cytoplasm'
+                    )
+                    loss_wbr_val = self.loss_fn.wbr_loss(
+                        y_pred_sample['nucleus_prob'], y_pred_sample['cytoplasm_prob']
+                    )
+
+                    print(f"  └─ Loss components:")
+                    print(
+                        f"     • Nucleus BCE: {loss_nuc['bce'].numpy():.4f}, Distance: {loss_nuc['distance'].numpy():.4f}")
+                    print(
+                        f"     • Cytoplasm BCE: {loss_cyto['bce'].numpy():.4f}, Distance: {loss_cyto['distance'].numpy():.4f}")
+                    print(f"     • WBR penalty: {loss_wbr_val.numpy():.4f}")
+
+                    # Лог в Comet если включен
+                    if experiment:
+                        experiment.log_metrics({
+                            'nucleus_bce': float(loss_nuc['bce'].numpy()),
+                            'nucleus_distance': float(loss_nuc['distance'].numpy()),
+                            'cytoplasm_bce': float(loss_cyto['bce'].numpy()),
+                            'cytoplasm_distance': float(loss_cyto['distance'].numpy()),
+                            'wbr_penalty': float(loss_wbr_val.numpy()),
+                        }, epoch=epoch + 1)
+                except Exception as e:
+                    print(f"  └─ Could not compute loss components: {e}")
+            # ========== КОНЕЦ ДОБАВЛЕНИЯ ==========
 
             # Log to Comet
             if experiment:
