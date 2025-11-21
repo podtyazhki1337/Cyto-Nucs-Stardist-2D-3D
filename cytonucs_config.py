@@ -3,7 +3,7 @@ CytoNucs StarDist Configuration
 Unified config for 2D/3D cytoplasm + nucleus segmentation
 """
 from stardist.models import Config2D, Config3D
-from stardist import Rays_GoldenSpiral
+
 import numpy as np
 import json
 from pathlib import Path
@@ -34,7 +34,7 @@ class CytoNucsConfig:
             # Training patches
             train_patch_size=(16, 128, 128),  # (Z,Y,X) for 3D or (Y,X) for 2D
             train_batch_size=2,
-
+            mode='train',
             # Loss weights
             lambda_prob_nucleus=1.0,
             lambda_dist_nucleus=1.0,
@@ -42,29 +42,43 @@ class CytoNucsConfig:
             lambda_dist_cytoplasm=1.0,
             lambda_containment=0.5,  # nucleus inside cell
             lambda_wbr=0.3,  # within-boundary regularization
-            lambda_consistency=0.0,  # cell center near nuclei cluster
+            lambda_variance=0.5,  # NEW: variance regularization
+            lambda_consistency=0.0,
             enable_consistency=False,  # explicitly enable/disable
-
+            lambda_area_cytoplasm=0.1,
             # Containment loss params
             containment_margin=2.0,  # allow small margin (voxels)
             max_assignment_distance=5.0,  # max distance for nucleus-cell pairing (voxels)
-
+            prob_thresh_cytoplasm=0.4,
+            prob_thresh_nucleus=0.5,
             # WBR params
             wbr_sigma=2.0,  # gaussian smoothing for boundary detection
-
+            wbr_warmup_epochs=5,
             # Training
             use_gpu=False,
             train_epochs=400,
             train_steps_per_epoch=100,
             train_learning_rate=3e-4,
-
+            save_every_n_epochs=10,
+            median_radius_train=None,  # Медианный радиус из training data
+            scale_factor_nucleus=None,  # Или напрямую scale_factor
+            scale_factor_cytoplasm=None,
+            lambda_fragmentation=0.0,
+            lambda_background_penalty=0.0,
             **kwargs
     ):
         self.ndim = ndim
         self.n_rays = n_rays
         self.grid = grid
+        self.nucleus_grid = kwargs.get('nucleus_grid', grid)
+        self.cytoplasm_grid = kwargs.get('cytoplasm_grid', grid)
         self.anisotropy = anisotropy if anisotropy is not None else (1,) * ndim
         self.n_channel_in = n_channel_in
+
+        # Проверка и исправление anisotropy
+        if len(self.anisotropy) != self.ndim:
+            print(f"⚠️  Fixing anisotropy: {self.anisotropy} -> {(1,)*self.ndim}")
+            self.anisotropy = (1,) * self.ndim
 
         # Architecture
         self.backbone = backbone
@@ -81,28 +95,92 @@ class CytoNucsConfig:
         self.lambda_dist_cytoplasm = lambda_dist_cytoplasm
         self.lambda_containment = lambda_containment
         self.lambda_wbr = lambda_wbr
+        self.lambda_area_cytoplasm=lambda_area_cytoplasm
+        self.lambda_variance = lambda_variance  # NEW
         self.lambda_consistency = lambda_consistency if enable_consistency else 0.0
         self.enable_consistency = enable_consistency
-
+        self.mode=mode
         # Containment
         self.containment_margin = containment_margin
         self.max_assignment_distance = max_assignment_distance
 
         # WBR
         self.wbr_sigma = wbr_sigma
-
+        self.wbr_warmup_epochs=wbr_warmup_epochs
+        self.median_radius_train = median_radius_train
+        self.scale_factor_nucleus = scale_factor_nucleus
+        self.scale_factor_cytoplasm = scale_factor_cytoplasm
         # Training
         self.use_gpu = use_gpu
         self.train_epochs = train_epochs
         self.train_steps_per_epoch = train_steps_per_epoch
         self.train_learning_rate = train_learning_rate
-
+        self.save_every_n_epochs = save_every_n_epochs
         # Generate rays based on anisotropy
-        self.rays = Rays_GoldenSpiral(n_rays, anisotropy=self.anisotropy)
+
+        self.prob_thresh_cytoplasm=prob_thresh_cytoplasm
+        self.prob_thresh_nucleus=prob_thresh_nucleus
+        self.lambda_fragmentation=lambda_fragmentation
+        self.lambda_background_penalty=lambda_background_penalty
+
+        if self.ndim == 2:
+            # ДЛЯ 2D: StarDist использует Config2D, который внутри создаёт лучи
+            # через Rays_GoldenSpiral с anisotropy=(1,1)
+            # Мы делаем то же самое:
+
+            from stardist.rays3d import Rays_GoldenSpiral as RaysBase
+
+            # ХИТРОСТЬ: Rays_GoldenSpiral для 2D создаётся с ndim=2
+            # Но класс Rays_GoldenSpiral ожидает 3D вершины.
+            # Поэтому используем ОБХОДНОЙ ПУТЬ через numpy:
+
+            import numpy as np
+
+            # Создаём углы равномерно на окружности (как в StarDist для 2D)
+            phi = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
+
+            # Координаты на единичной окружности (Y, X)
+            # В StarDist 2D первый луч направлен ВВЕРХ: [0, -1]
+            vertices_2d = np.stack([
+                np.sin(phi),  # Y координата
+                -np.cos(phi)  # X координата (инвертирована для "вверх")
+            ], axis=-1).astype(np.float32)
+
+            # Простой класс-обёртка (как внутри StarDist)
+            class Rays2D:
+                def __init__(self, vertices):
+                    self.vertices = np.array(vertices, dtype=np.float32)
+                    self.ndim = 2
+
+                def __len__(self):
+                    return len(self.vertices)
+
+                def dist_loss_weights(self, anisotropy=None):
+                    # Для совместимости с StarDist
+                    return np.ones(len(self.vertices), dtype=np.float32)
+
+            self.rays = Rays2D(vertices_2d)
+
+            print(f"✅ Created 2D rays (like train.py): {n_rays} rays")
+            print(f"   Vertices shape: {self.rays.vertices.shape}")
+            print(f"   Ray 0 (should point UP): {self.rays.vertices[0]}")
+
+        else:  # 3D
+
+            from stardist import Rays_GoldenSpiral
+
+            self.rays = Rays_GoldenSpiral(n_rays, anisotropy=self.anisotropy)
+
+            print(f"✅ Created 3D rays (like train.py): {n_rays} rays")
+            print(f"   Anisotropy: {self.anisotropy}")
+            print(f"   Vertices shape: {self.rays.vertices.shape}")
+            print(f"   Ray 0: {self.rays.vertices[0]}")
 
         # Store additional kwargs
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+
 
     @classmethod
     def from_json(cls, json_path):
