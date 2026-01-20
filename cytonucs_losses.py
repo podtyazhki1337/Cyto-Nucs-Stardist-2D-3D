@@ -17,7 +17,7 @@ class CytoNucsLoss:
         self.config = config
         self.ndim = config.ndim
         self.epsilon = 1e-6
-
+        self.model = None
         # Существующие веса
         self.lambda_wbr = config.lambda_wbr
         self.lambda_containment = config.lambda_containment
@@ -41,9 +41,17 @@ class CytoNucsLoss:
     def __call__(self, y_true_raw, y_pred):
         cfg = self.config
 
+        # === ПОЛУЧЕНИЕ ТЕКУЩЕЙ ЭПОХИ (ПРОСТОЙ СПОСОБ) ===
+        # Keras автоматически увеличивает эту метрику
+        try:
+            current_epoch = int(self.model.history.epoch[-1]) + 1 if hasattr(self,
+                                                                             'model') and self.model.history.epoch else 0
+        except:
+            current_epoch = 0
+
         y_true = self._create_gt_from_instances(y_true_raw)
 
-        # === 1. StarDist Loss (БЕЗ ИЗМЕНЕНИЙ) ===
+        # === 1. StarDist Loss ===
         loss_nucleus = self._stardist_loss(
             y_true['nucleus_prob'], y_pred['nucleus_prob'],
             y_true['nucleus_dist'], y_pred['nucleus_dist'],
@@ -56,26 +64,21 @@ class CytoNucsLoss:
             name='cytoplasm'
         )
 
-        # === 2. WBR (БЕЗ ИЗМЕНЕНИЙ) ===
+        # === 2. WBR ===
         wbr_raw = self._wbr_loss(y_pred['nucleus_prob'], y_pred['cytoplasm_prob'])
         warmup_epochs = getattr(cfg, 'wbr_warmup_epochs', 5)
-        current_epoch = getattr(self, 'current_epoch', 0)
 
         if current_epoch < warmup_epochs:
-            wbr_factor = current_epoch / warmup_epochs
+            wbr_factor = current_epoch / max(warmup_epochs, 1)  # защита от деления на 0
         else:
             wbr_factor = 1.0
 
         loss_wbr = self.lambda_wbr * wbr_factor * wbr_raw
 
-        # === 3. Containment (БЕЗ ИЗМЕНЕНИЙ) ===
+        # === 3. Containment ===
         loss_containment = self._containment_loss(y_true, y_pred, y_true_raw)
 
-        # ============================================================
-        # === 4. НОВЫЕ LOSSES ===
-        # ============================================================
-
-        # 4a. Fragmentation Loss (штраф за несколько peaks на одном GT)
+        # === 4. Fragmentation Loss (среднее по nucleus + cytoplasm) ===
         loss_fragmentation = tf.constant(0.0, dtype=tf.float32)
         if self.lambda_fragmentation > 0:
             loss_frag_nuc = self._fragmentation_loss(
@@ -90,7 +93,7 @@ class CytoNucsLoss:
             )
             loss_fragmentation = self.lambda_fragmentation * (loss_frag_nuc + loss_frag_cyto) / 2.0
 
-        # 4b. Background Penalty (усиленный штраф за FP на фоне)
+        # === 5. Background Penalty (среднее по nucleus + cytoplasm) ===
         loss_background = tf.constant(0.0, dtype=tf.float32)
         if self.lambda_background_penalty > 0:
             loss_bg_nuc = self._background_penalty_loss(
@@ -105,10 +108,7 @@ class CytoNucsLoss:
             )
             loss_background = self.lambda_background_penalty * (loss_bg_nuc + loss_bg_cyto) / 2.0
 
-        # ============================================================
         # === TOTAL LOSS ===
-        # ============================================================
-
         total_loss = (
                 cfg.lambda_prob_nucleus * loss_nucleus['bce'] +
                 cfg.lambda_dist_nucleus * loss_nucleus['distance'] +
@@ -116,8 +116,8 @@ class CytoNucsLoss:
                 cfg.lambda_dist_cytoplasm * loss_cytoplasm['distance'] +
                 loss_wbr +
                 self.lambda_containment * loss_containment +
-                loss_fragmentation +  # ← НОВОЕ
-                loss_background  # ← НОВОЕ
+                loss_fragmentation +
+                loss_background
         )
 
         # Debug
@@ -126,7 +126,7 @@ class CytoNucsLoss:
         self._loss_call_count += 1
 
         if self._loss_call_count < 10 or self._loss_call_count % 100 == 0:
-            tf.print("\n=== LOSS (epoch", current_epoch, ") ===")
+            tf.print("\n=== LOSS (epoch", current_epoch + 1, ", step", self._loss_call_count, ") ===")
             tf.print("  Nucleus BCE:", loss_nucleus['bce'], "| Dist:", loss_nucleus['distance'])
             tf.print("  Cytoplasm BCE:", loss_cytoplasm['bce'], "| Dist:", loss_cytoplasm['distance'])
             tf.print("  WBR:", loss_wbr, "(factor", wbr_factor, ")")
@@ -134,7 +134,7 @@ class CytoNucsLoss:
             if self.lambda_fragmentation > 0:
                 tf.print("  Fragmentation:", loss_fragmentation)
             if self.lambda_background_penalty > 0:
-                tf.print("  Background Penalty:", loss_background)
+                tf.print("  Background:", loss_background)
             tf.print("  TOTAL:", total_loss)
 
         return total_loss
@@ -186,12 +186,18 @@ class CytoNucsLoss:
 
     def _star_dist_wrapper_nucleus(self, instances):
         """Wrapper для nucleus с нормализацией"""
-        expected_max_radius = getattr(self.config, 'median_max_dist_nucleus', 20.0)
+        expected_max_radius = getattr(self.config, 'median_max_dist_nucleus', None)
+        if expected_max_radius is None:
+            # Auto-detect from data
+            expected_max_radius = 20.0  # fallback
         return self._star_dist_wrapper_internal(instances, expected_max_radius)
 
     def _star_dist_wrapper_cytoplasm(self, instances):
         """Wrapper для cytoplasm с нормализацией"""
-        expected_max_radius = getattr(self.config, 'median_max_dist_cytoplasm', 50.0)
+        expected_max_radius = getattr(self.config, 'median_max_dist_cytoplasm', None)
+        if expected_max_radius is None:
+            # Auto-detect from data
+            expected_max_radius = 50.0  # fallback
         return self._star_dist_wrapper_internal(instances, expected_max_radius)
 
     def _star_dist_wrapper_internal(self, instances, expected_max_radius):
@@ -438,16 +444,19 @@ class CytoNucsLoss:
             nuc_prob_gt=nuc_prob_gt,
             median_radius=median_radius
         )
-
+        # 4. CYTOPLASM SUPPORT: push cyto_prob up on GT nucleus regions
+        # Penalizes low cytoplasm probability where GT nuclei exist
+        loss_cyto_support = tf.reduce_mean((1.0 - cyto_prob) * nuc_fg)
         # COMBINE
         w_geometric = getattr(self.config, 'w_containment_geometric', 1.0)
         w_distance = getattr(self.config, 'w_containment_distance', 0.5)
         w_separation = getattr(self.config, 'w_center_separation', 0.2)
-
+        w_cyto_support = getattr(self.config, 'w_cyto_support', 0.1)
         total_containment_loss = (
-            w_geometric * loss_geometric +
-            w_distance * loss_distance_containment +
-            w_separation * loss_separation
+                w_geometric * loss_geometric +
+                w_distance * loss_distance_containment +
+                w_separation * loss_separation +
+                w_cyto_support * loss_cyto_support
         )
 
         return total_containment_loss

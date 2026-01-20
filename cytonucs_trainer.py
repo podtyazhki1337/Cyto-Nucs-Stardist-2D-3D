@@ -13,26 +13,46 @@ import json
 from cytonucs_inference import CytoNucsPredictor
 from stardist.matching import matching_dataset
 
+
 def _calculate_ap(precision, recall):
     """
     Calculate average precision from precision and recall values.
-    This is the implementation from the stardist library.
+    Expects precision and recall to be arrays of values in [0, 1].
     """
-    # === ИСПРАВЛЕНИЕ: Очистка данных от нечисловых значений ===
-    # Заменяем все, что не является числом (например, строки 'n/a'), на 0.0
-    precision = np.array([p if isinstance(p, (int, float)) else 0.0 for p in precision])
-    recall = np.array([r if isinstance(r, (int, float)) else 0.0 for r in recall])
-    # ==========================================================
+    # Очистка и преобразование
+    precision = np.array([p if isinstance(p, (int, float)) and not np.isnan(p) else 0.0 for p in precision])
+    recall = np.array([r if isinstance(r, (int, float)) and not np.isnan(r) else 0.0 for r in recall])
 
-    # Append end points
-    precision = np.concatenate(([0.], precision, [0.]))
+    # === ВАЖНАЯ ПРОВЕРКА: нормализация, если данные > 1 ===
+    if len(precision) > 0 and np.max(precision) > 1.0:
+        print(f"⚠️ WARNING: precision contains values > 1.0 (max={np.max(precision)}), normalizing...")
+        precision = precision / np.max(precision)
+
+    if len(recall) > 0 and np.max(recall) > 1.0:
+        print(f"⚠️ WARNING: recall contains values > 1.0 (max={np.max(recall)}), normalizing...")
+        recall = recall / np.max(recall)
+
+    # Проверка на пустые массивы
+    if len(precision) == 0 or len(recall) == 0:
+        return 0.0
+
+    # Сортировка по recall
+    sorted_indices = np.argsort(recall)
+    recall = recall[sorted_indices]
+    precision = precision[sorted_indices]
+
+    # Добавление конечных точек
+    precision = np.concatenate(([1.], precision, [0.]))
     recall = np.concatenate(([0.], recall, [1.]))
-    # Preprocess precision
+
+    # Интерполяция precision (максимум справа)
     for i in range(len(precision) - 2, -1, -1):
         precision[i] = np.maximum(precision[i], precision[i + 1])
-    # Compute area under curve
+
+    # Вычисление площади под кривой
     x = np.where(recall[1:] != recall[:-1])[0] + 1
     ap = np.sum((recall[x] - recall[x - 1]) * precision[x])
+
     return ap
 
 class CytoNucsTrainer:
@@ -40,7 +60,7 @@ class CytoNucsTrainer:
     Custom trainer for CytoNucs StarDist model.
     """
 
-    def __init__(self, model, config, loss_fn, optimizer=None):
+    def __init__(self, model, config, loss_fn, gradient_clip_norm, optimizer=None):
         """
         Args:
             model: CytoNucsStarDistModel instance
@@ -52,13 +72,18 @@ class CytoNucsTrainer:
         self.config = config
         self.loss_fn = loss_fn
         self.current_step = 0
+
         # Setup optimizer
         if optimizer is None:
+            lr_decay_steps = getattr(config, 'lr_decay_steps', 700)
+            lr_decay_rate = getattr(config, 'lr_decay_rate', 0.5)
+            lr_staircase = getattr(config, 'lr_staircase', True)
+
             schedule = ExponentialDecay(
                 initial_learning_rate=config.train_learning_rate,
-                decay_steps=700,
-                decay_rate=0.5,
-                staircase=True
+                decay_steps=lr_decay_steps,
+                decay_rate=lr_decay_rate,
+                staircase=lr_staircase
             )
             # ИСПРАВЛЕНО: БЕЗ clipnorm (будет применяться clip_by_global_norm вручную)
             self.optimizer = Adam(learning_rate=schedule)
@@ -104,7 +129,7 @@ class CytoNucsTrainer:
                 valid_vars.append(var)
 
         # Gradient clipping
-        clip_norm = 5.0
+        clip_norm =  getattr(self.config, 'gradient_clip_norm', 10)
         clipped_gradients, global_norm = tf.clip_by_global_norm(valid_gradients, clip_norm)
 
         # Debug
@@ -121,51 +146,7 @@ class CytoNucsTrainer:
         return loss
 
 
-    def _create_targets_from_masks(self, y_batch_dict):
-        """
-        Конвертирует instance masks в prob/dist targets.
-        Вызывается на CPU в Python для каждого батча.
-        """
-        nucleus_instances = y_batch_dict['nucleus_instances'].numpy()
-        cytoplasm_instances = y_batch_dict['cytoplasm_instances'].numpy()
 
-        batch_size = nucleus_instances.shape[0]
-
-        # Инициализация
-        if self.config.ndim == 3:
-            prob_shape = (*nucleus_instances.shape[1:], 1)
-            dist_shape = (*nucleus_instances.shape[1:], self.config.n_rays)
-        else:
-            prob_shape = (*nucleus_instances.shape[1:], 1)
-            dist_shape = (*nucleus_instances.shape[1:], self.config.n_rays)
-
-        nucleus_prob_batch = np.zeros((batch_size, *prob_shape), dtype=np.float32)
-        nucleus_dist_batch = np.zeros((batch_size, *dist_shape), dtype=np.float32)
-        cytoplasm_prob_batch = np.zeros((batch_size, *prob_shape), dtype=np.float32)
-        cytoplasm_dist_batch = np.zeros((batch_size, *dist_shape), dtype=np.float32)
-
-        # Обработка каждого образца в батче
-        from cytonucs_losses import create_distance_maps_with_custom_rays
-
-        for b in range(batch_size):
-            nuc_prob, nuc_dist = create_distance_maps_with_custom_rays(
-                nucleus_instances[b], self.config.rays
-            )
-            cyto_prob, cyto_dist = create_distance_maps_with_custom_rays(
-                cytoplasm_instances[b], self.config.rays
-            )
-
-            nucleus_prob_batch[b] = nuc_prob
-            nucleus_dist_batch[b] = nuc_dist
-            cytoplasm_prob_batch[b] = cyto_prob
-            cytoplasm_dist_batch[b] = cyto_dist
-
-        return {
-            'nucleus_prob': tf.convert_to_tensor(nucleus_prob_batch),
-            'nucleus_dist': tf.convert_to_tensor(nucleus_dist_batch),
-            'cytoplasm_prob': tf.convert_to_tensor(cytoplasm_prob_batch),
-            'cytoplasm_dist': tf.convert_to_tensor(cytoplasm_dist_batch)
-        }
 
     @tf.function
     def val_step(self, x_batch, y_batch):
@@ -404,6 +385,7 @@ class DiceCallback:
             save_best: save best model by Dice
             experiment: Comet ML experiment
         """
+
         self.model = model
         self.val_generator = val_generator
         self.eval_every = eval_every
@@ -431,15 +413,18 @@ class DiceCallback:
             _ = self.model.keras_model(x_batch_tf, training=False)
 
         print("  ✓ BatchNorm warmed up")
-
-        # Теперь создаём predictor
         config = self.model.config
+        prob_thresh_nucleus = getattr(config, 'prob_thresh_nucleus', 0.3)
+        prob_thresh_cytoplasm = getattr(config, 'prob_thresh_cytoplasm', 0.4)
+        nms_thresh = getattr(config, 'nms_thresh', 0.3)
+        # Теперь создаём predictor
+
         predictor = CytoNucsPredictor(
             model=self.model,
             config=config,
-            prob_thresh_nucleus=0.3,
-            prob_thresh_cytoplasm=0.35,
-            nms_thresh=0.5
+            prob_thresh_nucleus=prob_thresh_nucleus,
+            prob_thresh_cytoplasm= prob_thresh_cytoplasm,
+            nms_thresh=nms_thresh
         )
 
         y_true_nucleus, y_pred_nucleus = [], []
@@ -468,32 +453,17 @@ class DiceCallback:
         stats_nucleus_tuple = matching_dataset(y_true_nucleus, y_pred_nucleus, thresh=taus, show_progress=False)
         stats_cytoplasm_tuple = matching_dataset(y_true_cytoplasm, y_pred_cytoplasm, thresh=taus, show_progress=False)
 
-        precision_nucleus, recall_nucleus = stats_nucleus_tuple[3], stats_nucleus_tuple[4]
-        precision_cytoplasm, recall_cytoplasm = stats_cytoplasm_tuple[3], stats_cytoplasm_tuple[4]
+        precision_nucleus = np.array([s.precision for s in stats_nucleus_tuple])
+        recall_nucleus = np.array([s.recall for s in stats_nucleus_tuple])
+
+        precision_cytoplasm = np.array([s.precision for s in stats_cytoplasm_tuple])
+        recall_cytoplasm = np.array([s.recall for s in stats_cytoplasm_tuple])
 
         ap_nucleus = _calculate_ap(precision_nucleus, recall_nucleus)
         ap_cytoplasm = _calculate_ap(precision_cytoplasm, recall_cytoplasm)
 
-        # ИСПРАВЛЕНО: Проверяем, что значения - это числа перед конвертацией
-        def safe_float(val, default=0.0):
-            """Безопасное преобразование в float с проверкой типа"""
-            if isinstance(val, str):
-                return default
-            if isinstance(val, (list, np.ndarray)):
-                if len(val) > 0:
-                    return safe_float(val[0], default)
-                return default
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                return default
-
-        # Используем индекс 0 для AP@50 (первый порог tau=0.5)
-        ap50_nucleus = safe_float(precision_nucleus[0])
-        ap50_cytoplasm = safe_float(precision_cytoplasm[0])
-
-        ap_nucleus = safe_float(ap_nucleus)
-        ap_cytoplasm = safe_float(ap_cytoplasm)
+        ap50_nucleus = precision_nucleus[0]
+        ap50_cytoplasm = precision_cytoplasm[0]
         print(f"  Nucleus   | Dice: {mean_dice_nucleus:.4f} | AP: {ap_nucleus:.4f} (AP@50: {ap50_nucleus:.4f})")
         print(f"  Cytoplasm | Dice: {mean_dice_cytoplasm:.4f} | AP: {ap_cytoplasm:.4f} (AP@50: {ap50_cytoplasm:.4f})")
 

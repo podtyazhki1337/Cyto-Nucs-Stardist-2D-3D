@@ -156,10 +156,16 @@ class CytoNucsDataGenerator(Sequence):
                 else:
                     # Auto-compute if missing
 
-                    assignments, _ = compute_nucleus_cell_assignments(nucleus_mask,cytoplasm_mask, max_distance=5.0)
+                    max_dist = getattr(self.config, 'max_assignment_distance', 100.0)
+                    assignments, _, _ = compute_nucleus_cell_assignments(
+                        nucleus_mask, cytoplasm_mask, max_distance=max_dist
+                    )
             else:
                 # Auto-compute assignments
-                assignments, _ = compute_nucleus_cell_assignments(nucleus_mask,cytoplasm_mask, max_distance=5.0)
+                max_dist = getattr(self.config, 'max_assignment_distance', 100.0)
+                assignments, _, _ = compute_nucleus_cell_assignments(
+                    nucleus_mask, cytoplasm_mask, max_distance=max_dist
+                )
 
             self.data_pool.append({
                 'image': img,

@@ -11,7 +11,7 @@ import json
 import sys
 from comet_ml import Experiment
 from tqdm import tqdm
-
+from cytonucs_gpu_setup import setup_gpu, print_gpu_info
 # Import CytoNucs modules
 from cytonucs_config import CytoNucsConfig
 from cytonucs_model import build_cytonucs_model
@@ -36,16 +36,32 @@ def run_inference_only(config_dict, config_path):
     """
     Pure inference mode - loads full images directly, processes with tiling if needed
     """
-    import imageio
+    import imageio.v2 as imageio
     from pathlib import Path
     from csbdeep.utils import normalize
     from cytonucs_inference import CytoNucsPredictor
     from cytonucs_trainer import compute_dice, _calculate_ap
     from stardist.matching import matching_dataset
 
-    print("=" * 60)
-    print("🔍 MODE: INFERENCE ONLY")
-    print("=" * 60)
+    # ========== GPU SETUP FOR INFERENCE ==========
+    use_gpu = config_dict['model'].get('use_gpu', False)
+
+    if use_gpu:
+        print("\n🔧 Configuring GPU for inference...")
+        gpu_config = config_dict.get('gpu_config', {})
+
+        gpus = setup_gpu(
+            memory_limit=gpu_config.get('memory_limit', None),
+            allow_growth=gpu_config.get('allow_growth', True),
+            visible_devices=gpu_config.get('visible_devices', None)
+        )
+
+        if gpus:
+            print(f"✅ Using GPU for inference")
+        else:
+            print("⚠️  No GPU detected, using CPU for inference")
+    else:
+        print("\n💻 Running inference on CPU")
 
     # ========== Load Model ==========
     model_config = CytoNucsConfig.from_json(config_path)
@@ -66,15 +82,6 @@ def run_inference_only(config_dict, config_path):
     model.load_weights(checkpoint_path)
     print("✅ Model loaded")
 
-    # ========== Setup Dataset - ПРЯМАЯ ЗАГРУЗКА ==========
-    dataset_name = config_dict['inference'].get('dataset', 'train')
-    dataset_dir = Path(config_dict['data']['dataset_dir']) / dataset_name
-
-    if not dataset_dir.exists():
-        print(f"❌ Dataset directory not found: {dataset_dir}")
-        sys.exit(1)
-
-    # ПРЯМОЙ ПОИСК ФАЙЛОВ (без генератора!)
     def find_all_images(path):
         """Находит все изображения в разных форматах"""
         files = []
@@ -82,24 +89,42 @@ def run_inference_only(config_dict, config_path):
             files.extend(list(path.glob(ext)))
         return sorted(files)
 
-    image_files = find_all_images(dataset_dir / 'images')
-    nucleus_mask_files = find_all_images(dataset_dir / 'nucleus_masks')
-    cytoplasm_mask_files = find_all_images(dataset_dir / 'cytoplasm_masks')
+    image_files = []
+    nucleus_mask_files = []
+    cytoplasm_mask_files = []
+
+    # Загружаем из test
+    test_dir = Path(config_dict['data']['dataset_dir']) / 'test'
+    if test_dir.exists():
+        image_files.extend(find_all_images(test_dir / 'images'))
+        nucleus_mask_files.extend(find_all_images(test_dir / 'nucleus_masks'))
+        cytoplasm_mask_files.extend(find_all_images(test_dir / 'cytoplasm_masks'))
+        print(f"📂 Loaded {len(image_files)} images from test")
+
+    # Загружаем из validation
+    val_dir = Path(config_dict['data']['dataset_dir']) / 'val'
+    if val_dir.exists():
+        val_start_idx = len(image_files)
+        image_files.extend(find_all_images(val_dir / 'images'))
+        nucleus_mask_files.extend(find_all_images(val_dir / 'nucleus_masks'))
+        cytoplasm_mask_files.extend(find_all_images(val_dir / 'cytoplasm_masks'))
+        val_count = len(image_files) - val_start_idx
+        print(f"📂 Loaded {val_count} images from validation")
 
     if len(image_files) == 0:
-        print(f"❌ No images found in {dataset_dir / 'images'}")
+        print(f"❌ No images found in test or validation directories")
         sys.exit(1)
 
-    print(f"\n📂 Dataset: {dataset_dir}")
-    print(f"Found {len(image_files)} images")
+    print(f"\n📊 Total images for inference: {len(image_files)}")
 
     # Проверка соответствия файлов
     assert len(image_files) == len(nucleus_mask_files) == len(cytoplasm_mask_files), \
         f"Mismatch: {len(image_files)} images, {len(nucleus_mask_files)} nucleus, {len(cytoplasm_mask_files)} cytoplasm"
 
-    print(f"\nTEST Database:")
+    print(f"\nINFERENCE Database (test + validation):")
     for idx, im_file in enumerate(image_files):
-        print(f"{idx}\t{im_file.name}")
+        source = "val" if "val" in str(im_file.parent.parent) else "test"
+        print(f"{idx}\t{im_file.name}\t[{source}]")
 
     # ========== Warm up BatchNorm ==========
     print("\n🔥 Warming up BatchNorm...")
@@ -154,7 +179,7 @@ def run_inference_only(config_dict, config_path):
         model=model,
         config=model_config,
         prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
-        prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),
+        prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),  # ← Проверьте эту строку!
         nms_thresh=config_dict['inference'].get('nms_thresh', 0.3)
     )
 
@@ -163,7 +188,13 @@ def run_inference_only(config_dict, config_path):
     print(f"  prob_thresh_cytoplasm: {predictor.prob_thresh_cytoplasm}")
     print(f"  nms_thresh: {predictor.nms_thresh}")
 
-    # ========== Output Directory ==========
+    dataset_sources = []
+    if len(image_files) > 0 and "test" in str(image_files[0].parent.parent):
+        dataset_sources.append("test")
+    if len(image_files) > len(dataset_sources) or any("val" in str(f.parent.parent) for f in image_files):
+        dataset_sources.append("val")
+
+    dataset_name = "_".join(dataset_sources) if dataset_sources else "inference"
     viz_dir = Path(model.basedir) / model.name / f'inference_{dataset_name}'
     viz_dir.mkdir(parents=True, exist_ok=True)
 
@@ -329,43 +360,15 @@ def run_inference_only(config_dict, config_path):
     # AP через matching_dataset
     taus = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
 
-    print("  Computing AP for nucleus...")
-    stats_nucleus = matching_dataset(y_true_nucleus, y_pred_nucleus, thresh=taus, show_progress=False)
+    stats_nucleus_tuple = matching_dataset(y_true_nucleus, y_pred_nucleus, thresh=taus, show_progress=False)
+    stats_cytoplasm_tuple = matching_dataset(y_true_cytoplasm, y_pred_cytoplasm, thresh=taus, show_progress=False)
 
-    print("  Computing AP for cytoplasm...")
-    stats_cytoplasm = matching_dataset(y_true_cytoplasm, y_pred_cytoplasm, thresh=taus, show_progress=False)
+    # === ПРАВИЛЬНОЕ ИЗВЛЕЧЕНИЕ: из каждого DatasetMatching объекта ===
+    precision_nucleus = np.array([s.precision for s in stats_nucleus_tuple])
+    recall_nucleus = np.array([s.recall for s in stats_nucleus_tuple])
 
-    # КРИТИЧНО: matching_dataset возвращает словарь с ключами 'precision', 'recall', etc.
-    # Или tuple - нужно проверить формат
-
-    print(f"  DEBUG: stats_nucleus type: {type(stats_nucleus)}")
-    if isinstance(stats_nucleus, dict):
-        precision_nucleus = stats_nucleus['precision']
-        recall_nucleus = stats_nucleus['recall']
-        precision_cytoplasm = stats_cytoplasm['precision']
-        recall_cytoplasm = stats_cytoplasm['recall']
-    elif isinstance(stats_nucleus, tuple):
-        # Tuple формат: (tp, fp, fn, precision, recall, ...)
-        print(f"  DEBUG: stats_nucleus length: {len(stats_nucleus)}")
-        print(f"  DEBUG: stats_nucleus[3] (precision): {stats_nucleus[3]}")
-        print(f"  DEBUG: stats_nucleus[4] (recall): {stats_nucleus[4]}")
-
-        precision_nucleus = stats_nucleus[3]
-        recall_nucleus = stats_nucleus[4]
-        precision_cytoplasm = stats_cytoplasm[3]
-        recall_cytoplasm = stats_cytoplasm[4]
-    else:
-        print(f"  ⚠️  Unexpected stats format: {type(stats_nucleus)}")
-        precision_nucleus = [0.0]
-        recall_nucleus = [0.0]
-        precision_cytoplasm = [0.0]
-        recall_cytoplasm = [0.0]
-
-    # Конвертируем в numpy arrays если это не так
-    precision_nucleus = np.array(precision_nucleus)
-    recall_nucleus = np.array(recall_nucleus)
-    precision_cytoplasm = np.array(precision_cytoplasm)
-    recall_cytoplasm = np.array(recall_cytoplasm)
+    precision_cytoplasm = np.array([s.precision for s in stats_cytoplasm_tuple])
+    recall_cytoplasm = np.array([s.recall for s in stats_cytoplasm_tuple])
 
     print(f"  Precision nucleus shape: {precision_nucleus.shape}, values: {precision_nucleus}")
     print(f"  Recall nucleus shape: {recall_nucleus.shape}, values: {recall_nucleus}")
@@ -374,29 +377,12 @@ def run_inference_only(config_dict, config_path):
     ap_nucleus = _calculate_ap(precision_nucleus, recall_nucleus)
     ap_cytoplasm = _calculate_ap(precision_cytoplasm, recall_cytoplasm)
 
-    def safe_float(val, default=0.0):
-        """Безопасное преобразование в float"""
-        if val is None:
-            return default
-        if isinstance(val, str):
-            return default
-        if isinstance(val, (list, np.ndarray)):
-            if len(val) == 0:
-                return default
-            # Берём первый элемент
-            return safe_float(val[0], default)
-        try:
-            return float(val)
-        except:
-            return default
-
-    # AP@50 - precision at IoU=0.5 (первый threshold)
-    ap50_nucleus = safe_float(precision_nucleus[0] if len(precision_nucleus) > 0 else 0.0)
-    ap50_cytoplasm = safe_float(precision_cytoplasm[0] if len(precision_cytoplasm) > 0 else 0.0)
+    ap50_nucleus = precision_nucleus[0]  # Просто берем первый элемент
+    ap50_cytoplasm = precision_cytoplasm[0]
 
     print(f"\n  Final AP values:")
-    print(f"    Nucleus: AP={safe_float(ap_nucleus):.4f}, AP@50={ap50_nucleus:.4f}")
-    print(f"    Cytoplasm: AP={safe_float(ap_cytoplasm):.4f}, AP@50={ap50_cytoplasm:.4f}")
+    print(f"    Nucleus: AP={ap_nucleus:.4f}, AP@50={ap50_nucleus:.4f}")
+    print(f"    Cytoplasm: AP={ap_cytoplasm:.4f}, AP@50={ap50_cytoplasm:.4f}")
 
     # ============================================================
     # COMPUTE JTPR (Joint True Positive Rate)
@@ -437,9 +423,9 @@ def run_inference_only(config_dict, config_path):
     print("\n" + "=" * 60)
     print(f"INFERENCE RESULTS ({dataset_name})")
     print("=" * 60)
-    print(f"  Nucleus   | Dice: {mean_dice_nucleus:.4f} | AP: {safe_float(ap_nucleus):.4f} (AP@50: {ap50_nucleus:.4f})")
+    print(f"  Nucleus   | Dice: {mean_dice_nucleus:.4f} | AP: {ap_nucleus:.4f} (AP@50: {ap50_nucleus:.4f})")
     print(
-        f"  Cytoplasm | Dice: {mean_dice_cytoplasm:.4f} | AP: {safe_float(ap_cytoplasm):.4f} (AP@50: {ap50_cytoplasm:.4f})")
+        f"  Cytoplasm | Dice: {mean_dice_cytoplasm:.4f} | AP: {ap_cytoplasm:.4f} (AP@50: {ap50_cytoplasm:.4f})")
     print(f"  JTPR      | Mean: {mean_jtpr:.4f} | Global: {global_jtpr:.4f} ({joint_tp_total}/{total_pairs_total})")
     print("=" * 60)
 
@@ -448,8 +434,8 @@ def run_inference_only(config_dict, config_path):
         'n_images': len(y_true_nucleus),
         'dice_nucleus_mean': float(mean_dice_nucleus),
         'dice_cytoplasm_mean': float(mean_dice_cytoplasm),
-        'ap_nucleus': safe_float(ap_nucleus),
-        'ap_cytoplasm': safe_float(ap_cytoplasm),
+        'ap_nucleus': float(ap_nucleus),
+        'ap_cytoplasm': float(ap_cytoplasm),
         'ap50_nucleus': float(ap50_nucleus),
         'ap50_cytoplasm': float(ap50_cytoplasm),
         'jtpr_mean': float(mean_jtpr),
@@ -484,7 +470,27 @@ def main(config_path='config_cytonucs.json'):
 
     config_dict = load_config(config_path)
     print(f"\nLoaded config from: {config_path}")
+    # ========== GPU SETUP ==========
+    # Configure GPU before creating any TensorFlow operations
+    use_gpu = config_dict['model'].get('use_gpu', False)
 
+    if use_gpu:
+        print("\n🔧 Configuring GPU...")
+        gpu_config = config_dict.get('gpu_config', {})
+
+        gpus = setup_gpu(
+            memory_limit=gpu_config.get('memory_limit', None),
+            allow_growth=gpu_config.get('allow_growth', True),
+            visible_devices=gpu_config.get('visible_devices', None)
+        )
+
+        if gpus:
+            print_gpu_info()
+        else:
+            print("\n⚠️  No GPU detected, but use_gpu=True in config")
+            print("   Training will continue on CPU")
+    else:
+        print("\n💻 Running on CPU (use_gpu=False in config)")
     # Set random seeds
     np.random.seed(42)
     tf.random.set_seed(42)
@@ -826,7 +832,7 @@ def main(config_path='config_cytonucs.json'):
         def get_config(self):
             return { "initial_lr": float(self.initial_lr), "warmup_steps": float(self.warmup_steps), "decay_steps": float(self.decay_steps), "decay_rate": float(self.decay_rate), "min_lr": float(self.min_lr) }
 
-    warmup_epochs = 5  # Первые 5 эпох - прогрев
+    warmup_epochs = config_dict['loss_params']['wbr_warmup_epochs']
     initial_lr = config_dict['training']['initial_learning_rate']
     steps_per_epoch = model_config.train_steps_per_epoch
 
@@ -837,11 +843,12 @@ def main(config_path='config_cytonucs.json'):
         decay_rate=0.9,
         min_lr=1e-7
     )
-
+    gradient_clip_norm = config_dict['training']['gradient_clip_norm']
     trainer = CytoNucsTrainer(
         model=model,
         config=model_config,
         loss_fn=loss_fn,
+        gradient_clip_norm=gradient_clip_norm,
         optimizer=Adam(learning_rate=schedule)
     )
     # Restore history if resuming
@@ -887,8 +894,9 @@ def main(config_path='config_cytonucs.json'):
         predictor = CytoNucsPredictor(
             model=model,
             config=model_config,
-            prob_thresh=0.5,
-            nms_thresh=0.5
+            prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
+            prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),  # ← Проверьте эту строку!
+            nms_thresh=config_dict['inference'].get('nms_thresh', 0.3)
         )
 
         # Collect validation data
@@ -933,9 +941,9 @@ def main(config_path='config_cytonucs.json'):
         predictor = CytoNucsPredictor(
             model=model,
             config=model_config,
-            prob_thresh_nucleus=0.3,
-            prob_thresh_cytoplasm=0.35,  # ← Поднять с 0.3!
-            nms_thresh=0.5  # ← Поднять с 0.4!
+            prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
+            prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),  # ← Проверьте эту строку!
+            nms_thresh=config_dict['inference'].get('nms_thresh', 0.3)
         )
 
     # ========== Final Evaluation ==========
@@ -976,7 +984,7 @@ def main(config_path='config_cytonucs.json'):
             print(f"    JTPR details: {jtpr_details}")
         # Save predictions if requested
         if config_dict['evaluation']['save_predictions']:
-            import imageio
+            import imageio.v2 as imageio
             pred_dir = Path(config_dict['output']['basedir']) / config_dict['experiment']['name'] / 'predictions'
             pred_dir.mkdir(parents=True, exist_ok=True)
             from cytonucs_inference import create_overlay_with_iou
@@ -1064,12 +1072,38 @@ def main(config_path='config_cytonucs.json'):
     }
     viz_dir = Path(config_dict['output']['basedir']) / config_dict['experiment']['name'] / 'visualizations'
     if viz_dir.exists():
-        import imageio
+        import imageio.v2 as imageio
+        from PIL import Image
         images = []
-        for img_path in sorted(viz_dir.glob('epoch_*.png')):
-            images.append(imageio.imread(img_path))
+        target_size = None
 
-        if len(images) > 0:
+        # Load all images and find the most common size
+        img_paths = sorted(viz_dir.glob('epoch_*.png'))
+        loaded_images = []
+        for img_path in img_paths:
+            img = imageio.imread(img_path)
+            loaded_images.append((img_path, img))
+            if target_size is None:
+                target_size = img.shape[:2]  # (height, width)
+
+        # Resize all images to the target size
+        if len(loaded_images) > 0:
+            for img_path, img in loaded_images:
+                # Convert to PIL Image for resizing
+                pil_img = Image.fromarray(img)
+                # Resize if dimensions don't match
+                if img.shape[:2] != target_size:
+                    pil_img = pil_img.resize((target_size[1], target_size[0]), Image.LANCZOS)
+                    img = np.array(pil_img)
+
+                # Ensure all images have the same number of channels
+                if len(img.shape) == 2:  # Grayscale
+                    img = np.stack([img]*3, axis=-1)  # Convert to RGB
+                elif img.shape[2] == 4:  # RGBA
+                    img = img[:, :, :3]  # Remove alpha channel
+
+                images.append(img)
+
             imageio.mimsave(
                 viz_dir / 'training_progress.gif',
                 images,
