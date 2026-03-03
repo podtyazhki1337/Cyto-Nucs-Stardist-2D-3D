@@ -72,7 +72,7 @@ class CytoNucsTrainer:
         self.config = config
         self.loss_fn = loss_fn
         self.current_step = 0
-
+        self.current_epoch_var = tf.Variable(1, dtype=tf.int32, trainable=False)
         # Setup optimizer
         if optimizer is None:
             lr_decay_steps = getattr(config, 'lr_decay_steps', 700)
@@ -116,7 +116,7 @@ class CytoNucsTrainer:
             y_pred = self.model.keras_model(x_batch, training=True)
 
             # Loss (внутри: StarDist C++ + WBR + Containment + Consistency!)
-            loss = self.loss_fn(y_batch_dict, y_pred)
+            loss = self.loss_fn(y_batch_dict, y_pred, current_epoch=self.current_epoch_var)
 
         # Backward pass
         gradients = tape.gradient(loss, self.model.keras_model.trainable_variables)
@@ -164,7 +164,7 @@ class CytoNucsTrainer:
         y_pred = self.model.keras_model(x_batch, training=False)
 
         # ИСПРАВЛЕНИЕ: убрать assignments=None
-        loss = self.loss_fn(y_batch, y_pred)  # ← БЕЗ assignments!
+        loss = self.loss_fn(y_batch, y_pred, current_epoch=self.current_epoch_var)
 
         # Update validation metric
         self.val_loss_metric.update_state(loss)
@@ -189,6 +189,7 @@ class CytoNucsTrainer:
             """
             epochs = epochs or self.config.train_epochs
             steps_per_epoch = steps_per_epoch or self.config.train_steps_per_epoch
+
             callbacks = callbacks or []
 
             print(f"Training for {epochs} epochs, {steps_per_epoch} steps/epoch")
@@ -202,9 +203,7 @@ class CytoNucsTrainer:
                 print(f"Epoch {epoch + 1}/{epochs}")
                 print(f"{'=' * 50}")
 
-                if hasattr(self.loss_fn, 'current_epoch'):
-                    self.loss_fn.current_epoch = epoch + 1
-
+                self.current_epoch_var.assign(epoch + 1)
                 # Reset metrics
                 self.train_loss_metric.reset_state()
                 self.val_loss_metric.reset_state()

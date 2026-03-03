@@ -224,7 +224,10 @@ class CytoNucsDataGenerator(Sequence):
                 img, nucleus_mask, cytoplasm_mask = self.augmenter(img, nucleus_mask, cytoplasm_mask)
 
             # Нормализация
-            img = normalize(img.astype(np.float32), 1, 99.8, axis=tuple(range(self.config.ndim)))
+            if img.ndim == 3 and img.shape[-1] in [3, 4]:
+                img = normalize(img.astype(np.float32), 1, 99.8, axis=(0, 1))
+            else:
+                img = normalize(img.astype(np.float32), 1, 99.8, axis=tuple(range(self.config.ndim)))
 
             # Crop/Pad до patch_size
             patch_size = self.config.train_patch_size
@@ -810,7 +813,7 @@ def prepare_cytonucs_dataset(
             #cytoplasm_mask = fill_contour_mask(cytoplasm_mask)
 
             # Сохранение
-            output_filename = base_name + '.tif'
+            output_filename = base_name + '.tiff'
 
             save_image_smart(
                 img,

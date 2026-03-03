@@ -1,4 +1,3 @@
-# cytonucs_model.py - ПРАВИЛЬНАЯ иерархия
 
 import tensorflow as tf
 from tensorflow.keras import Model, layers
@@ -60,15 +59,16 @@ class CytoNucsStarDistModel:
         nucleus_prob = ConvLayer(1, 1, padding='same', activation='sigmoid', name='nucleus_prob')(x_nuc)
 
         # ИСПРАВЛЕНО: Правильная инициализация для абсолютных расстояний
-        # Bias ~15 (типичный radius nucleus), weights малые для стабильности
+        nucleus_dist_bias = getattr(cfg, 'median_max_dist_nucleus', 15.0)
+        print(f"  ✓ Nucleus dist bias init: {nucleus_dist_bias} px")
+        x_nuc_dist = ConvLayer(cfg.n_rays, 3, padding='same', activation='relu', name='nuc_dist_pre')(x_nuc)
         nucleus_dist = ConvLayer(
             cfg.n_rays, 1,
             padding='same',
-            activation='linear',
+            activation='relu',  # ← было 'linear'
             name='nucleus_dist',
-            kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.01),
-            bias_initializer=tf.keras.initializers.Constant(15.0)  # ← Начальный radius ~15px
-        )(x_nuc)
+            bias_initializer=tf.keras.initializers.Constant(nucleus_dist_bias)
+        )(x_nuc_dist)
         # ========== DECODER 2: CYTOPLASM (С КОНТЕКСТОМ) ==========
         # Stop gradient для контекста
         nucleus_prob_context = layers.Lambda(
@@ -103,20 +103,24 @@ class CytoNucsStarDistModel:
 
         # Final context fusion
         x_cyto = layers.Concatenate(name='cyto_final_concat')([x_cyto, nucleus_prob_context])
-        x_cyto = ConvLayer(32, 3, padding='same', activation='relu', name='cyto_final_conv')(x_cyto)
+        x_cyto = ConvLayer(64, 3, padding='same', activation='relu', name='cyto_final_conv1')(x_cyto)
+        x_cyto = ConvLayer(64, 3, padding='same', activation='relu', name='cyto_final_conv2')(x_cyto)
 
         # Output heads CYTOPLASM
         cytoplasm_prob = ConvLayer(1, 1, padding='same', activation='sigmoid', name='cytoplasm_prob')(x_cyto)
 
-        # ИСПРАВЛЕНО: Bias ~40 (типичный radius cytoplasm)
+        # Distance head with more capacity
+        x_cyto_dist = ConvLayer(cfg.n_rays, 3, padding='same', activation='relu', name='cyto_dist_pre')(x_cyto)
+
+        cytoplasm_dist_bias = getattr(cfg, 'median_max_dist_cytoplasm', 40.0)
+        print(f"  ✓ Cytoplasm dist bias init: {cytoplasm_dist_bias} px")
         cytoplasm_dist = ConvLayer(
             cfg.n_rays, 1,
             padding='same',
-            activation='linear',
+            activation='relu',  # ← было 'linear'
             name='cytoplasm_dist',
-            kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.01),
-            bias_initializer=tf.keras.initializers.Constant(40.0)  # ← Начальный radius ~40px
-        )(x_cyto)
+            bias_initializer=tf.keras.initializers.Constant(cytoplasm_dist_bias)
+        )(x_cyto_dist)
 
         outputs = {
             'nucleus_prob': nucleus_prob,

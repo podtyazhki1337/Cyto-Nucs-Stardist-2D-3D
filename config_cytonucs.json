@@ -2,7 +2,7 @@
   "mode": "train",
 
   "experiment": {
-    "name": "cytonucs_stardist_hela_2d",
+    "name": "cytonucs_hollandi_stardist_2d",
     "use_comet": false,
     "comet_api_key": "",
     "comet_project": "cytonucs",
@@ -10,21 +10,21 @@
   },
 
   "data": {
-    "dataset_dir": "/NAS/mmaiurov/Datasets/Cutonucs/preprocessed/",
-    "validation_images": ["B02_01.png"],
+    "dataset_dir": "/NAS/mmaiurov/Datasets/Cytonucs_Hollandi/preprocessed/",
+    "validation_images": [],
     "skip_images": [],
     "pool_size": null,
     "repool_freq": 10
   },
 
   "preprocessing": {
-    "run_preprocessing": true,
-    "raw_images_dir": "/NAS/mmaiurov/Datasets/Cutonucs/images",
-    "raw_nucleus_masks_dir": "/NAS/mmaiurov/Datasets/Cutonucs/nuc_masks/filled",
-    "raw_cytoplasm_masks_dir": "/NAS/mmaiurov/Datasets/Cutonucs/cyto_masks/filled",
-    "output_dir": "/NAS/mmaiurov/Datasets/Cutonucs/preprocessed/",
-    "test_split": 0.25,
-    "val_split": null,
+    "run_preprocessing": false,
+    "raw_images_dir": "/NAS/mmaiurov/Datasets/Cytonucs_Hollandi/images/",
+    "raw_nucleus_masks_dir": "/NAS/mmaiurov/Datasets/Cytonucs_Hollandi/nuc_masks/",
+    "raw_cytoplasm_masks_dir": "/NAS/mmaiurov/Datasets/Cytonucs_Hollandi/cyto_masks/",
+    "output_dir": "/NAS/mmaiurov/Datasets/Cytonucs_Hollandi/preprocessed/",
+    "test_split": 0.1,
+    "val_split": 0.1,
     "compute_assignments": true,
     "seed": 42
   },
@@ -35,7 +35,6 @@
     "anisotropy": [1, 1],
     "nucleus_grid": [1, 1],
     "cytoplasm_grid": [1, 1],
-    "backbone": "unet",
     "shared_encoder": true,
     "n_channel_in": 3,
     "use_gpu": true
@@ -43,35 +42,34 @@
 
   "training": {
     "train_patch_size": [512, 512],
-    "train_batch_size": 8,
+    "train_batch_size": 4,
     "train_epochs": 400,
-    "steps_per_epoch": 25,
-    "initial_learning_rate": 1e-3,
-    "lr_decay_steps": 700,
-    "lr_decay_rate": 0.5,
+    "steps_per_epoch": 32,
+    "initial_learning_rate": 3e-4,
+    "lr_decay_steps": 5000,
+    "lr_decay_rate": 0.9,
     "lr_staircase": true,
     "gradient_clip_norm": 10,
     "resume_from_checkpoint": null
   },
   "inference": {
-    "checkpoint_path": "/storage02/miroslavm/Multi-Nuclear-Stardist-2D-3D/models/cytonucs_stardist_hela_2d/weights_best_WITH_WBR025_CONT01_400.weights.h5",
-    "prob_thresh": 0.15,
-    "nms_thresh": 0.5,
+    "checkpoint_path": "/storage02/miroslavm/Multi-Nuclear-Stardist-2D-3D/models/cytonucs_hollandi_stardist_2d/weights_best.weights.h5",
+    "nms_thresh": 0.3,
     "prob_thresh_nucleus": 0.3,
     "prob_thresh_cytoplasm": 0.4
   },
 
   "loss_weights": {
-    "lambda_prob_nucleus": 1.0,
-    "lambda_dist_nucleus": 1.0,
-    "lambda_prob_cytoplasm": 0.5,
-    "lambda_dist_cytoplasm": 1.5,
+    "lambda_prob_nucleus": 1,
+    "lambda_dist_nucleus": 1,
+    "lambda_prob_cytoplasm": 1,
+    "lambda_dist_cytoplasm": 3.5,
     "lambda_containment": 0.1,
-    "lambda_wbr": 0.25,
+    "lambda_wbr": 0.15,
     "lambda_consistency": 0,
     "enable_consistency": false,
-    "lambda_fragmentation": 0.1,
-    "lambda_background_penalty": 0.15
+    "lambda_fragmentation": 0.05,
+    "lambda_background_penalty": 0.05
   },
   "loss_params": {
     "containment_margin": 2.0,
@@ -82,8 +80,12 @@
     "w_containment_distance": 0.5,
     "w_center_separation": 0.2,
     "w_cyto_support": 0.15,
-    "median_max_dist_nucleus": 20.0,
-    "median_max_dist_cytoplasm": 50.0
+    "dist_nucleus_norm": 50.0,
+    "dist_cytoplasm_norm": 55.0,
+    "median_max_dist_cytoplasm": 50.0,
+    "median_max_dist_nucleus": 99.0,
+    "dist_loss": "mae",
+    "huber_delta": 0.1
   },
 
   "augmentation": {
@@ -109,7 +111,7 @@
   "gpu_config": {
     "allow_growth": true,
     "memory_limit": null,
-    "visible_devices": "0"
+    "visible_devices": "1"
   },
   "output": {
     "basedir": "models",

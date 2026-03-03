@@ -28,7 +28,7 @@ class CytoNucsConfig:
             n_channel_in=1,
 
             # Architecture
-            backbone='unet',
+
             shared_encoder=True,
 
             # Training patches
@@ -68,9 +68,13 @@ class CytoNucsConfig:
             median_radius_train=None,  # Медианный радиус из training data
             scale_factor_nucleus=None,  # Или напрямую scale_factor
             scale_factor_cytoplasm=None,
-            median_max_dist_nucleus=None,  # НОВЫЙ: для нормализации в loss
-            median_max_dist_cytoplasm=None,  # НОВЫЙ: для нормализации в loss
+            median_max_dist_nucleus=None,  # для bias
+            median_max_dist_cytoplasm=None,
+            dist_nucleus_norm=20,
+            dist_cytoplasm_norm=50,# для нормализации в loss
 
+            dist_loss='mae',
+            huber_delta=1.0,
             # Training
             use_gpu=False,
             train_epochs=400,
@@ -102,7 +106,7 @@ class CytoNucsConfig:
             self.anisotropy = (1,) * self.ndim
 
         # Architecture
-        self.backbone = backbone
+
         self.shared_encoder = shared_encoder
 
         # Patches
@@ -123,6 +127,10 @@ class CytoNucsConfig:
         self.enable_consistency = enable_consistency
         self.lambda_fragmentation = lambda_fragmentation
         self.lambda_background_penalty = lambda_background_penalty
+        self.dist_nucleus_norm=dist_nucleus_norm
+        self.dist_cytoplasm_norm=dist_cytoplasm_norm
+        self.dist_loss = dist_loss
+        self.huber_delta = huber_delta
         self.mode = mode
 
         # Containment
@@ -258,7 +266,7 @@ class CytoNucsConfig:
         if 'nms_thresh' in inference_cfg:  # ← ДОБАВЛЕНО!
             params['nms_thresh'] = inference_cfg['nms_thresh']
         if 'steps_per_epoch' in training_cfg:
-            training_cfg['train_steps_per_epoch'] = training_cfg['steps_per_epoch']
+            params['train_steps_per_epoch'] = training_cfg['steps_per_epoch']
         # Convert list to tuple for sizes
         if 'train_patch_size' in params:
             params['train_patch_size'] = tuple(params['train_patch_size'])

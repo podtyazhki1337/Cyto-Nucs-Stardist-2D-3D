@@ -741,10 +741,8 @@ def main(config_path='config_cytonucs.json'):
     if len(all_cyto_radii) > 0:
         print(f"    Cytoplasm radius range: [{np.min(all_cyto_radii):.1f}, {np.max(all_cyto_radii):.1f}] px")
 
-    # Set steps_per_epoch based on repool frequency
-    if config_dict['data'].get('repool_freq'):
-        model_config.train_steps_per_epoch = train_generator.repool_freq
-        print(f"Steps per epoch set to repool frequency: {model_config.train_steps_per_epoch}")
+
+    print(f"Steps per epoch: {model_config.train_steps_per_epoch} (from config)")
 
     # ========== Build Model ==========
     print("\nBuilding model...")
@@ -835,13 +833,15 @@ def main(config_path='config_cytonucs.json'):
     warmup_epochs = config_dict['loss_params']['wbr_warmup_epochs']
     initial_lr = config_dict['training']['initial_learning_rate']
     steps_per_epoch = model_config.train_steps_per_epoch
-
+    decay_steps = config_dict['training'].get('lr_decay_steps', 10000)
+    decay_rate = config_dict['training'].get('lr_decay_rate', 0.9)
+    min_lr = config_dict['training'].get('min_learning_rate', 1e-7)
     schedule = WarmupExponentialDecay(
         initial_lr=initial_lr,
         warmup_steps=warmup_epochs * steps_per_epoch,
-        decay_steps=10000,  # Увеличим для более плавного спада
-        decay_rate=0.9,
-        min_lr=1e-7
+        decay_steps=decay_steps,
+        decay_rate=decay_rate,
+        min_lr=min_lr
     )
     gradient_clip_norm = config_dict['training']['gradient_clip_norm']
     trainer = CytoNucsTrainer(

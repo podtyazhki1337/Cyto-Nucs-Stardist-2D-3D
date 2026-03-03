@@ -22,13 +22,16 @@ class CytoNucsLoss:
         self.lambda_wbr = config.lambda_wbr
         self.lambda_containment = config.lambda_containment
         self.lambda_consistency = config.lambda_consistency if config.enable_consistency else 0.0
-
+        self._loss_call_count = 0
+        self._last_epoch = -1
+        self._debug_count = {'nucleus': 0, 'cytoplasm': 0}
         # НОВЫЕ веса (с fallback на 0 если не заданы)
         self.lambda_fragmentation = getattr(config, 'lambda_fragmentation', 0.0)
         self.lambda_background_penalty = getattr(config, 'lambda_background_penalty', 0.0)
-
+        self.dist_loss = getattr(config, 'dist_loss', 'mae')  # 'mae' or 'huber' or 'mse'
+        self.huber_delta = getattr(config, 'huber_delta', 1.0)
         self.wbr_warmup_epochs = getattr(config, 'wbr_warmup_epochs', 10)
-        self.current_epoch = 0
+        self.current_epoch = tf.Variable(0, dtype=tf.int32, trainable=False, name='current_epoch')
 
     def _get_wbr_weight(self):
         """Постепенное включение WBR loss"""
@@ -38,16 +41,11 @@ class CytoNucsLoss:
             return self.lambda_wbr * warmup_factor
         return self.lambda_wbr
 
-    def __call__(self, y_true_raw, y_pred):
+    def __call__(self, y_true_raw, y_pred, current_epoch=None):
         cfg = self.config
 
-        # === ПОЛУЧЕНИЕ ТЕКУЩЕЙ ЭПОХИ (ПРОСТОЙ СПОСОБ) ===
-        # Keras автоматически увеличивает эту метрику
-        try:
-            current_epoch = int(self.model.history.epoch[-1]) + 1 if hasattr(self,
-                                                                             'model') and self.model.history.epoch else 0
-        except:
-            current_epoch = 0
+        current_epoch_display = current_epoch  # Для печати (1-based)
+        current_epoch = current_epoch - 1  # Для WBR warmup (0-based)
 
         y_true = self._create_gt_from_instances(y_true_raw)
 
@@ -67,9 +65,10 @@ class CytoNucsLoss:
         # === 2. WBR ===
         wbr_raw = self._wbr_loss(y_pred['nucleus_prob'], y_pred['cytoplasm_prob'])
         warmup_epochs = getattr(cfg, 'wbr_warmup_epochs', 5)
-
+        current_epoch_float = tf.cast(current_epoch, tf.float32)
+        warmup_epochs_float = tf.cast(warmup_epochs, tf.float32)
         if current_epoch < warmup_epochs:
-            wbr_factor = current_epoch / max(warmup_epochs, 1)  # защита от деления на 0
+            wbr_factor = current_epoch_float / tf.maximum(warmup_epochs_float, 1.0)
         else:
             wbr_factor = 1.0
 
@@ -121,21 +120,32 @@ class CytoNucsLoss:
         )
 
         # Debug
-        if not hasattr(self, '_loss_call_count'):
-            self._loss_call_count = 0
-        self._loss_call_count += 1
 
-        if self._loss_call_count < 10 or self._loss_call_count % 100 == 0:
-            tf.print("\n=== LOSS (epoch", current_epoch + 1, ", step", self._loss_call_count, ") ===")
-            tf.print("  Nucleus BCE:", loss_nucleus['bce'], "| Dist:", loss_nucleus['distance'])
-            tf.print("  Cytoplasm BCE:", loss_cytoplasm['bce'], "| Dist:", loss_cytoplasm['distance'])
-            tf.print("  WBR:", loss_wbr, "(factor", wbr_factor, ")")
-            tf.print("  Containment:", loss_containment)
-            if self.lambda_fragmentation > 0:
-                tf.print("  Fragmentation:", loss_fragmentation)
-            if self.lambda_background_penalty > 0:
-                tf.print("  Background:", loss_background)
-            tf.print("  TOTAL:", total_loss)
+        def print_debug(epoch_val, nuc_bce, nuc_dist, cyto_bce, cyto_dist,
+                        wbr_val, wbr_f, cont_val, frag_val, bg_val, tot_val):
+            # Конвертируем в numpy внутри py_function
+            if self._loss_call_count % 5 == 0:
+                print(f"\n=== LOSS (epoch {int(epoch_val)}, global_step {self._loss_call_count}) ===")
+                print(f"  Nucleus BCE: {float(nuc_bce):.4f} | Dist: {float(nuc_dist):.2f}")
+                print(f"  Cytoplasm BCE: {float(cyto_bce):.4f} | Dist: {float(cyto_dist):.2f}")
+                print(f"  WBR: {float(wbr_val):.4f} (factor {float(wbr_f):.2f})")
+                print(f"  Containment: {float(cont_val):.4f}")
+                print(f"  Fragmentation: {float(frag_val):.4f}")
+                print(f"  Background: {float(bg_val):.4f}")
+                print(f"  TOTAL: {float(tot_val):.4f}")
+
+            self._loss_call_count += 1
+            return 0
+
+        # Передаём все значения как аргументы
+        tf.py_function(
+            print_debug,
+            [current_epoch_display, loss_nucleus['bce'], loss_nucleus['distance'],
+             loss_cytoplasm['bce'], loss_cytoplasm['distance'],
+             loss_wbr, wbr_factor, loss_containment,
+             loss_fragmentation, loss_background, total_loss],
+            [tf.int32]
+        )
 
         return total_loss
 
@@ -254,7 +264,7 @@ class CytoNucsLoss:
                 m = (mask_filled == label_id)
                 edt = distance_transform_edt(m)
                 if edt.max() > 0:
-                    prob_map[m] = np.maximum(prob_map[m], np.tanh(edt / edt.max() * 3.0)[m])
+                    prob_map[m] = np.maximum(prob_map[m], (edt[m] / edt.max()))
 
             prob_list.append(prob_map[..., np.newaxis])
             dist_list.append(dist_map_clean)  # ← RAW PIXELS!
@@ -269,69 +279,92 @@ class CytoNucsLoss:
     # ============================================================
 
     def _stardist_loss(self, prob_true, prob_pred, dist_true, dist_pred, name='object'):
-        """
-        Стандартный StarDist loss: BCE + MAE.
-        ИСПРАВЛЕНО: Balanced BCE для борьбы с class imbalance.
-        """
+
         # ============================================================
         # === 1. BALANCED BCE ===
         # ============================================================
 
-        # КРИТИЧНО: Убираем channel dimension
-        prob_true_squeeze = tf.squeeze(prob_true, axis=-1)  # (B, H, W, 1) → (B, H, W)
+        prob_true_squeeze = tf.squeeze(prob_true, axis=-1)
         prob_pred_squeeze = tf.squeeze(prob_pred, axis=-1)
 
-        # Маски foreground/background
-        foreground_mask = tf.cast(prob_true_squeeze > 0.5, tf.float32)  # (B, H, W)
+        foreground_mask = tf.cast(prob_true_squeeze > 0.01, tf.float32)
         background_mask = 1.0 - foreground_mask
 
-        # КРИТИЧНО: Используем низкоуровневый API без reduction
-        # BCE = -(y*log(p) + (1-y)*log(1-p))
         epsilon = 1e-7
         prob_pred_clipped = tf.clip_by_value(prob_pred_squeeze, epsilon, 1.0 - epsilon)
 
         bce_raw = -(
                 prob_true_squeeze * tf.math.log(prob_pred_clipped) +
                 (1.0 - prob_true_squeeze) * tf.math.log(1.0 - prob_pred_clipped)
-        )  # (B, H, W) - поточечный BCE без reduction
+        )
 
-        # Веса для балансировки
         fg_weight = 1.0
-        bg_weight = 0.5 if name == 'cytoplasm' else 1.0
+        bg_weight = 1.0
 
-        # Применяем веса (все shape = (B, H, W))
         weight_map = foreground_mask * fg_weight + background_mask * bg_weight
         bce_weighted = bce_raw * weight_map
 
-        # Нормализуем по количеству пикселей КАЖДОГО класса отдельно
         num_fg = tf.reduce_sum(foreground_mask) + self.epsilon
         num_bg = tf.reduce_sum(background_mask) + self.epsilon
 
-        # Balanced loss: среднее по fg и bg отдельно
         loss_bce_fg = tf.reduce_sum(bce_weighted * foreground_mask) / num_fg
         loss_bce_bg = tf.reduce_sum(bce_weighted * background_mask) / num_bg
         loss_bce = (loss_bce_fg + loss_bce_bg) / 2.0
 
         # ============================================================
-        # === 2. MAE для distance (без изменений) ===
+        # === 2. Distance loss ===
         # ============================================================
 
-        # Используем ИСХОДНЫЙ prob_true (с channel dim) для distance mask
-        foreground_mask_orig = tf.cast(prob_true > 0.5, tf.float32)  # (B, H, W, 1)
         n_rays = tf.shape(dist_true)[-1]
 
-        if self.ndim == 2:
-            foreground_mask_exp = tf.tile(foreground_mask_orig, [1, 1, 1, n_rays])
-        else:
-            foreground_mask_exp = tf.tile(foreground_mask_orig, [1, 1, 1, 1, n_rays])
-
-        dist_error = tf.abs(dist_true - dist_pred)
-        weighted_dist_error = dist_error * foreground_mask_exp
-
-        num_fg_pixels = tf.reduce_sum(foreground_mask_orig) + self.epsilon
-        loss_distance = tf.reduce_sum(weighted_dist_error) / (
-                num_fg_pixels * tf.cast(n_rays, tf.float32) + self.epsilon
+        # Binary spatial mask для ОБОИХ (стандартный StarDist)
+        spatial_weight = tf.cast(
+            tf.reduce_max(dist_true, axis=-1, keepdims=True) > 0,
+            tf.float32
         )
+
+        if name == 'nucleus':
+            scale = getattr(self.config, 'dist_nucleus_norm', 20.0)
+        else:
+            scale = getattr(self.config, 'dist_cytoplasm_norm', 50.0)
+
+        scale = tf.cast(scale, tf.float32)
+        dist_true_norm = dist_true / (scale + self.epsilon)
+        dist_pred_norm = dist_pred / (scale + self.epsilon)
+
+        # Per-ray weighting: только для cytoplasm (форма важна)
+        # Nucleus почти круглые → uniform weights
+        if name == 'nucleus':
+            ray_weight = tf.ones_like(dist_true)
+        else:
+            max_dist_per_pixel = tf.reduce_max(dist_true, axis=-1, keepdims=True)
+            reg_weight = 1e-4
+            normalizer = max_dist_per_pixel + reg_weight * tf.reduce_mean(dist_true, axis=-1, keepdims=True)
+            ray_weight = dist_true / (normalizer + self.epsilon)
+
+        # MAE / Huber / MSE
+        if self.dist_loss == 'mse':
+            dist_error = tf.square(dist_true_norm - dist_pred_norm)
+        elif self.dist_loss == 'huber':
+            err = dist_true_norm - dist_pred_norm
+            abs_err = tf.abs(err)
+            delta = tf.cast(self.huber_delta, tf.float32)
+            quadratic = tf.minimum(abs_err, delta)
+            linear = abs_err - quadratic
+            dist_error = 0.5 * tf.square(quadratic) + delta * linear
+        else:
+            dist_error = tf.abs(dist_true_norm - dist_pred_norm)
+
+        if self.ndim == 2:
+            spatial_weight_exp = tf.tile(spatial_weight, [1, 1, 1, n_rays])
+        else:
+            spatial_weight_exp = tf.tile(spatial_weight, [1, 1, 1, 1, n_rays])
+
+        weighted_dist_error = dist_error * ray_weight * spatial_weight_exp
+
+
+        total_weight = tf.reduce_sum(ray_weight * spatial_weight_exp) + self.epsilon
+        loss_distance = tf.reduce_sum(weighted_dist_error) / total_weight
 
         # ============================================================
         # === Debug ===
@@ -347,8 +380,8 @@ class CytoNucsLoss:
             mean_pred_fg = tf.reduce_sum(prob_pred_squeeze * foreground_mask) / num_fg
             mean_pred_bg = tf.reduce_sum(prob_pred_squeeze * background_mask) / num_bg
 
-            # Дополнительная статистика
-            max_pred_bg = tf.reduce_max(prob_pred_squeeze * background_mask)
+            bg_probs_only = tf.where(background_mask > 0.5, prob_pred_squeeze, -1.0)
+            max_pred_bg = tf.reduce_max(bg_probs_only)
 
             tf.print("\n  [STARDIST LOSS -", name, "]")
             tf.print("    BCE (balanced):     ", loss_bce)
@@ -357,10 +390,10 @@ class CytoNucsLoss:
             tf.print("    Mean prob (fg):     ", mean_pred_fg)
             tf.print("    Mean prob (bg):     ", mean_pred_bg, "← should be LOW!")
             tf.print("    Max prob (bg):      ", max_pred_bg)
-            tf.print("    Dist MAE (fg):      ", loss_distance)
+            tf.print("    Dist (fg):      ", loss_distance)
 
-            mean_dist_fg = tf.reduce_sum(dist_pred * foreground_mask_exp) / (
-                    tf.reduce_sum(foreground_mask_exp) + self.epsilon
+            mean_dist_fg = tf.reduce_sum(dist_pred * spatial_weight_exp) / (
+                    tf.reduce_sum(spatial_weight_exp) + self.epsilon
             )
             tf.print("    Mean dist (fg):     ", mean_dist_fg, "px")
 
