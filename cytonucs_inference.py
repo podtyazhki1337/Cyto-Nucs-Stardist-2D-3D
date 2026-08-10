@@ -4,12 +4,321 @@ CytoNucs StarDist Inference
 Post-processing to convert probability and distance maps into instance segmentations.
 """
 import numpy as np
-from scipy.ndimage import label, distance_transform_edt
-from skimage.measure import regionprops
-from stardist.geometry import polygons_to_label, polyhedron_to_label
-from stardist.nms import non_maximum_suppression
 import tensorflow as tf
 
+
+def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
+                               cyto_coords=None, cyto_probs=None,
+                               mask_thresh=0.5, iou_dedup=0.5, verbose=True,
+                               nuc_dists=None, cyto_dists=None,
+                               nuc_labels=None, cyto_labels=None):
+    """
+    Инстансы определяются в 3D как в каноническом StarDist: NMS -> полиэдры.
+    Рефайн только ДОБИРАЕТ форму, по 2D-слайсам.
+
+    Цикл идёт по МЕТКАМ, а не по пикам: polyhedron_to_label отдаёт
+    непересекающиеся метки, одна метка = один инстанс. Отсюда ни отображения
+    пик->метка, ни счётчиков пропусков, ни отдельного «добора клеток без ядер».
+
+    Форма инстанса = полиэдр (отрендерен по ВСЕМУ объёму, значит целостен по Z и
+    не обрезается окном прогона) ОБЪЕДИНЁННЫЙ с выращенной маской внутри окна.
+    Выращивание послойное: на слайсе центра берётся связная компонента,
+    содержащая центр, дальше вверх и вниз по Z берутся компоненты, касающиеся
+    уже принятой части соседнего слайса. Для плоской 2D-культуры это и есть
+    естественная форма, и по Z ничего не рвётся, когда 3D-связность ломается
+    из-за anisotropy.
+
+    ПОСЛЕ добора формы применяется ТОТ ЖЕ критерий, что в NMS StarDist
+    (stardist3d_impl.cpp: A_inter/A_min > nms_thresh) — см. _place. Новых
+    параметров нет, берётся существующий config.nms_thresh. Без этого шага
+    укороченные лучи замощают одну клетку несколькими непересекающимися
+    полиэдрами (тест NMS они проходят именно из-за укороченности), выращенная
+    маска первого забирает территорию остальных, и `out == 0` оставляет от них
+    тонкие ободки — «2 objects» у одного ядра и «6» у двух клеток.
+
+    Наборы лучей у голов РАЗНЫЕ (см. CytoNucsConfig.rays_nucleus /
+    rays_cytoplasm), поэтому сигма промпта считается по набору своей головы.
+
+    Один прогон на инстанс ядра даёт И маску ядра, И маску его клетки — ровно
+    как учит генератор (промпт на ядре, cytoplasm_target = родительская клетка).
+    Многоядерность выходит сама: два ядра приходят в одну и ту же клетку, второе
+    просто записывается в assignments.
+
+    iou_dedup оставлен в сигнатуре для обратной совместимости вызовов.
+    Возвращает (nucleus_instances, cytoplasm_instances, assignments).
+    """
+    import numpy as np, tensorflow as tf
+    from scipy.ndimage import zoom, find_objects
+    from scipy.ndimage import label as _cc_label
+
+    nd = int(config.ndim)
+    patch = tuple(int(p) for p in config.train_patch_size)
+    n_img = int(config.n_channel_in)
+    aniso = np.asarray(getattr(config, 'anisotropy', (1.,) * nd), np.float32)
+    nms_thresh = float(getattr(config, 'nms_thresh', 0.3))
+
+    if nuc_labels is None and cyto_labels is None:
+        raise ValueError("predict_instances_prompted: нужны nuc_labels/cyto_labels "
+                         "(результат polyhedron_to_label) — они и ЕСТЬ инстансы")
+
+    nuc_labels = None if nuc_labels is None else np.asarray(nuc_labels, np.int32)
+    cyto_labels = None if cyto_labels is None else np.asarray(cyto_labels, np.int32)
+
+    shape = tuple(int(s) for s in img_full.shape[:nd])
+    nuc_out = np.zeros(shape, np.int32)
+    cyto_out = np.zeros(shape, np.int32)
+    area_n, area_c, assignments = {}, {}, {}
+
+    # Окно прогона = train_patch_size. Универсально: от глубины стека не
+    # зависит (пробовалось брать Z целиком — на 250 срезах не влезет в память).
+    run_shape = tuple(min(patch[a], shape[a]) for a in range(nd))
+    grids = np.meshgrid(*[np.arange(s, dtype=np.float32) for s in run_shape],
+                        indexing='ij')
+
+    def _verts(name):
+        r = getattr(config, f'rays_{name}', None) or getattr(config, 'rays', None)
+        try:
+            return np.asarray(r.vertices, np.float32)      # (n_rays, nd)
+        except Exception:
+            return None
+
+    _verts_nuc, _verts_cyto = _verts('nucleus'), _verts('cytoplasm')
+
+    def _anchors(labels, coords, probs, dists, objs):
+        """Для каждой метки — точка промпта, её лучи и уверенность.
+        objs — результат find_objects(labels), считается ОДИН раз снаружи:
+        на томе 17x2048x2048 он не бесплатный, а нужен и здесь, и в _place."""
+        res = {}
+        if labels is None:
+            return res
+        if coords is not None and len(coords) > 0:
+            hi = np.array(labels.shape) - 1
+            for j in range(len(coords)):
+                c = np.clip(np.asarray(coords[j], int), 0, hi)
+                lab = int(labels[tuple(c)])
+                if lab == 0:
+                    continue
+                p = float(probs[j]) if probs is not None else 1.0
+                if lab in res and res[lab][2] >= p:
+                    continue
+                res[lab] = (c, None if dists is None else np.asarray(dists[j]), p)
+
+        for i, sl_o in enumerate(objs, start=1):
+            if sl_o is None or i in res:
+                continue
+            sub = (labels[sl_o] == i)
+            loc = np.array([s.start for s in sl_o])
+            ctr = np.array([(s.start + s.stop - 1) // 2 for s in sl_o], int)
+            if not sub[tuple(ctr - loc)]:
+                pts = np.argwhere(sub)
+                ctr = pts[np.argmin(np.abs(pts + loc - ctr).sum(axis=1))] + loc
+            res[i] = (ctr, None, 0.0)
+        return res
+
+    def _sigma(r_hint, rays_at_peak, verts):
+        """Сигма промпта из ЛУЧЕЙ ЭТОГО пика, а не из глобальной медианы:
+        генератор строит промпт как extent/4 по bbox конкретного объекта.
+        Rays_GoldenSpiral хранит verts = dir/anisotropy, поэтому |verts*dist|
+        уже в вокселях — единицы совпадают с bbox генератора. Набор берётся
+        ПО ГОЛОВЕ: направления у ядра и цитоплазмы разные, а проверка по длине
+        (96 == 96) их не различает."""
+        if (rays_at_peak is not None and verts is not None
+                and len(rays_at_peak) == len(verts)):
+            ext = np.abs(verts * np.asarray(rays_at_peak, np.float32)[:, None]).max(axis=0)
+            return np.maximum(2.0 * ext / 4.0, 1.0)          # extent = 2 * полуось
+        return np.maximum(r_hint / np.maximum(aniso, 1e-6) / 2.0, 1.0)
+
+    def _run(center, r_hint, rays_at_peak=None, head='nucleus'):
+        """Возвращает (sl, cl, nucleus_mask, cytoplasm_mask):
+        sl — окно в координатах тома, cl — центр промпта в координатах окна."""
+        lo = [max(0, min(int(center[a]) - run_shape[a] // 2,
+                         shape[a] - run_shape[a])) for a in range(nd)]
+        sl = tuple(slice(lo[a], lo[a] + run_shape[a]) for a in range(nd))
+        crop = img_full[sl]
+        if crop.ndim == nd:
+            crop = crop[..., None]
+        cl = np.clip(np.asarray(center, int) - np.asarray(lo),
+                     0, np.asarray(run_shape) - 1)
+        sig = _sigma(r_hint, rays_at_peak,
+                     _verts_cyto if head == 'cytoplasm' else _verts_nuc)
+        d2 = sum(((g - cl[a]) / sig[a]) ** 2 for a, g in enumerate(grids))
+        pr = np.exp(-0.5 * d2).astype(np.float32)[..., None]
+        x = np.concatenate([crop[..., :n_img], pr, pr], axis=-1)[None]
+        y = model.keras_model(tf.convert_to_tensor(x, tf.float32), training=False)
+
+        def _get(k):
+            a = y[k].numpy()[0]
+            a = a[..., 0] if a.shape[-1] == 1 else a
+            if a.shape != run_shape:
+                a = zoom(a, tuple(run_shape[i] / a.shape[i] for i in range(nd)), order=1)
+                a = a[tuple(slice(0, s) for s in run_shape)]
+            return a
+        return sl, cl, _get('nucleus_mask'), _get('cytoplasm_mask')
+
+    def _grow(m, cl):
+        """Послойное выращивание маски от центра промпта.
+        3D-связность здесь не годится: при anisotropy=[5,1,1] объект толщиной
+        3-5 срезов легко распадается по Z, а по слайсам он всегда цел."""
+        out = np.zeros_like(m, bool)
+        if not m.any():
+            return out
+        if nd == 2:
+            cc, n = _cc_label(m)
+            k = int(cc[tuple(int(v) for v in cl)]) if n else 0
+            return (cc == k) if k > 0 else out
+
+        z0 = int(cl[0])
+        cc, n = _cc_label(m[z0])
+        k = int(cc[tuple(int(v) for v in cl[1:])]) if n else 0
+        if k == 0:
+            return out
+        out[z0] = (cc == k)
+
+        for step in (1, -1):
+            z = z0 + step
+            while 0 <= z < m.shape[0]:
+                prev = out[z - step]
+                if not prev.any():
+                    break
+                cc, n = _cc_label(m[z])
+                if n == 0:
+                    break
+                ids = np.unique(cc[prev & (cc > 0)])
+                ids = ids[ids > 0]
+                if ids.size == 0:
+                    break
+                out[z] = np.isin(cc, ids)
+                z += step
+        return out
+
+    def _place(labels_arr, lab, bb, sl, grown, out, area):
+        """Полиэдр ОБЪЕДИНЁННЫЙ с выращенной маской внутри окна.
+
+        Всё считается в ОКРЕСТНОСТИ reg = bbox(инстанса) ∪ окно прогона, а не
+        по полному тому. Прежняя версия на каждый инстанс материализовала
+        (labels == lab) на 17x2048x2048 — 71 МБ bool и 71 млн операций, и это
+        умножалось на число инстансов. Результат побитово тот же: bbox содержит
+        весь инстанс, а за пределами reg полиэдр пуст и `out` не меняется.
+
+        Проверка тождественности идёт по ПОЛИЭДРУ, а не по объединению с
+        маской. NMS уже вынес решение «это разные объекты» по критерию
+        A_inter/A_min на полиэдрах; повторять тот же тест на РАСШИРЕННЫХ
+        масках нельзя, потому что рефайн на промпте у границы двух
+        соприкасающихся клеток выдаёт обе, маска первой разливается на
+        территорию второй, и вторая объявляется дубликатом.
+        Проверка остаётся нужной для случая, когда лучи занижены и одну
+        клетку замощают несколько полиэдров — там пересекаются сами полиэдры.
+        """
+        reg = tuple(slice(min(bb[a].start, sl[a].start),
+                          max(bb[a].stop, sl[a].stop)) for a in range(nd))
+        poly = (labels_arr[reg] == lab)
+        out_reg = out[reg]                      # view: запись идёт в out
+        n_poly = int(poly.sum())
+
+        sub = out_reg[poly]
+        sub = sub[sub > 0]
+        if sub.size:
+            vals, cnts = np.unique(sub, return_counts=True)
+            a_min = np.minimum(n_poly, np.array([area.get(int(v), n_poly)
+                                                 for v in vals], np.int64))
+            iom = cnts / np.maximum(a_min, 1)
+            k = int(np.argmax(iom))
+            if iom[k] > nms_thresh:
+                return int(vals[k]), False      # тот же объект
+
+        loc = tuple(slice(sl[a].start - reg[a].start, sl[a].stop - reg[a].start)
+                    for a in range(nd))
+        keep = poly.copy()
+        keep[loc] |= grown
+        if not keep.any():
+            keep = poly
+
+        w = keep & (out_reg == 0)
+        if not w.any():
+            w = poly & (out_reg == 0)
+        if not w.any():
+            return 0, False
+        out_reg[w] = lab
+        area[lab] = int(w.sum())
+        return lab, True
+
+    def _bbox(objs, lab):
+        bb = objs[lab - 1] if 0 < lab <= len(objs) else None
+        if bb is None:
+            raise RuntimeError(f"метка {lab} отсутствует в find_objects")
+        return bb
+
+    r_nuc = float(getattr(config, 'median_max_dist_nucleus', 25.0))
+    r_cyto = float(getattr(config, 'median_max_dist_cytoplasm', 60.0))
+
+    nuc_objs = [] if nuc_labels is None else find_objects(nuc_labels)
+    cyto_objs = [] if cyto_labels is None else find_objects(cyto_labels)
+
+    nuc_anchor = _anchors(nuc_labels, nuc_coords, nuc_probs, nuc_dists, nuc_objs)
+    cyto_anchor = _anchors(cyto_labels, cyto_coords, cyto_probs, cyto_dists,
+                           cyto_objs)
+
+    n_runs, n_merge_n, n_merge_c, cyto_seen = 0, 0, 0, {}
+
+    # ---------- ЯДРА (и клетки, которым они принадлежат) ----------
+    for lab_n in sorted(nuc_anchor, key=lambda L: -nuc_anchor[L][2]):
+        ctr, rays, _ = nuc_anchor[lab_n]
+
+        sl, cl, mn, mc = _run(ctr, r_nuc, rays, head='nucleus')
+        n_runs += 1
+
+        this_n, new_n = _place(nuc_labels, lab_n, _bbox(nuc_objs, lab_n), sl,
+                               _grow(mn > mask_thresh, cl), nuc_out, area_n)
+        if this_n and not new_n:
+            n_merge_n += 1
+
+        this_c = 0
+        if cyto_labels is not None:
+            # окно, а не полный том: poly_n[sl] тождественно (nuc_labels[sl]==lab_n)
+            _m = (nuc_labels[sl] == lab_n)
+            vals, cnts = np.unique(cyto_labels[sl][_m], return_counts=True)
+            ok = vals > 0
+            if ok.any():
+                lab_c = int(vals[ok][np.argmax(cnts[ok])])
+                if lab_c in cyto_seen:
+                    this_c = cyto_seen[lab_c]  # многоядерная клетка
+                else:
+                    this_c, new_c = _place(cyto_labels, lab_c,
+                                           _bbox(cyto_objs, lab_c), sl,
+                                           _grow(mc > mask_thresh, cl),
+                                           cyto_out, area_c)
+                    if this_c:
+                        cyto_seen[lab_c] = this_c
+                        if not new_c:
+                            n_merge_c += 1
+        if this_n and this_c:
+            assignments[this_n] = this_c
+
+    # ---------- КЛЕТКИ БЕЗ ЯДЕР ----------
+    for lab_c in sorted(cyto_anchor, key=lambda L: -cyto_anchor[L][2]):
+        if lab_c in cyto_seen:
+            continue
+        ctr, rays, _ = cyto_anchor[lab_c]
+        sl, cl, _mn, mc = _run(ctr, r_cyto, rays, head='cytoplasm')
+        n_runs += 1
+        got, new_c = _place(cyto_labels, lab_c, _bbox(cyto_objs, lab_c), sl,
+                            _grow(mc > mask_thresh, cl), cyto_out, area_c)
+        if got:
+            cyto_seen[lab_c] = got
+            if not new_c:
+                n_merge_c += 1
+
+
+    if verbose:
+        _np_ = 0 if nuc_labels is None else int(len(np.unique(nuc_labels)) - 1)
+        _cp_ = 0 if cyto_labels is None else int(len(np.unique(cyto_labels)) - 1)
+        print(f"  [prompted] полиэдров nuc={_np_} cyto={_cp_} -> "
+              f"ЗАПИСАНО nuc={int(len(np.unique(nuc_out)) - 1)} "
+              f"cyto={int(len(np.unique(cyto_out)) - 1)} | "
+              f"схлопнуто как тот же объект {n_merge_n}/{n_merge_c} "
+              f"(критерий NMS, nms_thresh={nms_thresh:.2f}) | "
+              f"прогонов {n_runs}, пар ядро-клетка: {len(assignments)}")
+    return nuc_out, cyto_out, assignments
 
 def create_overlay_with_iou(image, nucleus_pred, cytoplasm_pred,
                             nucleus_gt, cytoplasm_gt,
@@ -22,22 +331,22 @@ def create_overlay_with_iou(image, nucleus_pred, cytoplasm_pred,
 
     NEW: Shows each instance with unique color from random colormap
     """
-    from skimage.segmentation import find_boundaries
+
     from stardist import random_label_cmap
     import cv2
     import matplotlib.pyplot as plt
-    from matplotlib import colors
-    import io
+
 
     # Handle 3D
-    if image.ndim == 3 and image.shape[-1] not in [3, 4]:
+    if nucleus_pred.ndim == 3:
         if z_slice is None:
-            z_slice = image.shape[0] // 2
-        image = image[z_slice]
+            z_slice = nucleus_pred.shape[0] // 2
         nucleus_pred = nucleus_pred[z_slice]
         cytoplasm_pred = cytoplasm_pred[z_slice]
         nucleus_gt = nucleus_gt[z_slice]
         cytoplasm_gt = cytoplasm_gt[z_slice]
+        if image.ndim >= 3:
+            image = image[z_slice]  # (Z,Y,X)->(Y,X) или (Z,Y,X,C)->(Y,X,C)
 
     # Convert to grayscale
     if image.ndim == 3 and image.shape[-1] in [3, 4]:
@@ -133,143 +442,6 @@ def create_overlay_with_iou(image, nucleus_pred, cytoplasm_pred,
     return overlay
 
 
-def remove_overlapping_instances(instances, iou_threshold=0.3, containment_threshold=0.7):
-    """
-    Remove overlapping instances with improved logic:
-    1. Remove small objects fully contained in larger ones
-    2. Merge objects with high IoU
-    3. Keep larger object when overlap is significant
-
-    Args:
-        instances: (H, W) instance mask
-        iou_threshold: minimum IoU to consider overlap (default: 0.3)
-        containment_threshold: if object A is 70%+ inside B, remove A (default: 0.7)
-
-    Returns:
-        cleaned_instances: instance mask without overlaps
-    """
-    from skimage.measure import regionprops
-
-    if instances.max() == 0:
-        return instances
-
-    props = {p.label: p for p in regionprops(instances)}
-    n_objects = len(props)
-
-    if n_objects <= 1:
-        return instances
-
-    # ============================================================
-    # STEP 1: Remove contained objects (small inside large)
-    # ============================================================
-
-    to_remove = set()
-
-    for label_i, prop_i in props.items():
-        if label_i in to_remove:
-            continue
-
-        mask_i = (instances == label_i)
-        area_i = prop_i.area
-
-        for label_j, prop_j in props.items():
-            if label_i == label_j or label_j in to_remove:
-                continue
-
-            mask_j = (instances == label_j)
-            area_j = prop_j.area
-
-            # Check if i is contained in j
-            intersection = np.logical_and(mask_i, mask_j).sum()
-
-            # If small object is mostly (>70%) inside large object
-            if area_i < area_j:
-                containment_ratio = intersection / area_i
-                if containment_ratio > containment_threshold:
-                    to_remove.add(label_i)
-                    break
-
-    print(f"    Removed {len(to_remove)} contained objects")
-
-    # ============================================================
-    # STEP 2: Remove objects with high IoU overlap
-    # ============================================================
-
-    remaining_labels = [l for l in props.keys() if l not in to_remove]
-
-    if len(remaining_labels) > 1:
-        # Recompute props for remaining objects
-        cleaned_temp = instances.copy()
-        for label in to_remove:
-            cleaned_temp[cleaned_temp == label] = 0
-
-        props_remaining = {p.label: p for p in regionprops(cleaned_temp) if p.label > 0}
-
-        # Compute IoU matrix
-        labels_list = list(props_remaining.keys())
-        n_remaining = len(labels_list)
-
-        iou_matrix = np.zeros((n_remaining, n_remaining))
-
-        for i, label_i in enumerate(labels_list):
-            mask_i = (cleaned_temp == label_i)
-            for j, label_j in enumerate(labels_list):
-                if i >= j:
-                    continue
-                mask_j = (cleaned_temp == label_j)
-
-                intersection = np.logical_and(mask_i, mask_j).sum()
-                union = np.logical_or(mask_i, mask_j).sum()
-
-                iou = intersection / union if union > 0 else 0
-                iou_matrix[i, j] = iou
-                iou_matrix[j, i] = iou
-
-        # Find overlapping pairs and remove smaller
-        overlapping_pairs = np.argwhere(iou_matrix > iou_threshold)
-
-        for i, j in overlapping_pairs:
-            if i >= j:
-                continue
-
-            label_i = labels_list[i]
-            label_j = labels_list[j]
-
-            if label_i in to_remove or label_j in to_remove:
-                continue
-
-            # Keep larger object
-            area_i = props_remaining[label_i].area
-            area_j = props_remaining[label_j].area
-
-            if area_i > area_j:
-                to_remove.add(label_j)
-            else:
-                to_remove.add(label_i)
-
-    # ============================================================
-    # STEP 3: Create cleaned mask
-    # ============================================================
-
-    cleaned = instances.copy()
-    for label in to_remove:
-        cleaned[cleaned == label] = 0
-
-    # Relabel consecutively
-    unique_labels = np.unique(cleaned)
-    unique_labels = unique_labels[unique_labels > 0]
-
-    result = np.zeros_like(cleaned)
-    for new_id, old_id in enumerate(unique_labels, start=1):
-        result[cleaned == old_id] = new_id
-
-    n_removed = len(to_remove)
-    n_final = result.max()
-
-    if n_removed > 0:
-        print(f"    Overlap removal: {n_objects} → {n_final} (removed {n_removed})")
-
-    return result
 
 
 def create_iou_comparison_overlay(image, nucleus_pred, cytoplasm_pred,
@@ -447,7 +619,9 @@ class CytoNucsPredictor:
         self.ndim = config.ndim
         self.grid = tuple(getattr(config, 'grid', (1,) * self.ndim))[-self.ndim:]
         self.n_rays = config.n_rays
-        self.rays = getattr(config, 'rays', None)
+        self.rays_nucleus = getattr(config, 'rays_nucleus', getattr(config, 'rays', None))
+        self.rays_cytoplasm = getattr(config, 'rays_cytoplasm', getattr(config, 'rays', None))
+        self.rays = self.rays_nucleus  # обратная совместимость
         # ============================================================
         # === ПОРОГИ из аргументов, config, или defaults ===
         # ============================================================
@@ -485,518 +659,1344 @@ class CytoNucsPredictor:
         print(f"  prob_thresh_cytoplasm: {self.prob_thresh_cytoplasm}")
         print(f"  nms_thresh: {self.nms_thresh}")
 
+    def _get_detection_model(self):
+        """
+        Detection-only submodel для первого StarDist прохода.
+
+        На первом проходе нужны только:
+          - nucleus_prob
+          - nucleus_dist
+          - cytoplasm_prob
+          - cytoplasm_dist
+
+        Refinement heads здесь не считаются, потому что с нулевым prompt
+        их результат не используется для финальных instances.
+
+        Настоящий refinement выполняется позже через
+        predict_instances_prompted() с реальным Gaussian prompt.
+        """
+        if not hasattr(self, '_detection_model') or self._detection_model is None:
+            self._detection_model = tf.keras.Model(
+                inputs=self.model.keras_model.inputs,
+                outputs={
+                    'nucleus_prob':
+                        self.model.keras_model.get_layer('nucleus_prob').output,
+
+                    'nucleus_dist':
+                        self.model.keras_model.get_layer('nucleus_dist').output,
+
+                    'cytoplasm_prob':
+                        self.model.keras_model.get_layer('cytoplasm_prob').output,
+
+                    'cytoplasm_dist':
+                        self.model.keras_model.get_layer('cytoplasm_dist').output,
+                },
+                name='cytonucs_detection_inference'
+            )
+
+        return self._detection_model
+
     def _predict_with_tiling(self, img, n_tiles, normalize_img):
         """
-        Tiling с weighted blending на probability maps,
-        затем ОДИН NMS на полном изображении - убирает все артефакты.
+        StarDist/CSBDeep tiled inference для CytoNucs. Работает для 2D и 3D.
+
+        Оси делятся на два класса:
+
+          * СВОБОДНАЯ ось: сшивается штатным csbdeep tile_iterator с overlap
+            >= context, тайлы шире обучающего патча (сеть свёрточная).
+
+          * ФИКСИРОВАННАЯ ось: окно всегда содержит ровно train_patch[a]
+            реальных отсчётов, окна непересекающиеся, последнее сдвигается
+            назад и записывает только ещё не покрытое.
+
+        Какие оси фиксированные — задаёт tiling_fixed_axes (см. ниже). Для 3D
+        по умолчанию это Z: препарат 2D-культуры плоский, обучающий патч по Z
+        покрывает его целиком, и сеть откалибрована именно на стек в train_Z
+        срезов вместе с его краевым паддингом; подать другое число срезов —
+        сменить режим целиком. Для 2D фиксированных осей нет, остаётся чистый
+        канонический StarDist tiling.
+
+        Отличия от прежней fixed-Z версии:
+          * нет `raise ... "рассчитана на ndim=3"` -> 2D работает;
+          * нет требования grid_Z=1: границы окон выравниваются по block_sizes,
+            поэтому grid по фиксированной оси может быть любым (иначе смена
+            анизотропии на новых данных ломала бы инференс уже после обучения);
+          * произвольный набор фиксированных осей, а не жёстко ось 0.
+
+        Первый проход считает только detection heads (prob/dist обеих голов);
+        zero-prompt refinement не нужен, настоящий идёт в
+        predict_instances_prompted() с реальным Gaussian prompt.
         """
         from csbdeep.utils import normalize
+        from csbdeep.internals.predict import tile_iterator
+        from math import gcd
+        from itertools import product
         import numpy as np
+        import tensorflow as tf
+        import gc
+
+        _n_img = int(self.config.n_channel_in)
+        nd = int(self.ndim)
+
+        # ============================================================
+        # INPUT
+        # ============================================================
+
+        if img.ndim == nd:
+            img = img[..., np.newaxis]
+        elif img.ndim != nd + 1:
+            raise ValueError(
+                f"_predict_with_tiling: ожидалось ndim={nd} "
+                f"или ndim+channels, получено shape={img.shape}")
 
         if normalize_img:
-            if img.ndim == 3 and img.shape[-1] in [3, 4]:
-                img = normalize(img.astype(np.float32), 1, 99.8, axis=(0, 1))
-            else:
-                img = normalize(img.astype(np.float32), 1, 99.8,
-                                axis=tuple(range(self.ndim)))
+            img = normalize(img.astype(np.float32), 1, 99.8,
+                            axis=tuple(range(nd)))
+        else:
+            img = img.astype(np.float32, copy=False)
 
-        patch_size = self.config.train_patch_size
-        img_shape = img.shape[:self.ndim]
+        # Первый detection pass идёт с нулевыми prompts.
+        if img.shape[-1] == _n_img:
+            img = np.concatenate(
+                [img, np.zeros(img.shape[:nd] + (2,), np.float32)], axis=-1)
+        elif img.shape[-1] != _n_img + 2:
+            raise ValueError(
+                f"_predict_with_tiling: channels={img.shape[-1]}, "
+                f"ожидалось {_n_img} или {_n_img + 2}")
 
-        # БОЛЬШОЙ overlap для гладкого blending
-        overlap = tuple(p // 2 for p in patch_size)  # 50%
-        print(f"  Tiling: {n_tiles} tiles, patch_size={patch_size}, overlap={overlap}")
-
-        # Накапливаем PROBABILITY MAPS, не instances!
-        nucleus_prob_full = np.zeros(img_shape, dtype=np.float32)
-        nucleus_dist_full = np.zeros(img_shape + (self.n_rays,), dtype=np.float32)
-        cytoplasm_prob_full = np.zeros(img_shape, dtype=np.float32)
-        cytoplasm_dist_full = np.zeros(img_shape + (self.n_rays,), dtype=np.float32)
-        weight_map = np.zeros(img_shape, dtype=np.float32)
-
-        # Весовая функция (gaussian)
-        weight_patch = self._create_gaussian_weight(patch_size)
+        img_shape = tuple(int(v) for v in img.shape[:nd])
+        self._last_img_shape = img_shape
 
         # ============================================================
-        # ГЕНЕРАЦИЯ ПОЗИЦИЙ ТАЙЛОВ
+        # HEAD GRIDS
         # ============================================================
-        step = tuple(p - o for p, o in zip(patch_size, overlap))
 
-        if self.ndim == 2:
-            y_positions = list(range(0, img_shape[0] - patch_size[0] + 1, step[0]))
-            if len(y_positions) == 0 or y_positions[-1] + patch_size[0] < img_shape[0]:
-                y_positions.append(max(0, img_shape[0] - patch_size[0]))
+        def _read_grid(name):
+            g = getattr(self.config, name, None)
+            if g is None:
+                g = getattr(self.config, 'grid', (1,) * nd)
+            g = tuple(int(v) for v in g)
+            if len(g) != nd or any(v < 1 for v in g):
+                raise ValueError(f"Некорректный {name}: {g}")
+            return g
 
-            x_positions = list(range(0, img_shape[1] - patch_size[1] + 1, step[1]))
-            if len(x_positions) == 0 or x_positions[-1] + patch_size[1] < img_shape[1]:
-                x_positions.append(max(0, img_shape[1] - patch_size[1]))
-
-            tile_positions = [(y, x) for y in y_positions for x in x_positions]
-
-            print(f"    Y positions: {y_positions}")
-            print(f"    X positions: {x_positions}")
-
-        else:  # 3D
-            z_positions = list(range(0, img_shape[0] - patch_size[0] + 1, step[0]))
-            if len(z_positions) == 0 or z_positions[-1] + patch_size[0] < img_shape[0]:
-                z_positions.append(max(0, img_shape[0] - patch_size[0]))
-
-            y_positions = list(range(0, img_shape[1] - patch_size[1] + 1, step[1]))
-            if len(y_positions) == 0 or y_positions[-1] + patch_size[1] < img_shape[1]:
-                y_positions.append(max(0, img_shape[1] - patch_size[1]))
-
-            x_positions = list(range(0, img_shape[2] - patch_size[2] + 1, step[2]))
-            if len(x_positions) == 0 or x_positions[-1] + patch_size[2] < img_shape[2]:
-                x_positions.append(max(0, img_shape[2] - patch_size[2]))
-
-            tile_positions = [(z, y, x) for z in z_positions for y in y_positions for x in x_positions]
-
-        print(f"    Total tiles: {len(tile_positions)}")
+        nuc_grid = _read_grid('nucleus_grid')
+        cyto_grid = _read_grid('cytoplasm_grid')
 
         # ============================================================
-        # ОБРАБОТКА ТАЙЛОВ - НАКАПЛИВАЕМ PROBABILITY MAPS
+        # ARCHITECTURE
         # ============================================================
-        total_tiles = len(tile_positions)
 
-        for tile_idx, tile_pos in enumerate(tile_positions, start=1):
-            if self.ndim == 2:
-                y_start, x_start = tile_pos
-                y_end = min(y_start + patch_size[0], img_shape[0])
-                x_end = min(x_start + patch_size[1], img_shape[1])
+        _an = tuple(getattr(self.config, 'anisotropy', (1,) * nd))
+        if len(_an) != nd:
+            _an = (1,) * nd
+        _mn = min(_an)
+        _pool = tuple(2 if v < 2.0 * _mn else 1 for v in _an)
+        _base_grid = tuple(min(n, c) for n, c in zip(nuc_grid, cyto_grid))
+        _depth = int(getattr(self.config, 'unet_n_depth', 4))
 
-                if img.ndim == 3:
-                    patch = img[y_start:y_end, x_start:x_end, :]
+        def _lcm(a, b):
+            return int(a) * int(b) // gcd(int(a), int(b))
+
+        def _levels_between(coarse, fine):
+            n = 0
+            cur = list(fine)
+            while tuple(cur) != tuple(coarse):
+                nxt = [cur[a] * int(_pool[a]) if coarse[a] > cur[a] else cur[a]
+                       for a in range(nd)]
+                if nxt == cur:
+                    raise ValueError(
+                        f"grid {coarse} недостижим из {fine} через pool={_pool}")
+                cur = nxt
+                n += 1
+            return n
+
+        n_pool_base = _levels_between(_base_grid, (1,) * nd)
+        nuc_skip = _levels_between(nuc_grid, _base_grid)
+        cyto_skip = _levels_between(cyto_grid, _base_grid)
+
+        # ============================================================
+        # INPUT DIVISIBILITY
+        # ============================================================
+
+        div_by = tuple(max(1, int(_base_grid[a]) * (int(_pool[a]) ** _depth))
+                       for a in range(nd))
+
+        # Шаг раскладки: кратность входа сети И кратность grid ОБЕИХ голов —
+        # иначе перевод s_src/s_dst в grid-координаты головы перестаёт быть
+        # точным делением.
+        block_sizes = tuple(_lcm(_lcm(div_by[a], nuc_grid[a]), cyto_grid[a])
+                            for a in range(nd))
+
+        # ============================================================
+        # EFFECTIVE RECEPTIVE FIELD
+        # ============================================================
+        #
+        # cytoplasm decoder получает nucleus context, поэтому его RF больше
+        # RF обычного U-Net и csbdeep.tile_overlap(depth,3,2) недостаточно.
+        # Расчёт повторяет топологию cytonucs_model.py:
+        #   pre_pool -> shared encoder -> nucleus decoder
+        #   -> nucleus_prob_ctx_src -> cytoplasm decoder
+        # ============================================================
+
+        def _rf_detection_axis(a):
+            p = int(_pool[a])
+            kernel = 3
+
+            def _conv(r, jump, n=1):
+                return r + n * (kernel - 1) * jump, jump
+
+            def _pool_op(r, jump):
+                if p > 1:
+                    r = r + (p - 1) * jump
+                    jump = jump * p
+                return r, jump
+
+            def _up_op(r, jump):
+                if p > 1:
+                    if jump % p != 0:
+                        raise RuntimeError(f"RF: jump={jump} не делится на pool={p}")
+                    jump = jump // p
+                return r, jump
+
+            r, jump = 1, 1
+            for _ in range(n_pool_base):
+                r, jump = _conv(r, jump, n=2)
+                r, jump = _pool_op(r, jump)
+
+            encoder_rf, encoder_jump = [], []
+            for i in range(_depth + 1):
+                r, jump = _conv(r, jump, n=2)
+                encoder_rf.append(r)
+                encoder_jump.append(jump)
+                if i < _depth:
+                    r, jump = _pool_op(r, jump)
+
+            bottleneck_r, bottleneck_jump = r, jump
+
+            rn, jn = bottleneck_r, bottleneck_jump
+            for i in reversed(range(nuc_skip, _depth)):
+                rn, jn = _up_op(rn, jn)
+                rn = max(rn, encoder_rf[i])
+                rn, jn = _conv(rn, jn, n=2)
+            x_nucleus_rf, x_nucleus_jump = rn, jn
+            nucleus_detection_rf, _ = _conv(x_nucleus_rf, x_nucleus_jump, n=1)
+
+            ctx_r, ctx_jump = _conv(x_nucleus_rf, x_nucleus_jump, n=1)
+            _ctx_delta = cyto_skip - nuc_skip
+            for _ in range(max(0, _ctx_delta)):
+                ctx_r, ctx_jump = _pool_op(ctx_r, ctx_jump)
+            for _ in range(max(0, -_ctx_delta)):
+                ctx_r, ctx_jump = _up_op(ctx_r, ctx_jump)
+            ctx_base_r, ctx_base_jump = ctx_r, ctx_jump
+
+            rc, jc = bottleneck_r, bottleneck_jump
+            for i in reversed(range(cyto_skip, _depth)):
+                rc, jc = _up_op(rc, jc)
+                rc = max(rc, encoder_rf[i])
+                cr, cj = ctx_base_r, ctx_base_jump
+                for _ in range(i - cyto_skip):
+                    cr, cj = _pool_op(cr, cj)
+                if cj != jc:
+                    raise RuntimeError(
+                        f"RF context resolution mismatch: level={i}, "
+                        f"ctx_jump={cj}, decoder_jump={jc}")
+                rc = max(rc, cr)
+                rc, jc = _conv(rc, jc, n=2)
+            cytoplasm_detection_rf, _ = _conv(rc, jc, n=1)
+
+            return int(max(nucleus_detection_rf, cytoplasm_detection_rf))
+
+        rf_detection = tuple(_rf_detection_axis(a) for a in range(nd))
+        context = tuple(int(np.ceil((rf_detection[a] - 1) / 2.0)) for a in range(nd))
+
+        _tp = tuple(int(v) for v in self.config.train_patch_size)[-nd:]
+
+        # Какие оси фиксированные. По умолчанию для 3D это ось 0 (Z), для 2D —
+        # ни одной. Переопределяется ключом tiling_fixed_axes в inference-секции
+        # конфига: [] даёт канонический tiling по всем осям (изотропные 3D),
+        # [0] — текущее поведение.
+        _fx_cfg = getattr(self.config, 'tiling_fixed_axes', None)
+        if _fx_cfg is None:
+            _fx_cfg = [0] if nd == 3 else []
+        _fx_cfg = sorted({int(a) for a in _fx_cfg})
+        if any(a < 0 or a >= nd for a in _fx_cfg):
+            raise ValueError(f"tiling_fixed_axes={_fx_cfg} вне диапазона [0,{nd})")
+        fixed = tuple(a in _fx_cfg for a in range(nd))
+
+        for a in _fx_cfg:
+            if _tp[a] % block_sizes[a] != 0:
+                raise ValueError(
+                    f"Фиксированная ось {a}: train_patch={_tp[a]} не кратен "
+                    f"block_size={block_sizes[a]}")
+
+        # ============================================================
+        # n_tiles
+        # ============================================================
+
+        if n_tiles is None:
+            n_tiles = (1,) * nd
+        else:
+            n_tiles = tuple(int(v) for v in n_tiles)
+            if len(n_tiles) == nd + 1:
+                if n_tiles[-1] != 1:
+                    raise ValueError("Канальная ось не может тайлиться")
+                n_tiles = n_tiles[:nd]
+            if len(n_tiles) != nd or any(v < 1 for v in n_tiles):
+                raise ValueError(
+                    f"n_tiles должен иметь {nd} положительных значений, "
+                    f"получено {n_tiles}")
+
+        # ============================================================
+        # ФИКСИРОВАННЫЕ ОСИ: непересекающиеся окна по train_patch
+        # ============================================================
+
+        def _fdown(v, d):
+            return (int(v) // int(d)) * int(d)
+
+        def _fup(v, d):
+            return -((-int(v)) // int(d)) * int(d)
+
+        def _fixed_plan(a):
+            """(src_lo, src_size, dst_lo, dst_hi) по фиксированной оси.
+            dst-интервалы непересекающиеся и покрывают [0, n) ровно один раз."""
+            n, d = img_shape[a], block_sizes[a]
+            win = max(d, min(_fdown(_tp[a], d), _fup(n, d)))
+            if n <= win:
+                return [(0, _fup(n, d), 0, n)]
+            out = []
+            for lo in range(0, n, win):
+                hi = min(lo + win, n)
+                s0 = _fdown(min(lo, n - win), d)
+                size = win if s0 + win >= hi else _fup(hi - s0, d)
+                out.append((s0, size, lo, hi))
+            return out
+
+        fixed_axes = [a for a in range(nd) if fixed[a]]
+        free_axes = [a for a in range(nd) if not fixed[a]]
+        fixed_plans = {a: _fixed_plan(a) for a in fixed_axes}
+
+        # ============================================================
+        # СВОБОДНЫЕ ОСИ: паддинг до кратности + overlap >= context
+        # ============================================================
+
+        pad_free = {a: (-img_shape[a]) % block_sizes[a] for a in free_axes}
+        padded = tuple(img_shape[a] + pad_free.get(a, 0) for a in range(nd))
+
+        n_block_overlaps = tuple(
+            0 if fixed[a] else int(np.ceil(context[a] / block_sizes[a]))
+            for a in range(nd))
+
+        n_tiles_eff = tuple(
+            1 if fixed[a]
+            else int(np.clip(n_tiles[a], 1, max(1, padded[a] // block_sizes[a])))
+            for a in range(nd))
+
+        print(f"  Detection RF={rf_detection}, required context={context}, "
+              f"block_sizes={block_sizes}")
+        print(f"  Оси: фиксированные {fixed_axes} -> окно "
+              f"train_patch, без overlap; свободные {free_axes} -> tile_iterator, "
+              f"overlap="
+              f"{tuple(n_block_overlaps[a] * block_sizes[a] for a in free_axes)} px")
+        for a in fixed_axes:
+            print(f"    ось {a}: n={img_shape[a]}, train={_tp[a]}, "
+                  f"окон={len(fixed_plans[a])}")
+            for i, (s0, sz, d0, d1) in enumerate(fixed_plans[a]):
+                print(f"      #{i}: src={s0}:{s0 + sz} -> dst={d0}:{d1}")
+
+        # ============================================================
+        # ВЫХОДНЫЕ КАРТЫ
+        # ============================================================
+        #
+        # По фиксированным осям адресация глобальная -> размер ceil(n/grid).
+        # По свободным осям tile_iterator работает поверх ПАДДЕННОГО массива,
+        # его s_dst покрывает [0, padded) -> держим padded/grid и режем в конце.
+        # ============================================================
+
+        def _map_shape(grid_):
+            return tuple(
+                int(np.ceil(img_shape[a] / grid_[a])) if fixed[a]
+                else padded[a] // grid_[a]
+                for a in range(nd))
+
+        nuc_shape_tiled = _map_shape(nuc_grid)
+        cyto_shape_tiled = _map_shape(cyto_grid)
+
+        _dist_dtype = np.dtype(getattr(self.config, 'dist_map_dtype', 'float32'))
+
+        nucleus_prob_full = np.empty(nuc_shape_tiled, np.float32)
+        nucleus_dist_full = np.empty(nuc_shape_tiled + (self.n_rays,), _dist_dtype)
+        cytoplasm_prob_full = np.empty(cyto_shape_tiled, np.float32)
+        cytoplasm_dist_full = np.empty(cyto_shape_tiled + (self.n_rays,), _dist_dtype)
+
+        cov_nuc = np.zeros(nuc_shape_tiled, np.uint8)
+        cov_cyto = np.zeros(cyto_shape_tiled, np.uint8)
+
+        # ============================================================
+        # OUTPUT COPY
+        # ============================================================
+
+        def _put(dst, val, grid_, s_src, s_dst, fx, coverage=None):
+            """fx: {axis: (src_lo, dst_lo, dst_hi)} для фиксированных осей.
+            Для свободных осей берутся слайсы tile_iterator."""
+            ss, sd = [], []
+            for a in range(nd):
+                g = int(grid_[a])
+                if fixed[a]:
+                    src_lo, dst_lo, dst_hi = fx[a]
+                    if src_lo % g or dst_lo % g:
+                        raise RuntimeError(
+                            f"ось {a}: окно {src_lo}/{dst_lo} не кратно grid={g}")
+                    g_lo = dst_lo // g
+                    g_hi = -((-dst_hi) // g)          # ceil: последний блок
+                    off = src_lo // g
+                    sd.append(slice(g_lo, g_hi))
+                    ss.append(slice(g_lo - off, g_hi - off))
                 else:
-                    patch = img[y_start:y_end, x_start:x_end]
+                    a_src, a_dst = s_src[a], s_dst[a]
+                    if (a_src.start % g or a_src.stop % g
+                            or a_dst.start % g or a_dst.stop % g):
+                        raise RuntimeError(
+                            f"ось {a}: срезы тайла не кратны grid={g}: "
+                            f"src={a_src}, dst={a_dst}")
+                    ss.append(slice(a_src.start // g, a_src.stop // g))
+                    sd.append(slice(a_dst.start // g, a_dst.stop // g))
+            ss, sd = tuple(ss), tuple(sd)
+            dst[sd] = val[ss]
+            if coverage is not None:
+                coverage[sd] += 1
 
-                actual_h, actual_w = patch.shape[:2]
-                if actual_h < patch_size[0] or actual_w < patch_size[1]:
-                    if patch.ndim == 3:
-                        patch_padded = np.zeros((patch_size[0], patch_size[1], patch.shape[2]), dtype=patch.dtype)
-                        patch_padded[:actual_h, :actual_w, :] = patch
+        # ============================================================
+        # DETECTION MODEL
+        # ============================================================
+
+        detection_model = self._get_detection_model()
+        tiles_done = 0
+
+        _bs_full = tuple(block_sizes) + (1,)
+        _nt_full = tuple(n_tiles_eff) + (1,)
+        _ov_full = tuple(n_block_overlaps) + (0,)
+
+        try:
+            # Перебор окон по фиксированным осям (для 2D список пуст ->
+            # ровно одна итерация со всем изображением).
+            for combo in product(*[fixed_plans[a] for a in fixed_axes]):
+                fx = {a: (c[0], c[2], c[3]) for a, c in zip(fixed_axes, combo)}
+                win = {a: (c[0], c[1]) for a, c in zip(fixed_axes, combo)}
+
+                sub = img[tuple(
+                    slice(win[a][0], min(win[a][0] + win[a][1], img_shape[a]))
+                    if fixed[a] else slice(None) for a in range(nd))]
+
+                pad_width = []
+                for a in range(nd):
+                    if fixed[a]:
+                        pad_width.append((0, win[a][1] - sub.shape[a]))
                     else:
-                        patch_padded = np.zeros(patch_size, dtype=patch.dtype)
-                        patch_padded[:actual_h, :actual_w] = patch
-                    patch = patch_padded
+                        pad_width.append((0, pad_free[a]))
+                pad_width.append((0, 0))
 
-                slices_out = (slice(y_start, y_end), slice(x_start, x_end))
-                slices_patch = (slice(0, y_end - y_start), slice(0, x_end - x_start))
+                if any(p1 for _, p1 in pad_width):
+                    try:
+                        sub = np.pad(sub, pad_width, mode='reflect')
+                    except ValueError:
+                        sub = np.pad(sub, pad_width, mode='edge')
 
-            else:  # 3D
-                z_start, y_start, x_start = tile_pos
-                z_end = min(z_start + patch_size[0], img_shape[0])
-                y_end = min(y_start + patch_size[1], img_shape[1])
-                x_end = min(x_start + patch_size[2], img_shape[2])
+                for a in fixed_axes:
+                    if sub.shape[a] != win[a][1]:
+                        raise RuntimeError(
+                            f"ось {a}: перед forward ожидалось {win[a][1]}, "
+                            f"получено {sub.shape[a]}")
 
-                if img.ndim == 4:
-                    patch = img[z_start:z_end, y_start:y_end, x_start:x_end, :]
-                else:
-                    patch = img[z_start:z_end, y_start:y_end, x_start:x_end]
+                for tile, s_src, s_dst in tile_iterator(
+                        sub, n_tiles=_nt_full, block_sizes=_bs_full,
+                        n_block_overlaps=_ov_full):
 
-                actual_d, actual_h, actual_w = patch.shape[:3]
-                if actual_d < patch_size[0] or actual_h < patch_size[1] or actual_w < patch_size[2]:
-                    if patch.ndim == 4:
-                        patch_padded = np.zeros((patch_size[0], patch_size[1], patch_size[2], patch.shape[3]),
-                                                dtype=patch.dtype)
-                        patch_padded[:actual_d, :actual_h, :actual_w, :] = patch
-                    else:
-                        patch_padded = np.zeros(patch_size, dtype=patch.dtype)
-                        patch_padded[:actual_d, :actual_h, :actual_w] = patch
-                    patch = patch_padded
+                    y_pred = detection_model(tile[np.newaxis, ...], training=False)
 
-                slices_out = (slice(z_start, z_end), slice(y_start, y_end), slice(x_start, x_end))
-                slices_patch = (slice(0, z_end - z_start), slice(0, y_end - y_start), slice(0, x_end - x_start))
+                    def _arr(key):
+                        a = np.asarray(y_pred[key])[0]
+                        return a[..., 0] if (a.ndim == nd + 1
+                                             and a.shape[-1] == 1) else a
 
-            # Forward pass
-            if patch.ndim == self.ndim:
-                patch_input = patch[np.newaxis, ..., np.newaxis]
-            elif patch.ndim == self.ndim + 1:
-                patch_input = patch[np.newaxis, ...]
-            else:
-                raise ValueError(f"Unexpected patch shape: {patch.shape}")
+                    _put(nucleus_prob_full, _arr('nucleus_prob'), nuc_grid,
+                         s_src, s_dst, fx, coverage=cov_nuc)
+                    _put(nucleus_dist_full, _arr('nucleus_dist'), nuc_grid,
+                         s_src, s_dst, fx)
+                    _put(cytoplasm_prob_full, _arr('cytoplasm_prob'), cyto_grid,
+                         s_src, s_dst, fx, coverage=cov_cyto)
+                    _put(cytoplasm_dist_full, _arr('cytoplasm_dist'), cyto_grid,
+                         s_src, s_dst, fx)
 
-            import tensorflow as tf
-            patch_input_tf = tf.convert_to_tensor(patch_input, dtype=tf.float32)
+                    tiles_done += 1
+                    del y_pred
 
-            try:
-                y_pred = self.model.keras_model(patch_input_tf, training=False)
-            except Exception as e:
-                print(f"    ❌ Tile {tile_idx}/{total_tiles} failed: {e}")
-                continue
+        except (tf.errors.ResourceExhaustedError, tf.errors.InternalError) as e:
+            raise RuntimeError(
+                f"OOM при StarDist tiling n_tiles={n_tiles}. "
+                f"Auto-splitting отключён. Увеличьте n_tiles по свободным осям "
+                f"{free_axes} явно. Ошибка: {type(e).__name__}: {e}") from e
 
-            # Извлекаем RAW outputs (НЕ делаем NMS!)
-            nuc_prob = y_pred['nucleus_prob'].numpy()[0]
-            nuc_dist = y_pred['nucleus_dist'].numpy()[0]
-            cyto_prob = y_pred['cytoplasm_prob'].numpy()[0]
-            cyto_dist = y_pred['cytoplasm_dist'].numpy()[0]
-
-            # Убираем channel для prob
-            nuc_prob_2d = nuc_prob[..., 0] if nuc_prob.shape[-1] == 1 else nuc_prob
-            cyto_prob_2d = cyto_prob[..., 0] if cyto_prob.shape[-1] == 1 else cyto_prob
-
-            # Обрезаем до реального размера
-            nuc_prob_2d = nuc_prob_2d[slices_patch]
-            nuc_dist = nuc_dist[slices_patch]
-            cyto_prob_2d = cyto_prob_2d[slices_patch]
-            cyto_dist = cyto_dist[slices_patch]
-
-            weight_cropped = weight_patch[slices_patch]
-
-            # НАКАПЛИВАЕМ с весами
-            nucleus_prob_full[slices_out] += nuc_prob_2d * weight_cropped
-            cytoplasm_prob_full[slices_out] += cyto_prob_2d * weight_cropped
-
-            # Distance с весами
-            w_dist = weight_cropped[..., np.newaxis]
-            nucleus_dist_full[slices_out] += nuc_dist * w_dist
-            cytoplasm_dist_full[slices_out] += cyto_dist * w_dist
-
-            weight_map[slices_out] += weight_cropped
-
-            if tile_idx % 10 == 0 or tile_idx == total_tiles:
-                print(f"    Processed {tile_idx}/{total_tiles} tiles")
+        print(f"  ✅ StarDist tiling complete: {tiles_done} model forwards")
 
         # ============================================================
-        # НОРМАЛИЗАЦИЯ ПО ВЕСАМ
+        # COVERAGE CHECK
         # ============================================================
-        weight_map_safe = np.maximum(weight_map, 1e-8)
 
-        nucleus_prob_full = nucleus_prob_full / weight_map_safe
-        cytoplasm_prob_full = cytoplasm_prob_full / weight_map_safe
+        for _tag, _cov in (('nucleus', cov_nuc), ('cytoplasm', cov_cyto)):
+            _mn_cov, _mx_cov = int(_cov.min()), int(_cov.max())
+            print(f"  coverage[{_tag}]: min={_mn_cov}, max={_mx_cov}")
+            if _mn_cov != 1 or _mx_cov != 1:
+                raise RuntimeError(
+                    f"Tiling coverage нарушен для {_tag}: min={_mn_cov}, "
+                    f"max={_mx_cov}, missing={int((_cov == 0).sum())}, "
+                    f"double={int((_cov > 1).sum())}")
 
-        weight_map_dist = weight_map_safe[..., np.newaxis]
-        nucleus_dist_full = nucleus_dist_full / weight_map_dist
-        cytoplasm_dist_full = cytoplasm_dist_full / weight_map_dist
-
-        print(f"  ✅ Tiling complete, shape: {nucleus_prob_full.shape}")
-        print(f"  nucleus_dist: [{nucleus_dist_full.min():.1f}, {nucleus_dist_full.max():.1f}] px")
-        print(f"  cytoplasm_dist: [{cytoplasm_dist_full.min():.1f}, {cytoplasm_dist_full.max():.1f}] px")
+        del cov_nuc, cov_cyto
 
         # ============================================================
-        # ТЕПЕРЬ ОДИН РАЗ NMS НА ВСЁМ ИЗОБРАЖЕНИИ
+        # CROP PADDING СВОБОДНЫХ ОСЕЙ
         # ============================================================
-        print(f"  [nucleus] Running NMS on full image...")
-        self._current_type = 'nucleus'
-        nucleus_instances = self._stardist_postprocess(
-            nucleus_prob_full,
-            nucleus_dist_full,
-            prob_thresh=self.prob_thresh_nucleus,
-            nms_thresh=self.nms_thresh
-        )
 
-        print(f"  [cytoplasm] Running NMS on full image...")
-        self._current_type = 'cytoplasm'
-        cytoplasm_instances = self._stardist_postprocess(
-            cytoplasm_prob_full,
-            cytoplasm_dist_full,
-            prob_thresh=self.prob_thresh_cytoplasm,
-            nms_thresh=self.nms_thresh
-        )
+        def _crop(arr, grid_, rays=False):
+            sl = tuple(slice(0, int(np.ceil(img_shape[a] / grid_[a])))
+                       for a in range(nd))
+            return arr[sl + (slice(None),)] if rays else arr[sl]
 
-        # Enhanced NMS (удаление дубликатов)
-        nucleus_instances = self._enhanced_nms_postprocess(nucleus_instances)
-        cytoplasm_instances = self._enhanced_nms_postprocess(cytoplasm_instances)
+        nucleus_prob_full = _crop(nucleus_prob_full, nuc_grid)
+        nucleus_dist_full = _crop(nucleus_dist_full, nuc_grid, rays=True)
+        cytoplasm_prob_full = _crop(cytoplasm_prob_full, cyto_grid)
+        cytoplasm_dist_full = _crop(cytoplasm_dist_full, cyto_grid, rays=True)
 
-        # Containment
-        nucleus_instances, cytoplasm_instances = self._postprocess_containment(
-            nucleus_instances, cytoplasm_instances
-        )
+        print(f"  nucleus_dist: [{nucleus_dist_full.min():.1f}, "
+              f"{nucleus_dist_full.max():.1f}] px")
+        print(f"  cytoplasm_dist: [{cytoplasm_dist_full.min():.1f}, "
+              f"{cytoplasm_dist_full.max():.1f}] px")
 
-        details = {
-            'nucleus_prob': nucleus_prob_full,
-            'nucleus_dist': nucleus_dist_full,
-            'cytoplasm_prob': cytoplasm_prob_full,
-            'cytoplasm_dist': cytoplasm_dist_full,
-        }
-
-        return nucleus_instances, cytoplasm_instances, details
-
-    def _create_gaussian_weight(self, patch_size):
-        """Создаёт гауссовскую весовую маску."""
-        import numpy as np
-
-        if self.ndim == 2:
-            h, w = patch_size
-            y = np.arange(h) - (h - 1) / 2.0
-            x = np.arange(w) - (w - 1) / 2.0
-            yy, xx = np.meshgrid(y, x, indexing='ij')
-
-            sigma_y = h / 4.0
-            sigma_x = w / 4.0
-
-            weight = np.exp(-(yy ** 2 / (2 * sigma_y ** 2) + xx ** 2 / (2 * sigma_x ** 2)))
-            weight = weight / weight.max()
-
-        else:  # 3D
-            d, h, w = patch_size
-            z = np.arange(d) - (d - 1) / 2.0
-            y = np.arange(h) - (h - 1) / 2.0
-            x = np.arange(w) - (w - 1) / 2.0
-            zz, yy, xx = np.meshgrid(z, y, x, indexing='ij')
-
-            sigma_z = d / 4.0
-            sigma_y = h / 4.0
-            sigma_x = w / 4.0
-
-            weight = np.exp(-(zz ** 2 / (2 * sigma_z ** 2) +
-                              yy ** 2 / (2 * sigma_y ** 2) +
-                              xx ** 2 / (2 * sigma_x ** 2)))
-            weight = weight / weight.max()
-
-        return weight.astype(np.float32)
-
-
-    def _enhanced_nms_postprocess(self, labels):
-        """
-        Дополнительный NMS для удаления дубликатов клеток на границах тайлов.
-        """
-        from skimage.measure import regionprops
-        from scipy.spatial.distance import cdist
-        import numpy as np
-
-        if labels.max() == 0:
-            return labels
-
-        props = regionprops(labels)
-        centroids = np.array([p.centroid for p in props])
-        areas = np.array([p.area for p in props])
-        label_ids = np.array([p.label for p in props])
-
-        # Вычисляем расстояния между центроидами
-        distances = cdist(centroids, centroids)
-
-        # Порог: если центроиды ближе чем 30% от среднего радиуса
-        mean_radius = np.sqrt(areas / np.pi).mean()
-        threshold = mean_radius * 0.3
-
-        # Находим пары близких объектов
-        close_pairs = np.where((distances < threshold) & (distances > 0))
-
-        to_remove = set()
-        for i, j in zip(*close_pairs):
-            if i >= j or i in to_remove or j in to_remove:
-                continue
-
-            # Удаляем объект с меньшей площадью
-            if areas[i] < areas[j]:
-                to_remove.add(label_ids[i])
-            else:
-                to_remove.add(label_ids[j])
-
-        # Удаляем дубликаты
-        result = labels.copy()
-        for label_id in to_remove:
-            result[result == label_id] = 0
-
-        if len(to_remove) > 0:
-            print(f"    🔍 Enhanced NMS: removed {len(to_remove)} duplicate detections")
-
-        return result
+        _thr = float(self.prob_thresh_cytoplasm)
+        if nd == 3:
+            _z_frac = [float((cytoplasm_prob_full[z] > _thr).mean())
+                       for z in range(cytoplasm_prob_full.shape[0])]
+            print(f"  [cyto prob > {_thr:.2f} by Z] "
+                  + ", ".join(f"{z}:{v:.3f}" for z, v in enumerate(_z_frac)))
+        else:
+            print(f"  [cyto prob > {_thr:.2f}] "
+                  f"{float((cytoplasm_prob_full > _thr).mean()):.3f}")
 
 
 
     def predict_instances(self, img, normalize_img=True):
         """
-        Predict instances for both nuclei and cytoplasm.
+        Одиночный forward для тома/кадра, целиком влезающего в сеть.
+
+        Вход выравнивается по кратности ТАК ЖЕ, как это делает tiling. Без
+        этого UNet глубины depth падает на Concatenate, когда сторона не делится
+        на base_grid * pool**depth: прежняя версия молча полагалась на «удачный»
+        размер (2048 кратно 32) и ломалась на любом другом препарате, а в 2D —
+        почти всегда.
+
+        Прежний `except ResourceExhaustedError` с обрезкой до train_patch убран:
+        он возвращал сегментацию одного угла как результат по всему кадру. Если
+        не влезает — это тайлинг, а не тихая обрезка.
         """
         from csbdeep.utils import normalize
+        from math import gcd
+
+        nd = int(self.ndim)
+        _n_img = int(self.config.n_channel_in)
+
+        if img.ndim == nd:
+            img = img[..., np.newaxis]
+        elif img.ndim != nd + 1:
+            raise ValueError(f"predict_instances: ожидалось ndim={nd} "
+                             f"или ndim+channels, получено {img.shape}")
 
         if normalize_img:
             img = normalize(img.astype(np.float32), 1, 99.8,
-                            axis=tuple(range(self.ndim)))
-
-        # Подготовка входа
-        if img.ndim == self.ndim:
-            img_input = img[np.newaxis, ..., np.newaxis]  # (1, H, W, 1) or (1, D, H, W, 1)
+                            axis=tuple(range(nd)))
         else:
-            img_input = img[np.newaxis, ...]  # уже есть channel dim
+            img = img.astype(np.float32, copy=False)
 
-        img_input_tf = tf.convert_to_tensor(img_input, dtype=tf.float32)
+        if img.shape[-1] == _n_img:
+            img = np.concatenate(
+                [img, np.zeros(img.shape[:nd] + (2,), np.float32)], axis=-1)
+        elif img.shape[-1] != _n_img + 2:
+            raise ValueError(f"predict_instances: channels={img.shape[-1]}, "
+                             f"ожидалось {_n_img} или {_n_img + 2}")
 
-        try:
-            y_pred = self.model.keras_model(img_input_tf, training=False)
-        except tf.errors.ResourceExhaustedError:
-            print("  Warning: OOM - cropping to patch size")
-            tile_size = self.config.train_patch_size
-            slices = tuple(slice(0, min(s, p)) for s, p in zip(img.shape, tile_size))
-            img_cropped = img[slices]
-            img_input = img_cropped[np.newaxis, ..., np.newaxis]
-            img_input_tf = tf.convert_to_tensor(img_input, dtype=tf.float32)
-            y_pred = self.model.keras_model(img_input_tf, training=False)
+        img_shape = tuple(int(s) for s in img.shape[:nd])
+        self._last_img_shape = img_shape
 
-        # === КРИТИЧНО: Правильная распаковка ===
-        # Модель возвращает dict с tensor'ами
-        nucleus_prob = y_pred['nucleus_prob'].numpy()[0]  # (H, W, 1) или (D, H, W, 1)
-        nucleus_dist = y_pred['nucleus_dist'].numpy()[0]  # (H, W, n_rays) или (D, H, W, n_rays)
-        cytoplasm_prob = y_pred['cytoplasm_prob'].numpy()[0]  # (H, W, 1) или (D, H, W, 1)
-        cytoplasm_dist = y_pred['cytoplasm_dist'].numpy()[0]  # (H, W, n_rays) или (D, H, W, n_rays)
+        def _rd(nm):
+            g = getattr(self.config, nm, None)
+            if g is None:
+                g = getattr(self.config, 'grid', (1,) * nd)
+            g = tuple(int(v) for v in g)
+            if len(g) != nd or any(v < 1 for v in g):
+                raise ValueError(f"Некорректный {nm}: {g}")
+            return g
 
-        print(f"  Model output shapes:")
-        print(f"    nucleus_prob: {nucleus_prob.shape}")
-        print(f"    nucleus_dist: {nucleus_dist.shape}")
-        print(f"    cytoplasm_prob: {cytoplasm_prob.shape}")
-        print(f"    cytoplasm_dist: {cytoplasm_dist.shape}")
+        nuc_grid, cyto_grid = _rd('nucleus_grid'), _rd('cytoplasm_grid')
 
-        # NUCLEUS
+        _an = tuple(getattr(self.config, 'anisotropy', (1,) * nd))
+        if len(_an) != nd:
+            _an = (1,) * nd
+        _mn = min(_an)
+        _pool = tuple(2 if v < 2.0 * _mn else 1 for v in _an)
+        _depth = int(getattr(self.config, 'unet_n_depth', 4))
+
+        def _lcm(a, b):
+            return int(a) * int(b) // gcd(int(a), int(b))
+
+        block = tuple(
+            _lcm(_lcm(min(nuc_grid[a], cyto_grid[a]) * (_pool[a] ** _depth),
+                      nuc_grid[a]), cyto_grid[a]) for a in range(nd))
+
+        pad = [(0, (-img_shape[a]) % block[a]) for a in range(nd)] + [(0, 0)]
+        img_net = img
+        if any(p1 for _, p1 in pad):
+            try:
+                img_net = np.pad(img, pad, mode='reflect')
+            except ValueError:
+                img_net = np.pad(img, pad, mode='edge')
+
+        y_pred = self.model.keras_model(
+            tf.convert_to_tensor(img_net[np.newaxis, ...], tf.float32),
+            training=False)
+
+        def _get(key, grid_):
+            """Срез до РЕАЛЬНОГО размера входа в grid-разрешении головы."""
+            if key not in y_pred:
+                return None
+            a = np.asarray(y_pred[key])[0]
+            if a.ndim == nd + 1 and a.shape[-1] == 1:
+                a = a[..., 0]
+            sl = tuple(slice(0, int(np.ceil(img_shape[i] / grid_[i])))
+                       for i in range(nd))
+            return a[sl]
+
+        nucleus_prob = _get('nucleus_prob', nuc_grid)
+        nucleus_dist = _get('nucleus_dist', nuc_grid)
+        cytoplasm_prob = _get('cytoplasm_prob', cyto_grid)
+        cytoplasm_dist = _get('cytoplasm_dist', cyto_grid)
+        nuc_mask_pred = _get('nucleus_mask', nuc_grid)
+        cyto_mask_pred = _get('cytoplasm_mask', cyto_grid)
+        del y_pred
+
         self._current_type = 'nucleus'
         nucleus_instances = self._stardist_postprocess(
-            nucleus_prob,
-            nucleus_dist,
-            self.prob_thresh_nucleus,
-            self.nms_thresh
-        )
+            nucleus_prob, nucleus_dist,
+            self.prob_thresh_nucleus, self.nms_thresh)
+        nuc_coords, nuc_probs, nuc_dists = (
+            self._last_coords, self._last_probs, self._last_dists)
 
-        # CYTOPLASM
         self._current_type = 'cytoplasm'
         cytoplasm_instances = self._stardist_postprocess(
-            cytoplasm_prob,
-            cytoplasm_dist,
-            self.prob_thresh_cytoplasm,
-            self.nms_thresh
-        )
+            cytoplasm_prob, cytoplasm_dist,
+            self.prob_thresh_cytoplasm, self.nms_thresh)
+        cyto_coords, cyto_probs, cyto_dists = (
+            self._last_coords, self._last_probs, self._last_dists)
 
-        nucleus_instances, cytoplasm_instances = self._postprocess_containment(
-            nucleus_instances, cytoplasm_instances
-        )
+        mask_thr = getattr(self.config, 'mask_thresh', 0.5)
+        self._prompt_coords_nuc = nuc_coords
+        self._prompt_coords_cyto = cyto_coords
+        _nl = np.asarray(nucleus_instances).astype(np.int32)
+        _cl = np.asarray(cytoplasm_instances).astype(np.int32)
+
+        if ((nuc_coords is not None and len(nuc_coords) > 0)
+                or (cyto_coords is not None and len(cyto_coords) > 0)):
+            (nucleus_instances, cytoplasm_instances,
+             self._prompt_assignments) = predict_instances_prompted(
+                self.model, self.config, img,
+                nuc_coords, nuc_probs, cyto_coords, cyto_probs,
+                mask_thresh=mask_thr,
+                iou_dedup=getattr(self.config, 'mask_iou_dedup', 0.5),
+                nuc_dists=nuc_dists, cyto_dists=cyto_dists,
+                nuc_labels=_nl, cyto_labels=_cl)
+        else:
+            print("  ⚠️  Ни ядер, ни клеток -> промпт-ветка НЕ ЗАПУСКАЛАСЬ. "
+                  "Возвращены сырые полиэдры StarDist.")
+            self._prompt_assignments = {}
 
         details = {
-            'nucleus_prob': nucleus_prob[..., 0] if nucleus_prob.shape[-1] == 1 else nucleus_prob,
+            'nucleus_prob': nucleus_prob,
             'nucleus_dist': nucleus_dist,
-            'cytoplasm_prob': cytoplasm_prob[..., 0] if cytoplasm_prob.shape[-1] == 1 else cytoplasm_prob,
+            'cytoplasm_prob': cytoplasm_prob,
             'cytoplasm_dist': cytoplasm_dist,
+            'nucleus_mask': nuc_mask_pred,
+            'cytoplasm_mask': cyto_mask_pred,
+            'rays_nucleus': self.rays_nucleus,
+            'rays_cytoplasm': self.rays_cytoplasm,
+            'nucleus_grid': nuc_grid,
+            'cytoplasm_grid': cyto_grid,
         }
-
         return nucleus_instances, cytoplasm_instances, details
 
-    def _stardist_postprocess(self, prob, dist, prob_thresh, nms_thresh):
+    def _stardist_postprocess(
+            self,
+            prob,
+            dist,
+            prob_thresh,
+            nms_thresh
+    ):
         """
-        Стандартный StarDist post-processing: NMS + rendering.
-        ИСПРАВЛЕНО: правильная распаковка non_maximum_suppression (3 значения!)
+        Fast StarDist post-processing для больших 3D cytoplasm объектов.
+
+        Pipeline:
+            prob/dist
+              -> threshold
+              -> spatial candidate preselection
+              -> ОДИН StarDist sparse NMS
+              -> polyhedron_to_label
+
+        В отличие от прежней реализации:
+            - нет iterative rounds;
+            - нет covered mask;
+            - нет повторных NMS;
+            - нет повторного render внутри NMS loop.
+
+        Candidate preselection используется только для вычислительной
+        осуществимости: dense StarDist NMS для сотен тысяч крупных 3D
+        polyhedra практически непригоден.
+
+        GRID/RAYS и размер кандидирующего окна выбираются отдельно
+        для nucleus/cytoplasm.
         """
-        from stardist.nms import non_maximum_suppression
-        from stardist.geometry import polygons_to_label, polyhedron_to_label
+        import numpy as np
 
-        obj_type = 'nucleus' if hasattr(self, '_current_type') and self._current_type == 'nucleus' else 'cytoplasm'
+        obj_type = getattr(
+            self,
+            '_current_type',
+            'cytoplasm'
+        )
 
-        # === КРИТИЧНО: Убираем лишние размерности ===
-        if prob.ndim == 3 and prob.shape[-1] == 1:
-            prob = prob[..., 0]  # (H, W, 1) -> (H, W)
+        # ============================================================
+        # GRID / RAYS
+        # ============================================================
 
-        # Проверяем размерности
-        if self.ndim == 2:
-            assert prob.ndim == 2, f"prob должен быть 2D, получено {prob.ndim}D"
-            assert dist.ndim == 3, f"dist должен быть 3D, получено {dist.ndim}D"
-            assert prob.shape == dist.shape[:2], f"prob.shape={prob.shape} != dist.shape[:2]={dist.shape[:2]}"
+        grid_name = (
+            'nucleus_grid'
+            if obj_type == 'nucleus'
+            else 'cytoplasm_grid'
+        )
 
-        print(f"  [{obj_type}] prob.shape={prob.shape}, dist.shape={dist.shape}")
+        grid = tuple(
+            int(g)
+            for g in getattr(
+                self.config,
+                grid_name,
+                (1,) * self.ndim
+            )
+        )
 
-        # === 1. NON-MAXIMUM SUPPRESSION ===
-        try:
-            grid = (1, 1) if self.ndim == 2 else self.grid
+        if (
+                len(grid) != self.ndim
+                or any(g < 1 for g in grid)
+        ):
+            grid = (1,) * self.ndim
 
-            # ИСПРАВЛЕНО: распаковываем 3 значения
-            result = non_maximum_suppression(
-                dist,  # ← ПЕРВЫЙ аргумент: distance map
-                prob,  # ← ВТОРОЙ аргумент: probability map
-                grid=grid,
-                prob_thresh=prob_thresh,
-                nms_thresh=nms_thresh
+        rays = (
+            self.rays_nucleus
+            if obj_type == 'nucleus'
+            else self.rays_cytoplasm
+        )
+
+        if rays is None:
+            raise RuntimeError(
+                f"[{obj_type}] rays=None"
             )
 
-            if len(result) == 3:
-                coord, prob_nms, points_grid = result
-            elif len(result) == 2:
-                # Fallback для старых версий StarDist
-                coord, prob_nms = result
+        # ============================================================
+        # INPUT
+        # ============================================================
+
+        prob = np.asarray(
+            prob,
+            dtype=np.float32
+        )
+
+        if (
+                prob.ndim == self.ndim + 1
+                and prob.shape[-1] == 1
+        ):
+            prob = prob[..., 0]
+
+        dist = np.asarray(dist)
+
+        if prob.ndim != self.ndim:
+            raise ValueError(
+                f"[{obj_type}] invalid prob shape={prob.shape}"
+            )
+
+        if (
+                dist.ndim != self.ndim + 1
+                or dist.shape[:self.ndim] != prob.shape
+        ):
+            raise ValueError(
+                f"[{obj_type}] "
+                f"prob={prob.shape}, dist={dist.shape}"
+            )
+
+        if dist.shape[-1] != len(rays):
+            raise ValueError(
+                f"[{obj_type}] "
+                f"dist rays={dist.shape[-1]}, "
+                f"rays={len(rays)}"
+            )
+
+
+        # ============================================================
+        # FULL RESOLUTION SHAPE
+        # ============================================================
+
+        full_shape = tuple(
+            int(s * g)
+            for s, g in zip(
+                prob.shape,
+                grid
+            )
+        )
+
+        _img_shape = getattr(
+            self,
+            '_last_img_shape',
+            None
+        )
+
+        if (
+                _img_shape is not None
+                and len(_img_shape) == self.ndim
+        ):
+            full_shape = tuple(
+                min(int(a), int(b))
+                for a, b in zip(
+                    full_shape,
+                    _img_shape
+                )
+            )
+
+        def _empty():
+            self._last_coords = None
+            self._last_probs = None
+            self._last_dists = None
+
+            return np.zeros(
+                full_shape,
+                dtype=np.uint16
+            )
+
+        # ============================================================
+        # THRESHOLD + BORDER
+        # ============================================================
+
+        keep = (
+                prob > float(prob_thresh)
+        )
+
+        b_xy = int(
+            getattr(
+                self.config,
+                'nms_border_exclude_xy',
+                2
+            )
+        )
+
+        if b_xy > 0:
+
+            border_keep = np.zeros_like(
+                keep,
+                dtype=bool
+            )
+
+            if self.ndim == 3:
+                border_keep[
+                :,
+                b_xy:prob.shape[1] - b_xy,
+                b_xy:prob.shape[2] - b_xy
+                ] = True
+
             else:
-                raise ValueError(f"Unexpected non_maximum_suppression output: {len(result)} values")
+                border_keep[
+                b_xy:prob.shape[0] - b_xy,
+                b_xy:prob.shape[1] - b_xy
+                ] = True
+
+            keep &= border_keep
+
+        n_raw = int(
+            keep.sum()
+        )
+
+        if n_raw == 0:
+            print(
+                f"  [{obj_type}] No objects detected "
+                f"(prob_thresh={prob_thresh:.2f})"
+            )
+
+            return _empty()
+
+        # ============================================================
+        # ESTIMATED OBJECT EXTENT
+        # ============================================================
+        #
+        # Та же логика, что была у тебя раньше.
+        #
+        # rays_anisotropy ≈ max(extent) / extent
+        # median_max_dist задаёт общий масштаб.
+        # ============================================================
+
+        _a = np.asarray(
+            getattr(
+                self.config,
+                f'rays_anisotropy_{obj_type}',
+                getattr(
+                    self.config,
+                    'anisotropy',
+                    (1.0,) * self.ndim
+                )
+            ),
+            dtype=np.float64
+        )
+
+        _R = float(
+            getattr(
+                self.config,
+                f'median_max_dist_{obj_type}',
+                0.0
+            ) or 0.0
+        )
+
+        if (
+                _a.size == self.ndim
+                and _R > 0
+        ):
+
+            _rel = (
+                    1.0 /
+                    np.maximum(
+                        _a,
+                        1e-9
+                    )
+            )
+
+            ext = (
+                    2.0
+                    * _rel
+                    * _R
+                    / np.linalg.norm(_rel)
+            )
+
+        else:
+
+            ext = (
+                    np.asarray(
+                        full_shape,
+                        dtype=np.float64
+                    )
+                    / 8.0
+            )
+
+        # ============================================================
+        # CANDIDATE PRESELECTION
+        # ============================================================
+        #
+        # Не используем старые огромные cells с spacing=0.5.
+        #
+        # Берём более консервативное окно ~1/4 размера объекта.
+        # Это оставляет несколько кандидатов на клетку, после чего
+        # настоящий sparse StarDist NMS решает, какие из них являются
+        # одним объектом.
+        #
+        # Для Z специально ограничиваем размер, поскольку клетки плоские.
+        # ============================================================
+
+        frac = float(
+            getattr(
+                self.config,
+                'nms_candidate_spacing',
+                0.25
+            )
+        )
+
+        step = [
+            max(
+                1,
+                int(
+                    round(
+                        frac
+                        * ext[a]
+                        / grid[a]
+                    )
+                )
+            )
+            for a in range(self.ndim)
+        ]
+
+
+        # Не позволяем окну стать бессмысленно большим.
+        step = [
+            min(
+                step[a],
+                max(
+                    1,
+                    prob.shape[a] // 4
+                )
+            )
+            for a in range(self.ndim)
+        ]
+
+        # ============================================================
+        # Один максимум на НЕПЕРЕСЕКАЮЩИЙСЯ spatial block
+        # ============================================================
+        #
+        # Это НЕ NMS.
+        # Это только дешёвая preselection для C++ sparse NMS.
+        #
+        # В отличие от старой версии после неё:
+        #   - нет covered;
+        #   - нет второго/третьего раунда;
+        #   - нет повторного rendering.
+        # ============================================================
+
+        pp = np.where(
+            keep,
+            prob,
+            -np.inf
+        )
+
+        pad = [
+            (
+                0,
+                (-prob.shape[a]) % step[a]
+            )
+            for a in range(self.ndim)
+        ]
+
+        pp = np.pad(
+            pp,
+            pad,
+            mode='constant',
+            constant_values=-np.inf
+        )
+
+        cells = [
+            pp.shape[a] // step[a]
+            for a in range(self.ndim)
+        ]
+
+        reshape_shape = []
+
+        for a in range(self.ndim):
+            reshape_shape.extend(
+                [
+                    cells[a],
+                    step[a]
+                ]
+            )
+
+        blk = pp.reshape(
+            reshape_shape
+        )
+
+        perm = (
+                [2 * a for a in range(self.ndim)]
+                +
+                [2 * a + 1 for a in range(self.ndim)]
+        )
+
+        blk = (
+            blk
+            .transpose(perm)
+            .reshape(
+                int(np.prod(cells)),
+                -1
+            )
+        )
+
+        best = blk.argmax(
+            axis=1
+        )
+
+        values = blk[
+            np.arange(
+                blk.shape[0]
+            ),
+            best
+        ]
+
+        valid = np.isfinite(
+            values
+        )
+
+        if not valid.any():
+            print(
+                f"  [{obj_type}] "
+                f"No candidates after preselection"
+            )
+
+            return _empty()
+
+        cell_indices = np.array(
+            np.unravel_index(
+                np.nonzero(valid)[0],
+                cells
+            )
+        ).T
+
+        local_indices = np.array(
+            np.unravel_index(
+                best[valid],
+                step
+            )
+        ).T
+
+        candidates = (
+                cell_indices
+                * np.asarray(step)
+                + local_indices
+        )
+
+        candidates = candidates[
+            np.all(
+                candidates
+                < np.asarray(prob.shape),
+                axis=1
+            )
+        ]
+
+        # ============================================================
+        # CANDIDATE DATA
+        # ============================================================
+
+        sel = tuple(
+            candidates[:, a]
+            for a in range(self.ndim)
+        )
+
+        candidate_prob = (
+            prob[sel]
+            .astype(np.float32)
+        )
+
+        candidate_dist = np.maximum(
+            dist[sel].astype(np.float32),
+            1e-3
+        )
+
+        candidate_points = (
+                candidates
+                * np.asarray(grid)[None, :]
+        ).astype(np.float32)
+
+        # Сортируем по prob до sparse NMS.
+        order = np.argsort(
+            candidate_prob
+        )[::-1]
+
+        candidate_prob = (
+            candidate_prob[order]
+        )
+
+        candidate_dist = (
+            candidate_dist[order]
+        )
+
+        candidate_points = (
+            candidate_points[order]
+        )
+
+        print(
+            f"  [{obj_type}] "
+            f"{n_raw} threshold candidates "
+            f"-> {len(candidate_points)} preselected "
+            f"(step={tuple(step)}, "
+            f"bbox≈{tuple(int(round(v)) for v in ext)} px)"
+        )
+
+        # ============================================================
+        # ONE SPARSE STARDIST NMS
+        # ============================================================
+
+        try:
+
+            if self.ndim == 3:
+
+                from stardist.nms import \
+                    non_maximum_suppression_3d_sparse
+
+                (
+                    coord_full,
+                    prob_nms,
+                    dists,
+                    _
+                ) = non_maximum_suppression_3d_sparse(
+                    candidate_dist,
+                    candidate_prob,
+                    candidate_points,
+                    rays,
+                    nms_thresh=float(nms_thresh),
+                    verbose=False
+                )
+
+            else:
+
+                from stardist.nms import \
+                    non_maximum_suppression_sparse
+
+                (
+                    coord_full,
+                    prob_nms,
+                    dists,
+                    _
+                ) = non_maximum_suppression_sparse(
+                    candidate_dist,
+                    candidate_prob,
+                    candidate_points,
+                    nms_thresh=float(nms_thresh),
+                    verbose=False
+                )
 
         except Exception as e:
-            print(f"  [{obj_type}] ⚠️ NMS failed: {e}")
+
+            print(
+                f"  [{obj_type}] "
+                f"⚠️ sparse NMS failed: {e}"
+            )
+
             import traceback
             traceback.print_exc()
-            return np.zeros(prob.shape, dtype=np.uint16)
 
-        if len(coord) == 0:
-            print(f"  [{obj_type}] No objects detected (prob_thresh={prob_thresh:.2f})")
-            return np.zeros(prob.shape, dtype=np.uint16)
+            return _empty()
 
-        print(f"  [{obj_type}] NMS: {len(coord)} peaks detected")
+        coord_full = np.asarray(
+            coord_full
+        )
 
-        # === 2. Extract distances at detected points ===
-        dists = np.array([dist[tuple(c)] for c in coord])
+        prob_nms = np.asarray(
+            prob_nms,
+            dtype=np.float32
+        )
 
-        # === 3. RENDERING ===
+        dists = np.asarray(
+            dists,
+            dtype=np.float32
+        )
+
+        if len(coord_full) == 0:
+            print(
+                f"  [{obj_type}] "
+                f"NMS retained 0"
+            )
+
+            return _empty()
+
+        print(
+            f"  [{obj_type}] "
+            f"sparse NMS retained "
+            f"{len(coord_full)}"
+        )
+
+        # ============================================================
+        # DIST DIAGNOSTIC
+        # ============================================================
+
+        per_peak_max = (
+            dists.max(axis=1)
+        )
+
+        print(
+            f"  [{obj_type}] "
+            f"dist at peaks: "
+            f"median_max_ray="
+            f"{np.median(per_peak_max):.1f} "
+            f"min="
+            f"{per_peak_max.min():.1f} "
+            f"max="
+            f"{per_peak_max.max():.1f} "
+            f"median_mean_ray="
+            f"{np.median(dists.mean(axis=1)):.1f}"
+        )
+
+        # ============================================================
+        # RENDER ONCE
+        # ============================================================
+
         try:
-            if self.ndim == 2:
-                instances = polygons_to_label(
-                    dists,  # (N, n_rays)
-                    coord,  # (N, 2)
-                    prob.shape,  # (H, W)
-                    prob=prob_nms  # (N,)
-                )
-            else:  # 3D
+
+            if self.ndim == 3:
+
+                from stardist.geometry import \
+                    polyhedron_to_label
+
                 instances = polyhedron_to_label(
                     dists,
-                    coord,
-                    prob.shape,
-                    rays=self.rays if hasattr(self, 'rays') else None,
+                    coord_full,
+                    rays,
+                    shape=full_shape,
+                    prob=prob_nms,
+                    verbose=False
+                )
+
+            else:
+
+                from stardist.geometry import \
+                    polygons_to_label
+
+                instances = polygons_to_label(
+                    dists,
+                    coord_full,
+                    full_shape,
                     prob=prob_nms
                 )
 
-            n_instances = len(np.unique(instances)) - 1
-            print(f"    ✅ Rendered {n_instances} instances")
+            from skimage.segmentation import \
+                relabel_sequential
 
-            # ============================================================
-            # Post-processing NMS для удаления наложений
-            # ============================================================
-
-            if n_instances > 1:
-                instances = remove_overlapping_instances(
-                    instances,
-                    iou_threshold=0.2,  # ← Было 0.3, теперь 0.2 (более агрессивно)
-                    containment_threshold=0.6  # ← Объект 60%+ внутри другого = удалить
+            instances, _, _ = (
+                relabel_sequential(
+                    instances
                 )
+            )
 
-            return instances.astype(np.uint16)
+            print(
+                f"    ✅ Rendered "
+                f"{len(np.unique(instances)) - 1} "
+                f"instances"
+            )
+
+            self._last_coords = (
+                np.asarray(
+                    coord_full
+                ).astype(np.int32)
+            )
+
+            self._last_probs = (
+                prob_nms
+            )
+
+            self._last_dists = (
+                dists
+            )
+
+            return instances.astype(
+                np.uint16
+            )
 
         except Exception as e:
-            print(f"  [{obj_type}] ⚠️ Rendering failed: {e}")
+
+            print(
+                f"  [{obj_type}] "
+                f"⚠️ Rendering failed: {e}"
+            )
+
             import traceback
             traceback.print_exc()
-            return np.zeros(prob.shape, dtype=np.uint16)
+
+            return _empty()
 
 
 
 
-
-    def _dist_to_coords(self, points, dist):
-        coords = []
-        rays = self.config.rays
-
-        for pt in points:
-            if self.ndim == 3:
-                d = dist[pt[0], pt[1], pt[2]]
-            else:
-                d = dist[pt[0], pt[1]]
-
-            # ИСПРАВЛЕНО: берём ПРАВИЛЬНЫЕ координаты
-            if self.ndim == 2:
-                # 2D: rays.vertices должен быть (n_rays, 2) с (Y, X)
-                if rays.vertices.shape[1] == 2:
-                    rays_verts = rays.vertices  # (n_rays, 2)
-                else:
-                    # Если случайно 3D лучи для 2D - берём последние 2 координаты (Y, X)
-                    rays_verts = rays.vertices[:, -2:]
-            else:  # 3D
-                rays_verts = rays.vertices  # (n_rays, 3)
-
-            coord = d[:, np.newaxis] * rays_verts
-            pt_array = np.array(pt[:self.ndim], dtype=float)
-            coord = coord + pt_array
-            coords.append(coord)
-
-        return coords
 
     def _postprocess_containment(self, nucleus_instances, cytoplasm_instances):
         """
@@ -1006,7 +2006,7 @@ class CytoNucsPredictor:
         1. For each nucleus, check if it overlaps with a cell
         2. If no overlap, assign to nearest cell (if within distance threshold)
         3. If nucleus overlaps multiple cells, assign to cell with max overlap
-        4. Optionally: remove nuclei that can't be assigned
+
 
         Args:
             nucleus_instances: nucleus instance labels
@@ -1028,73 +2028,134 @@ class CytoNucsPredictor:
         # For debugging/validation
         print(f"  Assigned {len(assignments)} nuclei to cells")
         if len(unassigned) > 0:
-            print(f"  Warning: {len(unassigned)} nuclei could not be assigned")
+            print(f"  {len(unassigned)} nuclei без назначенной клетки (сохранены)")
 
-        # Optional: remove unassigned nuclei
-        nucleus_instances_refined = nucleus_instances.copy()
-        for nuc_id in unassigned:
-            nucleus_instances_refined[nucleus_instances == nuc_id] = 0
-
-        return nucleus_instances_refined, cytoplasm_instances
+        return nucleus_instances, cytoplasm_instances
 
     def optimize_thresholds(self, val_images, val_nucleus_masks, val_cytoplasm_masks,
                             prob_thresh_range=[0.3, 0.4, 0.5, 0.6, 0.7],
-                            nms_thresh_range=[0.3, 0.4, 0.5, 0.6]):
+                            nms_thresh_range=[0.15, 0.2, 0.25, 0.3, 0.4],
+                            mask_thresh_range=None):
         """
-        Optimize probability and NMS thresholds on validation set.
+        Подбор порогов по СРЕДНЕЙ accuracy по taus, а не по AP@50.
 
-        Args:
-            val_images: list of validation images
-            val_nucleus_masks: list of ground truth nucleus masks
-            val_cytoplasm_masks: list of ground truth cytoplasm masks
-            prob_thresh_range: list of prob thresholds to try
-            nms_thresh_range: list of NMS thresholds to try
+        AP@50 не отличает IoU 0.51 от 0.95, поэтому не даёт сигнала там, где
+        узкое место — форма: у ядра accuracy падает с 0.364 на tau=0.5 до 0.043
+        на 0.55, и подбор по одному только @50 этого не видит вовсе.
+        compute_dice тоже не годится: он усредняет по СОВПАВШИМ парам и за FP
+        не штрафует.
 
-        Returns:
-            best_params: dict with optimized thresholds
+        ДВЕ СТАДИИ, а не одно декартово произведение:
+          1) (prob, nms) при текущем mask_thresh — они задают СПИСОК ПИКОВ;
+          2) mask_thresh при найденных (prob, nms) — он задаёт РАЗМЕР МАСОК.
+        Зависимость почти разделима: пороги NMS не меняют форму маски, а
+        mask_thresh не меняет число пиков. Аддитивно вместо мультипликативно.
+
+        Один прогон даёт оценку СРАЗУ для обеих голов при их общем prob_thresh,
+        поэтому лучшие значения выбираются для каждой головы независимо. Это
+        приближение: порог ядра слабо влияет на цитоплазму, потому что клетки
+        пишутся в цикле по ядрам. Полный перебор двух осей стоил бы квадрата.
+
+        Тайлинг включается автоматически — тот же путь, что и на инференсе.
         """
         from itertools import product
+        from stardist.matching import matching_dataset
+        import time
 
-        best_score = -np.inf
-        best_params = None
+        # На время перебора глушим диагностику пар.
+        _diag_saved = getattr(self.config, 'diag_max_prompts', 20)
+        _mask_saved = float(getattr(self.config, 'mask_thresh', 0.5))
+        try:
+            self.config.diag_max_prompts = 0
+        except Exception:
+            pass
 
-        print("Optimizing thresholds...")
+        patch = tuple(int(p) for p in self.config.train_patch_size)
+        taus = list(getattr(self.config, 'threshold_opt_taus',
+                            [0.5, 0.6, 0.7, 0.8, 0.9]))
 
+        def _predict(img):
+            shp = img.shape[:self.ndim]
+            if any(s > p for s, p in zip(shp, patch)):
+                n_tiles = tuple(int(np.ceil(s / p)) for s, p in zip(shp, patch))
+                return self._predict_with_tiling(img, n_tiles=n_tiles, normalize_img=False)
+            return self.predict_instances(img, normalize_img=False)
+
+        def _score(tag):
+            pn, pc = [], []
+            for img in val_images:
+                nuc_pred, cyto_pred, _ = _predict(img)
+                pn.append(nuc_pred)
+                pc.append(cyto_pred)
+            sn = matching_dataset(val_nucleus_masks, pn, thresh=taus, show_progress=False)
+            sc = matching_dataset(val_cytoplasm_masks, pc, thresh=taus, show_progress=False)
+            sn = list(sn) if isinstance(sn, (list, tuple)) else [sn]
+            sc = list(sc) if isinstance(sc, (list, tuple)) else [sc]
+            an = float(np.mean([s.accuracy for s in sn]))
+            ac = float(np.mean([s.accuracy for s in sc]))
+            print(f"  {tag} | nuc AP={an:.3f} (@50 {sn[0].accuracy:.3f} "
+                  f"TP={sn[0].tp} FP={sn[0].fp} FN={sn[0].fn}) | "
+                  f"cyto AP={ac:.3f} (@50 {sc[0].accuracy:.3f} "
+                  f"TP={sc[0].tp} FP={sc[0].fp} FN={sc[0].fn})")
+            return an, ac
+
+        # ---------- СТАДИЯ 1: prob и nms ----------
+        print(f"[1/2] prob x nms — {len(prob_thresh_range) * len(nms_thresh_range)} "
+              f"комбинаций x {len(val_images)} томов (mask_thresh={_mask_saved}, "
+              f"taus={taus})")
+        grid = {}
         for prob_thresh, nms_thresh in product(prob_thresh_range, nms_thresh_range):
-            # Update thresholds
-            self.prob_thresh = prob_thresh
+            self.prob_thresh_nucleus = prob_thresh
+            self.prob_thresh_cytoplasm = prob_thresh
             self.nms_thresh = nms_thresh
+            t0 = time.time()
+            grid[(prob_thresh, nms_thresh)] = _score(
+                f"prob={prob_thresh:.2f} nms={nms_thresh:.2f} ({time.time()-t0:.0f} с)")
 
-            # Evaluate on validation set
-            scores = []
-            for img, nuc_gt, cyto_gt in zip(val_images, val_nucleus_masks, val_cytoplasm_masks):
-                nuc_pred, cyto_pred, _ = self.predict_instances(img, normalize_img=False)
+        best_nms = max(nms_thresh_range,
+                       key=lambda n: max((grid[(p, n)][0] + grid[(p, n)][1]) / 2.0
+                                         for p in prob_thresh_range))
+        best_prob_nuc = max(prob_thresh_range, key=lambda p: grid[(p, best_nms)][0])
+        best_prob_cyto = max(prob_thresh_range, key=lambda p: grid[(p, best_nms)][1])
+        self.prob_thresh_nucleus = best_prob_nuc
+        self.prob_thresh_cytoplasm = best_prob_cyto
+        self.nms_thresh = best_nms
+        print(f"  ▸ стадия 1: prob_nuc={best_prob_nuc} prob_cyto={best_prob_cyto} "
+              f"nms={best_nms}")
 
-                # Compute metrics
-                from cytonucs_trainer import compute_dice
-                dice_nuc = compute_dice(nuc_gt, nuc_pred)
-                dice_cyto = compute_dice(cyto_gt, cyto_pred)
-                score = (dice_nuc + dice_cyto) / 2
+        # ---------- СТАДИЯ 2: mask_thresh ----------
+        if mask_thresh_range is None:
+            mask_thresh_range = list(getattr(self.config, 'mask_thresh_range',
+                                             [0.25, 0.35, 0.45, 0.55]))
+        print(f"[2/2] mask_thresh — {len(mask_thresh_range)} значений "
+              f"при найденных prob/nms")
+        best_mask, best_mask_score = _mask_saved, -1.0
+        for mt in mask_thresh_range:
+            self.config.mask_thresh = float(mt)
+            t0 = time.time()
+            an, ac = _score(f"mask_thresh={mt:.2f} ({time.time()-t0:.0f} с)")
+            s = (an + ac) / 2.0
+            if s > best_mask_score:
+                best_mask, best_mask_score = float(mt), s
+        self.config.mask_thresh = best_mask
 
-                scores.append(score)
+        try:
+            self.config.diag_max_prompts = _diag_saved
+        except Exception:
+            pass
 
-            mean_score = np.mean(scores)
-
-            if mean_score > best_score:
-                best_score = mean_score
-                best_params = {'prob_thresh': prob_thresh, 'nms_thresh': nms_thresh}
-
-        # Set best thresholds
-        self.prob_thresh = best_params['prob_thresh']
-        self.nms_thresh = best_params['nms_thresh']
-
+        best_params = {
+            'prob_thresh_nucleus': best_prob_nuc,
+            'prob_thresh_cytoplasm': best_prob_cyto,
+            'nms_thresh': best_nms,
+            'mask_thresh': best_mask,
+        }
         print(f"Best parameters: {best_params}")
-        print(f"Best score: {best_score:.4f}")
-
         return best_params
 
 
-def compute_jtpr(nucleus_pred, cytoplasm_pred, nucleus_gt, cytoplasm_gt, iou_thresh=0.5):
+def compute_jtpr(nucleus_pred, cytoplasm_pred, nucleus_gt, cytoplasm_gt, iou_thresh=0.5,
+                 assignments_pred=None):
     """
     Compute Joint True Positive Rate (JTPR).
 
@@ -1116,8 +2177,10 @@ def compute_jtpr(nucleus_pred, cytoplasm_pred, nucleus_gt, cytoplasm_gt, iou_thr
     from cytonucs_losses import compute_nucleus_cell_assignments
 
     # Get assignments
-    assignments_pred, _, _ = compute_nucleus_cell_assignments(nucleus_pred, cytoplasm_pred)
+    if assignments_pred is None:
+        assignments_pred, _, _ = compute_nucleus_cell_assignments(nucleus_pred, cytoplasm_pred)
     assignments_gt, _, _ = compute_nucleus_cell_assignments(nucleus_gt, cytoplasm_gt)
+
 
     # Match nuclei
     nucleus_matches = match_instances(nucleus_pred, nucleus_gt, iou_thresh)
@@ -1159,41 +2222,59 @@ def compute_jtpr(nucleus_pred, cytoplasm_pred, nucleus_gt, cytoplasm_gt, iou_thr
 def match_instances(pred, gt, iou_thresh=0.5):
     """
     Match predicted instances to ground truth based on IoU.
+    Bbox-прунинг: IoU считается только для пар с пересекающимися bbox,
+    и только внутри общего bbox-окна — результат идентичен полному
+    попарному сравнению, но без прохода по всему объёму на каждую пару.
+    Работает для 2D и 3D.
 
-    Args:
-        pred: predicted instance labels
-        gt: ground truth instance labels
-        iou_thresh: minimum IoU for matching
-
-    Returns:
-        matches: dict mapping gt_id -> pred_id
+    Returns: dict {gt_id -> pred_id}
     """
     from skimage.measure import regionprops
 
-    pred_props = regionprops(pred)
-    gt_props = regionprops(gt)
+    if pred.max() == 0 or gt.max() == 0:
+        return {}
+
+    ndim = gt.ndim
+    pred_props = {p.label: p for p in regionprops(pred)}
+    gt_props = {p.label: p for p in regionprops(gt)}
+
+    def bbox_mins_maxs(prop):
+        bb = prop.bbox  # (mins..., maxs...)
+        return np.array(bb[:ndim]), np.array(bb[ndim:])
+
+    pred_bb = {pid: bbox_mins_maxs(p) for pid, p in pred_props.items()}
+    pred_area = {pid: p.area for pid, p in pred_props.items()}
 
     matches = {}
 
-    for gt_prop in gt_props:
-        gt_id = gt_prop.label
-        gt_mask = (gt == gt_id)
+    for gt_id, gt_prop in gt_props.items():
+        g_lo, g_hi = bbox_mins_maxs(gt_prop)
+        gt_area = gt_prop.area
 
-        best_iou = 0
+        best_iou = 0.0
         best_pred_id = None
 
-        for pred_prop in pred_props:
-            pred_id = pred_prop.label
-            pred_mask = (pred == pred_id)
+        for pid, (p_lo, p_hi) in pred_bb.items():
+            # Пересечение bbox
+            lo = np.maximum(g_lo, p_lo)
+            hi = np.minimum(g_hi, p_hi)
+            if np.any(hi <= lo):
+                continue  # bbox не пересекаются → IoU = 0
 
-            # Compute IoU
-            intersection = np.logical_and(gt_mask, pred_mask).sum()
-            union = np.logical_or(gt_mask, pred_mask).sum()
-            iou = intersection / union if union > 0 else 0
+            sl = tuple(slice(int(lo[d]), int(hi[d])) for d in range(ndim))
+            gt_sub = (gt[sl] == gt_id)
+            pred_sub = (pred[sl] == pid)
+
+            intersection = int(np.logical_and(gt_sub, pred_sub).sum())
+            if intersection == 0:
+                continue
+
+            union = gt_area + pred_area[pid] - intersection
+            iou = intersection / union if union > 0 else 0.0
 
             if iou > best_iou:
                 best_iou = iou
-                best_pred_id = pred_id
+                best_pred_id = pid
 
         if best_iou >= iou_thresh:
             matches[gt_id] = best_pred_id
@@ -1476,8 +2557,9 @@ def create_comprehensive_figure(image, nucleus_pred, cytoplasm_pred,
     return fig
 
 
-def compute_all_metrics(image, nucleus_pred, cytoplasm_pred,
-                       nucleus_gt=None, cytoplasm_gt=None, details=None):
+def compute_all_metrics(img, nucleus_pred, cytoplasm_pred,
+                        nucleus_gt=None, cytoplasm_gt=None, details=None,
+                        assignments_pred=None):
     """
     Compute comprehensive metrics including Dice, JTPR, containment, WBR.
 
@@ -1495,9 +2577,11 @@ def compute_all_metrics(image, nucleus_pred, cytoplasm_pred,
     }
 
     # Compute assignments
-    assignments_pred, unassigned, stats = compute_nucleus_cell_assignments(
+    assignments_heur, unassigned, stats = compute_nucleus_cell_assignments(
         nucleus_pred, cytoplasm_pred
     )
+    if assignments_pred is None:
+        assignments_pred = assignments_heur
 
     metrics['n_assigned'] = len(assignments_pred)
     metrics['n_unassigned'] = len(unassigned)
@@ -1511,20 +2595,26 @@ def compute_all_metrics(image, nucleus_pred, cytoplasm_pred,
 
     # WBR metric
     if details and 'nucleus_prob' in details and 'cytoplasm_prob' in details:
+        # Контейнер — бинарные инстансы клеток, а не cytoplasm_prob: последний
+        # это edt_prob, и порог по нему относит бо́льшую часть клетки к «снаружи».
         wbr_ratio = monitor_wbr_metric(
             details['nucleus_prob'],
-            details['cytoplasm_prob']
+            details['cytoplasm_prob'],
+            cytoplasm_instances=cytoplasm_pred
         )
         metrics['wbr_ratio'] = float(wbr_ratio)
 
     # Containment penalty
     if details and 'cytoplasm_dist' in details:
+        _cfg = getattr(details, 'config', None)
         containment_penalty, _ = compute_containment_penalty(
             nucleus_pred,
             cytoplasm_pred,
             details['cytoplasm_dist'],
             assignments_pred,
-            containment_margin=2.0
+            containment_margin=2.0,
+            rays=details.get('rays_cytoplasm'),
+            grid=details.get('cytoplasm_grid')
         )
         metrics['containment_penalty'] = float(containment_penalty)
 
@@ -1537,7 +2627,8 @@ def compute_all_metrics(image, nucleus_pred, cytoplasm_pred,
         # JTPR
         jtpr, jtpr_details = compute_jtpr(
             nucleus_pred, cytoplasm_pred,
-            nucleus_gt, cytoplasm_gt
+            nucleus_gt, cytoplasm_gt,
+            assignments_pred=assignments_pred
         )
         metrics['jtpr'] = float(jtpr)
         metrics['jtpr_details'] = jtpr_details
@@ -1595,10 +2686,12 @@ def load_model_from_config(config_path):
     print("✓ Model loaded")
 
     # Get thresholds
-    prob_thresh = config_dict.get('inference', {}).get('prob_thresh', 0.5)
-    nms_thresh = config_dict.get('inference', {}).get('nms_thresh', 0.4)
+    inf_cfg = config_dict.get('inference', {})
+    prob_thresh_nucleus = inf_cfg.get('prob_thresh_nucleus', inf_cfg.get('prob_thresh', 0.5))
+    prob_thresh_cytoplasm = inf_cfg.get('prob_thresh_cytoplasm', inf_cfg.get('prob_thresh', 0.5))
+    nms_thresh = inf_cfg.get('nms_thresh', 0.4)
 
-    return model, model_config, prob_thresh, nms_thresh
+    return model, model_config, prob_thresh_nucleus, prob_thresh_cytoplasm, nms_thresh
 
 
 def process_single_image(predictor, image_path, output_dir,
@@ -1648,11 +2741,20 @@ def process_single_image(predictor, image_path, output_dir,
             cytoplasm_gt = imageio.volread(gt_cyto_path)
             print(f"  Loaded GT cytoplasm")
 
-    # Run inference
+    # Run inference. Тайлинг — тот же путь, что в run_inference_only: без него
+    # том больше патча либо не влезает в память, либо молча обрезается до
+    # патча внутри except ResourceExhaustedError.
     print("  Predicting...")
-    nucleus_pred, cytoplasm_pred, details = predictor.predict_instances(
-        img, normalize_img=True
-    )
+    _patch = tuple(int(p) for p in predictor.config.train_patch_size)
+    _shp = img.shape[:predictor.ndim]
+    if any(s > p for s, p in zip(_shp, _patch)):
+        _nt = tuple(int(np.ceil(s / p)) for s, p in zip(_shp, _patch))
+        print(f"  🔲 Using tiling: {_nt}")
+        nucleus_pred, cytoplasm_pred, details = predictor._predict_with_tiling(
+            img, n_tiles=_nt, normalize_img=True)
+    else:
+        nucleus_pred, cytoplasm_pred, details = predictor.predict_instances(
+            img, normalize_img=True)
 
     print(f"  Detected: {nucleus_pred.max()} nuclei, {cytoplasm_pred.max()} cells")
 
@@ -1660,7 +2762,8 @@ def process_single_image(predictor, image_path, output_dir,
     print("  Computing metrics...")
     metrics = compute_all_metrics(
         img, nucleus_pred, cytoplasm_pred,
-        nucleus_gt, cytoplasm_gt, details
+        nucleus_gt, cytoplasm_gt, details,
+        assignments_pred=dict(getattr(predictor, '_prompt_assignments', {}) or {}) or None
     )
 
     if save_all:
@@ -1672,8 +2775,6 @@ def process_single_image(predictor, image_path, output_dir,
                             nucleus_pred.astype(np.uint16))
             imageio.imwrite(output_dir / f'{base_name}_cytoplasm.tif',
                             cytoplasm_pred.astype(np.uint16))
-
-            # Save probability maps
             imageio.imwrite(output_dir / f'{base_name}_nucleus_prob.tif',
                             (details['nucleus_prob'] * 65535).astype(np.uint16))
             imageio.imwrite(output_dir / f'{base_name}_cytoplasm_prob.tif',
@@ -1683,8 +2784,6 @@ def process_single_image(predictor, image_path, output_dir,
                              nucleus_pred.astype(np.uint16))
             imageio.volwrite(output_dir / f'{base_name}_cytoplasm.tif',
                              cytoplasm_pred.astype(np.uint16))
-
-            # Save probability maps
             imageio.volwrite(output_dir / f'{base_name}_nucleus_prob.tif',
                              (details['nucleus_prob'] * 65535).astype(np.uint16))
             imageio.volwrite(output_dir / f'{base_name}_cytoplasm_prob.tif',
@@ -1693,7 +2792,6 @@ def process_single_image(predictor, image_path, output_dir,
         # Create visualizations
         print("  Creating visualizations...")
 
-        # Comprehensive figure
         fig = create_comprehensive_figure(
             img, nucleus_pred, cytoplasm_pred,
             nucleus_gt, cytoplasm_gt, metrics
@@ -1703,12 +2801,10 @@ def process_single_image(predictor, image_path, output_dir,
         import matplotlib.pyplot as plt
         plt.close(fig)
 
-        # Simple overlay
         overlay = create_overlay(img, nucleus_pred, cytoplasm_pred,
                                 nucleus_gt, cytoplasm_gt)
         imageio.imwrite(output_dir / f'{base_name}_overlay.png', overlay)
 
-        # Save metrics
         with open(output_dir / f'{base_name}_metrics.json', 'w') as f:
             json.dump(metrics, f, indent=2)
 
@@ -1786,7 +2882,8 @@ Examples:
     print("=" * 60)
 
     try:
-        model, config, prob_thresh, nms_thresh = load_model_from_config(args.config)
+        model, config, prob_thresh_nucleus, prob_thresh_cytoplasm, nms_thresh = \
+            load_model_from_config(args.config)
     except Exception as e:
         print(f"Error loading model: {e}")
         import traceback
@@ -1794,8 +2891,13 @@ Examples:
         sys.exit(1)
 
     # Create predictor
-    predictor = CytoNucsPredictor(model, config, prob_thresh, nms_thresh)
-    print(f"Thresholds: prob={prob_thresh}, nms={nms_thresh}\n")
+    predictor = CytoNucsPredictor(
+        model, config,
+        prob_thresh_nucleus=prob_thresh_nucleus,
+        prob_thresh_cytoplasm=prob_thresh_cytoplasm,
+        nms_thresh=nms_thresh,
+    )
+    print(f"Thresholds: nuc={prob_thresh_nucleus}, cyto={prob_thresh_cytoplasm}, nms={nms_thresh}\n")
 
     # Process
     input_path = Path(args.input)

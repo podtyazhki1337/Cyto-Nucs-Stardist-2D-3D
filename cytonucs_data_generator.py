@@ -15,7 +15,7 @@ from skimage.transform import rescale
 import json
 import random
 import shutil
-from cytonucs_losses import compute_nucleus_cell_assignments
+from cytonucs_losses import compute_nucleus_cell_assignments, compute_stardist_gt
 
 class CytoNucsDataGenerator(Sequence):
     """
@@ -70,7 +70,21 @@ class CytoNucsDataGenerator(Sequence):
         self.counter = 0
         self.r = random.Random(42)
 
-        # Load file lists
+        def _rd(nm):
+            g = tuple(getattr(config, nm, (1,) * config.ndim))
+            if len(g) != config.ndim or any(int(v) < 1 for v in g):
+                g = (1,) * config.ndim
+            return tuple(int(v) for v in g)
+
+        self._nuc_grid = _rd('nucleus_grid')
+        self._cyto_grid = _rd('cytoplasm_grid')
+        self._nuc_rays = getattr(config, 'rays_nucleus', rays)
+        self._cyto_rays = getattr(config, 'rays_cytoplasm', rays)
+        self._nuc_aniso = getattr(config, 'rays_anisotropy_nucleus', config.anisotropy)
+        self._cyto_aniso = getattr(config, 'rays_anisotropy_cytoplasm', config.anisotropy)
+        # Зум переносим в __getitem__ (по патчу, а не по полному тому).
+        # ndzoom на 17x1024x1024x3 стоил секунды и вызывался на каждый сэмпл.
+
         # Load file lists
         def find_all_images(path):
             """Находит все изображения в разных форматах"""
@@ -132,50 +146,77 @@ class CytoNucsDataGenerator(Sequence):
         print(f"Pool size: {self.pool_size}, Repool frequency: {self.repool_freq}")
 
     def repool(self, seed=0):
-        """Reload a random subset of data into memory"""
+        """Reload a random subset of data into memory.
+        Нормализация и координаты foreground считаются ЗДЕСЬ, один раз на том."""
         print(f'Repooling (seed={seed})...')
 
         r_ = random.Random(seed)
         sample_ids = list(range(len(self.image_files)))
         pool_ids = r_.sample(sample_ids, min(self.pool_size, len(sample_ids)))
 
+        nd = int(self.config.ndim)
         self.data_pool = []
         for idx in pool_ids:
-            # Load data
             img = imageio.volread(self.image_files[idx])
-            nucleus_mask = imageio.volread(self.nucleus_files[idx])
-            cytoplasm_mask = imageio.volread(self.cytoplasm_files[idx])
+            # 3D RGB-стек сохранён как (Z, C, H, W) -> канал в конец (Z, H, W, C)
+            if nd == 3 and img.ndim == 4 and img.shape[1] in (3, 4):
+                img = np.moveaxis(img, 1, -1)
+            nucleus_mask = np.asarray(imageio.volread(self.nucleus_files[idx]))
+            cytoplasm_mask = np.asarray(imageio.volread(self.cytoplasm_files[idx]))
 
-            # Load or compute assignments
+            # ПЕРЦЕНТИЛЬНАЯ НОРМАЛИЗАЦИЯ — ОДИН РАЗ НА ТОМ.
+            # Раньше normalize(1, 99.8) звался в __getitem__ по ПОЛНОМУ тому на
+            # каждый сэмпл каждого шага: np.percentile делает partition по всем
+            # ~10^8 элементам. Это и есть основной вклад в 50 с/батч.
+            # Статистика глобальная по тому и от кропа с аугментацией не
+            # зависит, поэтому кэшируется без изменения результата.
+            if nd == 2 and img.ndim == 3 and img.shape[-1] in (3, 4):
+                img = normalize(img.astype(np.float32), 1, 99.8, axis=(0, 1))
+            else:
+                img = normalize(img.astype(np.float32), 1, 99.8,
+                                axis=tuple(range(nd)))
+            img = np.ascontiguousarray(img, dtype=np.float32)
+
+            # Координаты foreground — тоже один раз: np.argwhere по полному тому
+            # аллоцировал массив на каждый сэмпл.
+            seed_mask = nucleus_mask if nucleus_mask.max() > 0 else cytoplasm_mask
+
+            from scipy.ndimage import maximum_filter
+            _p = tuple(int(v) for v in self.config.train_patch_size)
+            _cover = maximum_filter(seed_mask, size=_p, mode='constant') > 0
+            _bs = tuple(slice(p // 2, s - p + p // 2 + 1)
+                        for p, s in zip(_p, seed_mask.shape))
+            _vi = np.where(_cover[_bs])
+            fg_coords = np.stack([v + s.start for s, v in zip(_bs, _vi)],
+                                 axis=1).astype(np.int32)
+            if len(fg_coords) == 0:  # фолбэк как в каноне
+                fg_coords = np.argwhere(seed_mask > 0).astype(np.int32)
             if self.has_assignments:
-                assignment_file = self.assignments_dir / self.image_files[idx].name.replace('.tif', '.json')
+                assignment_file = (self.assignments_dir /
+                                   (Path(self.image_files[idx].name).stem + '.json'))
                 if assignment_file.exists():
                     with open(assignment_file, 'r') as f:
-                        assignments = json.load(f)
-                        assignments = {int(k): int(v) for k, v in assignments.items()}
+                        assignments = {int(k): int(v) for k, v in json.load(f).items()}
                 else:
-                    # Auto-compute if missing
-
                     max_dist = getattr(self.config, 'max_assignment_distance', 100.0)
                     assignments, _, _ = compute_nucleus_cell_assignments(
-                        nucleus_mask, cytoplasm_mask, max_distance=max_dist
-                    )
+                        nucleus_mask, cytoplasm_mask, max_distance=max_dist)
             else:
-                # Auto-compute assignments
                 max_dist = getattr(self.config, 'max_assignment_distance', 100.0)
                 assignments, _, _ = compute_nucleus_cell_assignments(
-                    nucleus_mask, cytoplasm_mask, max_distance=max_dist
-                )
+                    nucleus_mask, cytoplasm_mask, max_distance=max_dist)
 
             self.data_pool.append({
                 'image': img,
                 'nucleus_mask': nucleus_mask,
                 'cytoplasm_mask': cytoplasm_mask,
+                'fg_coords': fg_coords,
                 'assignments': assignments,
                 'filename': self.image_files[idx].name
             })
 
-        print(f'  Loaded {len(self.data_pool)} samples into pool')
+        print(f'  Loaded {len(self.data_pool)} samples into pool '
+              f'(нормализовано и проиндексировано один раз)')
 
     def get_cell_properties(self, prop='cells_median_extent_p'):
         """
@@ -193,71 +234,208 @@ class CytoNucsDataGenerator(Sequence):
         return np.array(extents) if extents else None
 
     def __len__(self):
-        """Number of batches per epoch"""
-        return int(np.ceil(len(self.data_pool) / self.config.train_batch_size))
+        """
+        Число батчей за эпоху.
+        При маленьком пуле (1-2 тома) деление на batch_size давало 1 батч из
+        1 элемента: срез indices[0:bs] из массива длиной 1. Поэтому
+        train_batch_size вообще ни на что не влиял, а трейнер крутил
+        steps_per_epoch шагов по одному и тому же батчу (batch_idx = step % 1).
+        Для train опираемся на steps_per_epoch — каждый вызов собирает свежий
+        батч случайными кропами; для val сохраняем детерминированный проход.
+        """
+        if self.subset == 'train':
+            return max(1, int(getattr(self.config, 'train_steps_per_epoch', 1)))
+        return max(1, int(np.ceil(len(self.data_pool) / self.config.train_batch_size)))
 
     def __getitem__(self, idx):
-        """
-        Возвращаем ТОЛЬКО сырые маски (как в train.py).
-        Никаких distance maps здесь!
-        """
-        batch_indices = self.indices[
-                        idx * self.config.train_batch_size:
-                        (idx + 1) * self.config.train_batch_size
-                        ]
+        """Кроп СНАЧАЛА, аугментация ПОТОМ — по патчу, а не по полному тому.
+        Изображение приходит из пула уже нормализованным."""
+        bs = int(self.config.train_batch_size)
+        nd = int(self.config.ndim)
+        patch = tuple(int(p) for p in self.config.train_patch_size)
+        zoom_axes = (1, 2) if nd == 3 else (0, 1)
+
+        # локальный rng и для выбора элементов пула: __getitem__ теперь
+        # вызывается из НЕСКОЛЬКИХ потоков префетчера, глобальный np.random
+        # между ними шарится
+        pick = np.random.default_rng(None if self.subset == 'train' else int(idx))
+        if self.subset == 'train':
+            batch_indices = pick.choice(
+                len(self.data_pool), bs, replace=len(self.data_pool) < bs)
+        else:
+            batch_indices = self.indices[idx * bs:(idx + 1) * bs]
 
         X_batch = []
-        y_batch = {
-            'nucleus_instances': [],
-            'cytoplasm_instances': []
-        }
+        y_batch = {'nucleus_instances': [], 'cytoplasm_instances': []}
 
-        for i in batch_indices:
+        for _pos, i in enumerate(batch_indices):
+            # ДЕТЕРМИНИРОВАННЫЙ val: иначе каждая эпоха валидируется на другом
+            # кропе с другим промптом, и val_loss мерит дисперсию выборки.
+            rng = (np.random.default_rng() if self.subset == 'train'
+                   else np.random.default_rng(1000 * int(idx) + int(_pos)))
+
             sample = self.data_pool[i]
+            img_full = sample['image']
+            nuc_full = sample['nucleus_mask']
+            cyto_full = sample['cytoplasm_mask']
+            spatial = img_full.shape[:nd]
 
-            img = sample['image'].copy()
-            nucleus_mask = sample['nucleus_mask'].copy()
-            cytoplasm_mask = sample['cytoplasm_mask'].copy()
+            # ZOOM выбираем ЗАРАНЕЕ, чтобы кропнуть ровно столько, сколько после
+            # масштабирования даст patch. Внутри аугментера зум отключён.
+            zr = getattr(self.config, 'zoom_range', (0.75, 1.35))
+            f = 1.0
+            if (self.subset == 'train' and self.augmenter is not None
+                    and zr is not None and rng.random() < 0.5):
+                f = float(rng.uniform(*zr))
 
-            # Аугментация
+            need = list(patch)
+            for a in zoom_axes:
+                need[a] = int(np.ceil(patch[a] / f)) + 2      # запас на округление
+            need = [min(need[a], spatial[a]) for a in range(nd)]
+
+            # центр кропа: с вероятностью p_fg на случайном объекте
+            p_fg = getattr(self.config, 'fg_crop_prob', 0.9)
+            center = None
+            fg = sample['fg_coords']
+            if rng.random() < p_fg and len(fg) > 0:
+                center = fg[int(rng.integers(len(fg)))][:nd]
+
+            starts = []
+            for a in range(nd):
+                sh, p = spatial[a], need[a]
+                if sh <= p:
+                    starts.append(0)
+                elif center is not None:
+                    # center — валидный ЦЕНТР патча (канон), не воксель объекта
+                    starts.append(max(0, min(int(center[a]) - p // 2, sh - p)))
+                else:
+                    starts.append(
+                        int(
+                            rng.integers(
+                                0,
+                                sh - p + 1
+                            )
+                        )
+                    )
+            sl = tuple(slice(s, s + n) for s, n in zip(starts, need))
+
+            img = np.ascontiguousarray(img_full[sl])
+            nucleus_mask = np.ascontiguousarray(nuc_full[sl])
+            cytoplasm_mask = np.ascontiguousarray(cyto_full[sl])
+
+            # ZOOM по патчу
+            if f != 1.0:
+                from scipy.ndimage import zoom as ndzoom
+                zf = [1.0] * nd
+                for a in zoom_axes:
+                    zf[a] = f
+                zf_img = tuple(zf) + ((1.0,) if img.ndim > nd else ())
+                img = ndzoom(img, zf_img, order=1)
+                nucleus_mask = ndzoom(nucleus_mask, tuple(zf), order=0)
+                cytoplasm_mask = ndzoom(cytoplasm_mask, tuple(zf), order=0)
+
+            # Аугментация (флипы, транспоз, интенсивность) — уже по патчу
             if self.augmenter is not None:
-                img, nucleus_mask, cytoplasm_mask = self.augmenter(img, nucleus_mask, cytoplasm_mask)
+                img, nucleus_mask, cytoplasm_mask = self.augmenter(
+                    img, nucleus_mask, cytoplasm_mask)
 
-            # Нормализация
-            if img.ndim == 3 and img.shape[-1] in [3, 4]:
-                img = normalize(img.astype(np.float32), 1, 99.8, axis=(0, 1))
+            # Центральный кроп / паддинг ровно до patch
+            cur = img.shape[:nd]
+            beg = [max(0, (cur[a] - patch[a]) // 2) for a in range(nd)]
+            sl2 = tuple(slice(beg[a], beg[a] + min(cur[a], patch[a])) for a in range(nd))
+            img = img[sl2]
+            nucleus_mask = nucleus_mask[sl2]
+            cytoplasm_mask = cytoplasm_mask[sl2]
+
+            if any(img.shape[a] < patch[a] for a in range(nd)):
+                pw = [(0, patch[a] - img.shape[a]) for a in range(nd)]
+                pw_img = pw + [(0, 0)] if img.ndim > nd else pw
+                img = np.pad(img, pw_img, mode='reflect')
+                nucleus_mask = np.pad(nucleus_mask, pw, mode='constant')
+                cytoplasm_mask = np.pad(cytoplasm_mask, pw, mode='constant')
+
+            def _prompt_at(shape, c, extent, rng=rng):
+                # PROMPT AUGMENTATION. На обучении промпт строится по ТОЧНОМУ
+                # центроиду и bbox GT-инстанса, а на инференсе — по пику NMS с
+                # сигмой из ПРЕДСКАЗАННЫХ лучей. Рефайн, обученный на идеальном
+                # промпте, к этому сдвигу не готов. Шум задаётся в долях размера
+                # объекта, поэтому не зависит от масштаба данных.
+                # Изображение и StarDist-таргеты НЕ трогаются.
+                ext = np.asarray(extent, np.float32)
+                shift = float(getattr(self.config, 'prompt_center_jitter', 0.1))
+                sscale = float(getattr(self.config, 'prompt_sigma_jitter', 0.1))
+                c = np.asarray(c, np.float32)
+                if self.subset == 'train' and shift > 0:
+                    c = c + rng.normal(0.0, shift, size=c.shape).astype(np.float32) * ext
+                sig = np.maximum(ext / 4.0, 1.0)
+                if self.subset == 'train' and sscale > 0:
+                    sig = sig * float(rng.uniform(1.0 - sscale, 1.0 + sscale))
+                grids = np.meshgrid(*[np.arange(s, dtype=np.float32) for s in shape],
+                                    indexing='ij')
+                d2 = sum(((g - c[a]) / sig[a]) ** 2 for a, g in enumerate(grids))
+                return np.exp(-0.5 * d2).astype(np.float32)
+
+            # СОГЛАСОВАННАЯ ПАРА: клетка -> одно из ЕЁ ядер
+            _asg = sample.get('assignments') or {}
+            cyto_ids = np.unique(cytoplasm_mask)
+            cyto_ids = cyto_ids[cyto_ids > 0]
+            chosen_cyto = int(rng.choice(cyto_ids)) if len(cyto_ids) else 0
+
+            nuc_present = {int(v) for v in np.unique(nucleus_mask) if v > 0}
+            if chosen_cyto:
+                # ядра, НАЗНАЧЕННЫЕ этой клетке и присутствующие в патче
+                nuc_ids = [n for n, c in _asg.items()
+                           if int(c) == chosen_cyto and int(n) in nuc_present]
+                if not nuc_ids:  # фолбэк: перекрытие, как раньше
+                    nuc_ids = [int(v) for v in
+                               np.unique(nucleus_mask[cytoplasm_mask == chosen_cyto])
+                               if v > 0]
             else:
-                img = normalize(img.astype(np.float32), 1, 99.8, axis=tuple(range(self.config.ndim)))
+                nuc_ids = sorted(nuc_present)
+            chosen_nuc = int(rng.choice(nuc_ids)) if nuc_ids else 0
 
-            # Crop/Pad до patch_size
-            patch_size = self.config.train_patch_size
-            spatial_shape = img.shape[:self.config.ndim]
+            tg_n = np.zeros(nucleus_mask.shape, np.float32)
+            tg_c = np.zeros(cytoplasm_mask.shape, np.float32)
+            pr = np.zeros(nucleus_mask.shape, np.float32)
 
-            if any(spatial_shape[i] > patch_size[i] for i in range(self.config.ndim)):
-                starts = [np.random.randint(0, sh - p) if sh > p else 0
-                          for sh, p in zip(spatial_shape, patch_size)]
-                slices = tuple(slice(s, s + p) for s, p in zip(starts, patch_size))
-                img = img[slices]
-                nucleus_mask = nucleus_mask[slices]
-                cytoplasm_mask = cytoplasm_mask[slices]
+            if chosen_nuc:
+                mn = nucleus_mask == chosen_nuc
+                tg_n[mn] = 1.0
+                pts = np.argwhere(mn)
+                pr = _prompt_at(nucleus_mask.shape, pts.mean(axis=0),
+                                pts.max(axis=0) - pts.min(axis=0) + 1)
+            elif chosen_cyto:
+                pts = np.argwhere(cytoplasm_mask == chosen_cyto)
+                pr = _prompt_at(cytoplasm_mask.shape, pts.mean(axis=0),
+                                pts.max(axis=0) - pts.min(axis=0) + 1)
 
-            if any(img.shape[i] < patch_size[i] for i in range(self.config.ndim)):
-                pad_width = [(max(0, p - s) // 2, max(0, p - s) - max(0, p - s) // 2)
-                             for s, p in zip(img.shape, patch_size)]
-                img = np.pad(img, pad_width[:self.config.ndim], mode='reflect')
-                nucleus_mask = np.pad(nucleus_mask, pad_width[:self.config.ndim], mode='constant')
-                cytoplasm_mask = np.pad(cytoplasm_mask, pad_width[:self.config.ndim], mode='constant')
+            if chosen_cyto:
+                tg_c[cytoplasm_mask == chosen_cyto] = 1.0
 
-            # Добавляем в батч (как в train.py!)
-            X_batch.append(img[..., np.newaxis] if img.ndim == self.config.ndim else img)
+            img_ch = img[..., np.newaxis] if img.ndim == nd else img
+            img_ch = np.concatenate(
+                [img_ch, pr[..., np.newaxis], pr[..., np.newaxis]], axis=-1)
+
+            X_batch.append(img_ch)
             y_batch['nucleus_instances'].append(nucleus_mask)
             y_batch['cytoplasm_instances'].append(cytoplasm_mask)
+            y_batch.setdefault('nucleus_target', []).append(tg_n)
+            y_batch.setdefault('cytoplasm_target', []).append(tg_c)
 
-        # Stack
+            _pn, _dn = compute_stardist_gt(nucleus_mask, self.config, self._nuc_grid,
+                                           rays=self._nuc_rays, aniso=self._nuc_aniso)
+            _pc, _dc = compute_stardist_gt(cytoplasm_mask, self.config, self._cyto_grid,
+                                           rays=self._cyto_rays, aniso=self._cyto_aniso)
+            y_batch.setdefault('nucleus_prob', []).append(_pn)
+            y_batch.setdefault('nucleus_dist', []).append(_dn)
+            y_batch.setdefault('cytoplasm_prob', []).append(_pc)
+            y_batch.setdefault('cytoplasm_dist', []).append(_dc)
+
         X_batch = np.stack(X_batch)
-        y_batch['nucleus_instances'] = np.stack(y_batch['nucleus_instances'])
-        y_batch['cytoplasm_instances'] = np.stack(y_batch['cytoplasm_instances'])
-
+        for _k in ('nucleus_instances', 'cytoplasm_instances',
+                   'nucleus_target', 'cytoplasm_target',
+                   'nucleus_prob', 'nucleus_dist', 'cytoplasm_prob', 'cytoplasm_dist'):
+            y_batch[_k] = np.stack(y_batch[_k])
         return X_batch, y_batch
 
     def _visualize_gt_comparison(self, img, nucleus_mask_original, cytoplasm_mask_original,
@@ -462,43 +640,66 @@ class CytoNucsDataGenerator(Sequence):
 def cytonucs_augmenter_3d(img, nucleus_mask, cytoplasm_mask):
     """
     3D augmentation for CytoNucs training.
-    Applies same transformations to image and both masks.
-    Same as augmenter in original train.py
+    Applies same spatial transformations to image and both masks.
+    Supports image with optional channel dimension, e.g.:
+        img: (Z, Y, X) or (Z, Y, X, C)
+        masks: (Z, Y, X)
     """
-    from scipy.ndimage import affine_transform, gaussian_filter
+    import numpy as np
 
-    # 1. Random flip and rotation (only in YX plane like original)
-    axis = (1, 2)  # Y, X axes
+    # Spatial axes: Z=0, Y=1, X=2
+    axis = (1, 2)  # Y, X axes only
 
-    # Random permutation of axes
+    def transpose_spatial(arr, perm):
+        transpose_axis = list(range(arr.ndim))
+
+        for a, p in zip(axis, perm):
+            if a < arr.ndim and p < arr.ndim:
+                transpose_axis[a] = p
+
+        return arr.transpose(transpose_axis)
+
+    # 1. Random permutation of Y/X axes
     if np.random.rand() > 0.5:
         perm = np.random.permutation(axis)
-        transpose_axis = list(range(img.ndim))
-        for a, p in zip(axis, perm):
-            transpose_axis[a] = p
-        img = img.transpose(transpose_axis)
-        nucleus_mask = nucleus_mask.transpose(transpose_axis)
-        cytoplasm_mask = cytoplasm_mask.transpose(transpose_axis)
 
-    # Random flips
+        img = transpose_spatial(img, perm)
+        nucleus_mask = transpose_spatial(nucleus_mask, perm)
+        cytoplasm_mask = transpose_spatial(cytoplasm_mask, perm)
+
+    # 2. Random flips in Y/X
     for ax in axis:
         if np.random.rand() > 0.5:
             img = np.flip(img, axis=ax)
             nucleus_mask = np.flip(nucleus_mask, axis=ax)
             cytoplasm_mask = np.flip(cytoplasm_mask, axis=ax)
-
-    # 2. Intensity augmentation (only for image)
+    # 2b. Масштабная аугментация в плоскости XY.
+    # Объекты между томами различаются в ~1.4 раза (median_max_ray 29.5 vs 42.2),
+    # и модель, обученная на одном масштабе, на другом промахивается по dist.
+    # Z НЕ масштабируем: при 8-17 срезах интерполяция по Z разрушает объект,
+    # а анизотропия [5,1,1] делает Z-шаг физически крупным.
+    zr = getattr(cytonucs_augmenter_3d, 'zoom_range', (0.75, 1.35))
+    if zr is not None and np.random.rand() < 0.5:
+        from scipy.ndimage import zoom as ndzoom
+        f = float(np.random.uniform(*zr))
+        zf_img = (1.0, f, f) + ((1.0,) if img.ndim == 4 else ())
+        img = ndzoom(img, zf_img, order=1)
+        nucleus_mask = ndzoom(nucleus_mask, (1.0, f, f), order=0)  # nearest: id не мешать
+        cytoplasm_mask = ndzoom(cytoplasm_mask, (1.0, f, f), order=0)
+    # 3. Intensity augmentation only for image
     img = img * np.random.uniform(0.6, 2.0) + np.random.uniform(-0.2, 0.2)
 
-    # 3. Gamma correction
+    # 4. Gamma correction
     gamma = np.random.uniform(0.9, 1.1)
-    img = np.clip(img, 0, None)
-    img = img ** gamma
+    img = np.sign(img) * (np.abs(img) ** gamma)
 
-    # 4. Gaussian noise
-    noise = np.random.normal(loc=0.0, scale=0.01, size=img.shape)
-    img = img + noise
-    img = np.clip(img, 0, None)
+    # 5. Gaussian noise
+    img = img + np.random.normal(loc=0.0, scale=0.01, size=img.shape)
+
+    # Important after np.flip / transpose: avoid negative strides for torch
+    img = np.ascontiguousarray(img)
+    nucleus_mask = np.ascontiguousarray(nucleus_mask)
+    cytoplasm_mask = np.ascontiguousarray(cytoplasm_mask)
 
     return img, nucleus_mask, cytoplasm_mask
 
@@ -523,9 +724,10 @@ def cytonucs_augmenter_2d(img, nucleus_mask, cytoplasm_mask):
     # 2. Random rotation
     angle = np.random.uniform(-180, 180)
     # ИСПРАВЛЕНО: принудительно приводим маски к int после ротации
-    img = rotate(img, angle, order=1, preserve_range=True)
-    nucleus_mask = rotate(nucleus_mask, angle, order=0, preserve_range=True).astype(nucleus_mask.dtype)
-    cytoplasm_mask = rotate(cytoplasm_mask, angle, order=0, preserve_range=True).astype(cytoplasm_mask.dtype)
+    img = rotate(img, angle, order=1, preserve_range=True, resize=False)
+    nucleus_mask = rotate(nucleus_mask, angle, order=0, preserve_range=True, resize=False).astype(nucleus_mask.dtype)
+    cytoplasm_mask = rotate(cytoplasm_mask, angle, order=0, preserve_range=True, resize=False).astype(
+        cytoplasm_mask.dtype)
 
     # 3. Intensity augmentation
     img = img * np.random.uniform(0.6, 2.0) + np.random.uniform(-0.2, 0.2)
@@ -571,7 +773,7 @@ def cytonucs_augmenter_2d(img, nucleus_mask, cytoplasm_mask):
             nucleus_mask = np.pad(nucleus_scaled, padding_mask, mode='constant')
             cytoplasm_mask = np.pad(cytoplasm_scaled, padding_mask, mode='constant')
 
-    # Возвращаем гарантированно целочисленные маски
+
     return img, nucleus_mask.astype(np.int32), cytoplasm_mask.astype(np.int32)
 
 
@@ -584,13 +786,15 @@ def prepare_cytonucs_dataset(
         test_split=0.1,
         val_split=0.1,
         compute_assignments=True,
-        seed=42
+        seed=42,
+        train_patch_size=None,
+        ndim=2
 ):
     """
     Prepare dataset for CytoNucs training (2D/3D, grayscale/RGB).
     """
-    from cytonucs_losses import compute_nucleus_cell_assignments
-    from skimage.morphology import remove_small_holes
+
+
     import cv2
 
     raw_images_dir = Path(raw_images_dir)
@@ -601,102 +805,93 @@ def prepare_cytonucs_dataset(
     # ========== Вспомогательные функции ==========
 
     def read_image_any_format(filepath, keep_rgb=False):
-        """Читает изображение: 2D grayscale, 2D RGB, или 3D grayscale"""
+        """
+        Читает изображение:
+        - 2D grayscale: (H, W)
+        - 2D RGB/RGBA: (H, W, 3/4)
+        - 3D grayscale: (Z, H, W)
+        - 3D RGB/RGBA: (Z, H, W, 3/4)
+
+        Если keep_rgb=False:
+        - 2D RGB -> grayscale
+        - 3D RGB -> 3D grayscale, послойно
+        """
         filepath = Path(filepath)
         ext = filepath.suffix.lower()
 
-        if ext in ['.tif', '.tiff']:
-            img = imageio.volread(str(filepath))
-        elif ext in ['.png', '.jpg', '.jpeg']:
+        if ext in [".tif", ".tiff"]:
+            img = imageio.imread(str(filepath))
+        elif ext in [".png", ".jpg", ".jpeg"]:
             img = imageio.imread(str(filepath))
         else:
             raise ValueError(f"Unsupported format: {ext}")
 
-        # Конвертация RGB→grayscale только для масок
-        if not keep_rgb and img.ndim == 3 and img.shape[-1] in [3, 4]:
-            # Это 2D RGB - конвертируем в grayscale
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        # RGB/RGBA -> grayscale только если keep_rgb=False
+        if not keep_rgb:
+            # 2D RGB/RGBA: (H, W, 3/4)
+            if img.ndim == 3 and img.shape[-1] in [3, 4]:
+                if img.shape[-1] == 4:
+                    img = img[..., :3]
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+            # 3D RGB/RGBA stack: (Z, H, W, 3/4)
+            elif img.ndim == 4 and img.shape[-1] in [3, 4]:
+                if img.shape[-1] == 4:
+                    img = img[..., :3]
+
+                img = np.stack(
+                    [cv2.cvtColor(slice_rgb, cv2.COLOR_RGB2GRAY) for slice_rgb in img],
+                    axis=0
+                )
 
         return img
 
     def save_image_smart(img, filepath):
         """
         Умное сохранение: определяет тип и использует правильный метод.
-
         Типы:
-        - 2D RGB: (H, W, 3) → imwrite uint8
-        - 2D grayscale: (H, W) → imwrite uint16
-        - 3D: (Z, H, W) → volwrite uint16
+        - 2D grayscale: (H, W)            → imwrite uint16
+        - 2D RGB:       (H, W, 3)         → imwrite uint8
+        - 3D grayscale: (Z, H, W)         → tifffile ZYX uint16
+        - 3D RGB-стек:  (Z, H, W, 3)      → tifffile ZYXC, каналы сохраняются
         """
-        # Проверяем тип изображения
-        if img.ndim == 3 and img.shape[-1] == 3:
-            # 2D RGB - маленькая размерность по последней оси
-            imageio.imwrite(filepath, img.astype(np.uint8))
-        elif img.ndim == 2:
+        import tifffile
+        filepath = str(filepath)
+
+        if img.ndim == 2:
             # 2D grayscale
             imageio.imwrite(filepath, img.astype(np.uint16))
+
+        elif img.ndim == 3 and img.shape[-1] in (3, 4):
+            # 2D RGB/RGBA
+            imageio.imwrite(filepath, img[..., :3].astype(np.uint8))
+
+
         elif img.ndim == 3:
+
             # 3D grayscale (Z, H, W)
-            imageio.volwrite(filepath, img.astype(np.uint16))
+
+            tifffile.imwrite(filepath, img.astype(np.uint16),
+
+                             metadata={'axes': 'ZYX'})
+
+
+        elif img.ndim == 4 and img.shape[-1] in (3, 4):
+
+            # 3D RGB/RGBA стек (Z, H, W, C). ImageJ требует канал перед YX (TZCYXS),
+
+            # поэтому пишем без imagej-режима, оси ZCYX (канал отдельным измерением).
+
+            c = min(img.shape[-1], 3)
+
+            arr = np.moveaxis(img[..., :c], -1, 1).astype(np.uint16)  # (Z,H,W,C) -> (Z,C,H,W)
+
+            tifffile.imwrite(filepath, arr, metadata={'axes': 'ZCYX'})
+
         else:
             raise ValueError(f"Unexpected image shape: {img.shape}")
 
-    def fill_contour_mask(mask):
-        """Заливка контуров БЕЗ перезаписи соседних объектов (FAST)"""
-        from scipy.ndimage import binary_fill_holes, binary_dilation, distance_transform_edt
-        from skimage.morphology import disk, ball
 
-        mask = mask.astype(np.uint16)
-
-        # Выбор структурного элемента
-        ndim = mask.ndim
-        structuring_element = ball(2) if ndim == 3 else disk(2)
-
-        # ШАГ 1: Собираем все расширенные маски
-        all_dilated = {}
-        all_distances = {}
-
-        for label_id in np.unique(mask)[1:]:
-            binary = (mask == label_id).astype(bool)
-            dilated = binary.copy()
-
-            # Быстрая заливка с ограниченным числом итераций
-            for i in range(15):
-                dilated = binary_dilation(dilated, structuring_element)
-                filled_attempt = binary_fill_holes(dilated)
-
-                ratio = filled_attempt.sum() / max(dilated.sum(), 1)
-                if ratio > 1.2:
-                    all_dilated[label_id] = filled_attempt
-                    break
-
-                if i == 14:
-                    all_dilated[label_id] = dilated
-
-            # Pre-compute distance transform (ОДИН РАЗ для каждого объекта!)
-            all_distances[label_id] = distance_transform_edt(~binary)
-
-        # ШАГ 2: Создаём карты приоритетов (векторизованно)
-        # Для каждого пикселя храним: (label_id, distance)
-        label_ids = list(all_dilated.keys())
-
-        # Инициализация результата
-        filled_mask = np.zeros_like(mask, dtype=np.uint16)
-        priority_map = np.full(mask.shape, np.inf, dtype=np.float32)
-
-        # ВЕКТОРИЗОВАННОЕ присвоение: для каждого объекта
-        for label_id in label_ids:
-            dilated_mask = all_dilated[label_id]
-            dist_map = all_distances[label_id]
-
-            # Где этот объект хочет быть И где он ближе чем текущий winner
-            better_mask = dilated_mask & (dist_map < priority_map)
-
-            # Обновляем
-            filled_mask[better_mask] = label_id
-            priority_map[better_mask] = dist_map[better_mask]
-
-        return filled_mask
 
     def validate_instance_mask(mask, name):
         """Проверка instance mask"""
@@ -781,7 +976,7 @@ def prepare_cytonucs_dataset(
             (output_dir / subset / subdir).mkdir(parents=True, exist_ok=True)
 
     # ========== Обработка ==========
-
+    rescale_factors = []
     for subset_name, triplets in [('train', train_triplets),
                                   ('val', val_triplets),
                                   ('test', test_triplets)]:
@@ -804,13 +999,66 @@ def prepare_cytonucs_dataset(
 
             print(f"    Detected: {ndim}D, img shape {img.shape}")
 
+            # === RESCALE (как в стандартном StarDist train.py) ===
+            # # Constraint: median cytoplasm extent должен влезать в FOV сети
+            # if train_patch_size is not None:
+            #     from skimage.measure import regionprops
+            #     from stardist import fill_label_holes
+            #
+            #     cyto_props = regionprops(cytoplasm_mask)
+            #     if len(cyto_props) > 0:
+            #         extents = []
+            #         for prop in cyto_props:
+            #             bbox = prop.bbox
+            #             n = len(bbox) // 2
+            #             ext = np.array([bbox[d + n] - bbox[d] for d in range(n)])
+            #             extents.append(ext)
+            #         median_extent = np.median(extents, axis=0)
+            #
+            #         # FOV ≈ effective receptive field of UNet
+            #         # Эмпирически ~60% patch_size для 4-level UNet с 3×3 convs
+            #         patch_arr = np.array(train_patch_size[-ndim:], dtype=np.float64)
+            #         fov = patch_arr * 0.6
+            #
+            #         # Rescale только если median extent НЕ влезает в FOV
+            #         max_extent = np.max(median_extent)
+            #         max_fov = np.min(fov)
+            #
+            #         if max_extent > max_fov:
+            #             rescale_factor = float(max_fov / max_extent)
+            #             rescale_factor = np.clip(rescale_factor, 0.25, 1.0)
+            #
+            #             print(f"    Median extent {median_extent} > FOV {fov}")
+            #             print(f"    Rescaling: factor={rescale_factor:.3f}")
+            #
+            #             if ndim == 2 and img.ndim == 3 and img.shape[-1] in [3, 4]:
+            #                 img = rescale(img, (rescale_factor, rescale_factor, 1),
+            #                               order=1, preserve_range=True, anti_aliasing=True).astype(img.dtype)
+            #             else:
+            #                 img = rescale(img, rescale_factor,
+            #                               order=1, preserve_range=True, anti_aliasing=True).astype(img.dtype)
+            #
+            #             nucleus_mask = rescale(nucleus_mask, rescale_factor,
+            #                                    order=0, preserve_range=True, anti_aliasing=False).astype(np.uint16)
+            #             nucleus_mask = fill_label_holes(nucleus_mask)
+            #
+            #             cytoplasm_mask = rescale(cytoplasm_mask, rescale_factor,
+            #                                      order=0, preserve_range=True, anti_aliasing=False).astype(np.uint16)
+            #             cytoplasm_mask = fill_label_holes(cytoplasm_mask)
+            #
+            #             print(f"    New shape: {img.shape}")
+            #             rescale_factors.append(rescale_factor)
+            #         else:
+            #             print(f"    No rescale needed: median extent {max_extent:.0f}px < FOV {max_fov:.0f}px")
+            rescale_factors.append(1.0)
+
             # Валидация
             validate_instance_mask(nucleus_mask, "nucleus")
             validate_instance_mask(cytoplasm_mask, "cytoplasm")
 
-            # Заливка
-            #nucleus_mask = fill_contour_mask(nucleus_mask)
-            #cytoplasm_mask = fill_contour_mask(cytoplasm_mask)
+            # Единственный rescale — FOV-based блок выше (он ndim-aware).
+            # Прежний второй блок (хардкод target_extent=[128,128], 2D-индексы
+            # bbox[2]/bbox[3]) удалён: ломал 3D и противоречил "no rescaling".
 
             # Сохранение
             output_filename = base_name + '.tiff'
@@ -853,7 +1101,8 @@ def prepare_cytonucs_dataset(
         'test': [t[0].name for t in test_triplets],
         'seed': seed,
         'test_split': test_split,
-        'val_split': val_split if not validation_images else 'manual'
+        'val_split': val_split if not validation_images else 'manual',
+        'rescale_factor': float(np.median(rescale_factors)) if len(rescale_factors) > 0 else 1.0
     }
     # ========== Generate metadata ==========
     print("\nGenerating metadata...")
@@ -862,16 +1111,16 @@ def prepare_cytonucs_dataset(
 
     for subset_name in ['train', 'val', 'test']:
         subset_dir = output_dir / subset_name
-        image_files = sorted((subset_dir / 'images').glob('*.tif'))
+        image_files = sorted(
+            p for ext in ('*.tif', '*.tiff') for p in (subset_dir / 'images').glob(ext))
 
         metadata = []
 
         for img_file in image_files:
             base_name = img_file.stem
 
-            # Load masks
-            nuc_mask = imageio.volread(subset_dir / 'nucleus_masks' / f'{base_name}.tif')
-            cyto_mask = imageio.volread(subset_dir / 'cytoplasm_masks' / f'{base_name}.tif')
+            nuc_mask = imageio.volread(subset_dir / 'nucleus_masks' / img_file.name)
+            cyto_mask = imageio.volread(subset_dir / 'cytoplasm_masks' / img_file.name)
 
             # Compute median extent
             all_extents = []
@@ -900,6 +1149,7 @@ def prepare_cytonucs_dataset(
             metadata.append({
                 'filename': img_file.name,
                 'cells_median_extent_p': median_extent,
+                'rescale_factor': float(rescale_factor) if 'rescale_factor' in dir() else 1.0,
                 'n_nuclei': int(nuc_mask.max()),
                 'n_cells': int(cyto_mask.max())
             })

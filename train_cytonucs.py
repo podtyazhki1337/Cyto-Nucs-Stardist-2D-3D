@@ -34,428 +34,480 @@ def load_config(config_path='config_cytonucs.json'):
 
 def run_inference_only(config_dict, config_path):
     """
-    Pure inference mode - loads full images directly, processes with tiling if needed
+    Pure inference mode — loads full volumes, normalizes axes, runs tiled inference,
+    dumps full-resolution prediction/GT masks as TIFF, computes Dice/AP/JTPR.
+    Универсально для 2D/3D, grayscale и RGB-стеков (Z,Y,X,C).
     """
     import imageio.v2 as imageio
     from pathlib import Path
     from csbdeep.utils import normalize
-    from cytonucs_inference import CytoNucsPredictor
-    from cytonucs_trainer import compute_dice, _calculate_ap
+    from cytonucs_inference import CytoNucsPredictor, compute_jtpr
+    from cytonucs_trainer import compute_dice, DiceCallback
     from stardist.matching import matching_dataset
+    import tifffile
 
-    # ========== GPU SETUP FOR INFERENCE ==========
+    # ========== GPU SETUP ==========
     use_gpu = config_dict['model'].get('use_gpu', False)
-
     if use_gpu:
         print("\n🔧 Configuring GPU for inference...")
         gpu_config = config_dict.get('gpu_config', {})
-
         gpus = setup_gpu(
             memory_limit=gpu_config.get('memory_limit', None),
             allow_growth=gpu_config.get('allow_growth', True),
             visible_devices=gpu_config.get('visible_devices', None)
         )
-
-        if gpus:
-            print(f"✅ Using GPU for inference")
-        else:
-            print("⚠️  No GPU detected, using CPU for inference")
+        print("✅ Using GPU for inference" if gpus else "⚠️  No GPU detected, using CPU")
     else:
         print("\n💻 Running inference on CPU")
 
     # ========== Load Model ==========
     model_config = CytoNucsConfig.from_json(config_path)
+    ndim = model_config.ndim
+    patch_size = model_config.train_patch_size
     checkpoint_path = Path(config_dict['inference']['checkpoint_path'])
-
     if not checkpoint_path.exists():
         print(f"❌ Checkpoint not found: {checkpoint_path}")
         sys.exit(1)
 
     print(f"\n📥 Loading checkpoint: {checkpoint_path}")
-
     model = build_cytonucs_model(
         config=model_config,
         name=config_dict['experiment']['name'],
         basedir=config_dict['output']['basedir']
     )
-
     model.load_weights(checkpoint_path)
     print("✅ Model loaded")
 
+    # ========== Loaders / helpers ==========
+    def _load_volume(path):
+        """Читает том и нормализует порядок осей RGB-стека к (Z, Y, X, C)."""
+        arr = np.asarray(imageio.volread(str(path)))
+        if ndim == 3 and arr.ndim == 4 and arr.shape[-1] not in (3, 4) and arr.shape[1] in (3, 4):
+            arr = np.moveaxis(arr, 1, -1)  # (Z,C,Y,X) -> (Z,Y,X,C)
+        return arr
+
+    def _to_model_input(img):
+        """(spatial...) или (spatial..., C) -> нормализованный (spatial..., C)."""
+        if img.ndim == ndim:
+            img = img[..., np.newaxis]
+        img = normalize(img.astype(np.float32), 1, 99.8, axis=tuple(range(ndim)))
+        return img
+
+    def _semantic_dice(gt, pred):
+        """Бинарный Dice (любой объект vs фон) — без инстансного матчинга."""
+        g = np.asarray(gt) > 0
+        p = np.asarray(pred) > 0
+        if not g.any() and not p.any():
+            return 1.0
+        denom = g.sum() + p.sum()
+        return float(2 * np.logical_and(g, p).sum() / denom) if denom else 0.0
+
+    # ========== Load rescale factor (info only) ==========
+    split_info_path = Path(config_dict['data']['dataset_dir']) / 'split_info.json'
+    rescale_factor = 1.0
+    if split_info_path.exists():
+        with open(split_info_path, 'r') as f:
+            rescale_factor = json.load(f).get('rescale_factor', 1.0)
+    print(f"📐 Rescale factor from preprocessing: {rescale_factor:.3f}")
+
+    # ========== Find images ==========
     def find_all_images(path):
-        """Находит все изображения в разных форматах"""
         files = []
-        for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
+        for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF', '*.png', '*.PNG',
+                    '*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
             files.extend(list(path.glob(ext)))
         return sorted(files)
 
-    image_files = []
-    nucleus_mask_files = []
-    cytoplasm_mask_files = []
-
-    # Загружаем из test
-    test_dir = Path(config_dict['data']['dataset_dir']) / 'test'
-    if test_dir.exists():
-        image_files.extend(find_all_images(test_dir / 'images'))
-        nucleus_mask_files.extend(find_all_images(test_dir / 'nucleus_masks'))
-        cytoplasm_mask_files.extend(find_all_images(test_dir / 'cytoplasm_masks'))
-        print(f"📂 Loaded {len(image_files)} images from test")
-
-    # Загружаем из validation
-    val_dir = Path(config_dict['data']['dataset_dir']) / 'val'
-    if val_dir.exists():
-        val_start_idx = len(image_files)
-        image_files.extend(find_all_images(val_dir / 'images'))
-        nucleus_mask_files.extend(find_all_images(val_dir / 'nucleus_masks'))
-        cytoplasm_mask_files.extend(find_all_images(val_dir / 'cytoplasm_masks'))
-        val_count = len(image_files) - val_start_idx
-        print(f"📂 Loaded {val_count} images from validation")
+    image_files, nucleus_mask_files, cytoplasm_mask_files = [], [], []
+    for split in ('test', 'val'):
+        d = Path(config_dict['data']['dataset_dir']) / split
+        if d.exists():
+            start = len(image_files)
+            image_files.extend(find_all_images(d / 'images'))
+            nucleus_mask_files.extend(find_all_images(d / 'nucleus_masks'))
+            cytoplasm_mask_files.extend(find_all_images(d / 'cytoplasm_masks'))
+            print(f"📂 Loaded {len(image_files) - start} images from {split}")
 
     if len(image_files) == 0:
-        print(f"❌ No images found in test or validation directories")
+        print("❌ No images found in test or validation directories")
         sys.exit(1)
 
-    print(f"\n📊 Total images for inference: {len(image_files)}")
-
-    # Проверка соответствия файлов
     assert len(image_files) == len(nucleus_mask_files) == len(cytoplasm_mask_files), \
-        f"Mismatch: {len(image_files)} images, {len(nucleus_mask_files)} nucleus, {len(cytoplasm_mask_files)} cytoplasm"
+        f"Mismatch: {len(image_files)} img, {len(nucleus_mask_files)} nuc, {len(cytoplasm_mask_files)} cyto"
 
-    print(f"\nINFERENCE Database (test + validation):")
+    print(f"\n📊 Total images for inference: {len(image_files)}")
+    print("\nINFERENCE Database (test + validation):")
     for idx, im_file in enumerate(image_files):
         source = "val" if "val" in str(im_file.parent.parent) else "test"
         print(f"{idx}\t{im_file.name}\t[{source}]")
-
-    # ========== Warm up BatchNorm ==========
-    print("\n🔥 Warming up BatchNorm...")
-
-    # Загружаем первое изображение для warmup
-    first_img = imageio.volread(str(image_files[0]))
-
-    # КРИТИЧНО: для warmup используем PATCH SIZE модели!
-    patch_size = model_config.train_patch_size
-
-    # Обрезаем до patch size
-    if first_img.ndim == 3 and first_img.shape[-1] in [3, 4]:
-        # RGB: (H, W, 3)
-        h, w = first_img.shape[:2]
-        crop_h = min(h, patch_size[0])
-        crop_w = min(w, patch_size[1])
-        img_crop = first_img[:crop_h, :crop_w, :]
-        img_for_warmup = img_crop
-    else:
-        # Grayscale
-        slices = tuple(slice(0, min(s, p)) for s, p in zip(first_img.shape, patch_size))
-        img_crop = first_img[slices]
-        img_for_warmup = img_crop[..., np.newaxis]
-
-    # Normalize
-    if img_for_warmup.ndim == 3 and img_for_warmup.shape[-1] in [3, 4]:
-        img_normalized = normalize(
-            img_for_warmup.astype(np.float32),
-            1, 99.8,
-            axis=(0, 1)
-        )
-    else:
-        img_normalized = normalize(
-            img_for_warmup.astype(np.float32),
-            1, 99.8,
-            axis=tuple(range(model_config.ndim))
-        )
-
-    # Warmup: несколько forward passes
-    x_warmup = img_normalized[np.newaxis, ...]
-    x_warmup_tf = tf.convert_to_tensor(x_warmup, dtype=tf.float32)
-
-    print(f"  Warmup input shape: {x_warmup.shape}")
-
-    for _ in range(5):
-        _ = model.keras_model(x_warmup_tf, training=False)
-
-    print("  ✓ BatchNorm warmed up")
 
     # ========== Create Predictor ==========
     predictor = CytoNucsPredictor(
         model=model,
         config=model_config,
         prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
-        prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),  # ← Проверьте эту строку!
+        prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),
         nms_thresh=config_dict['inference'].get('nms_thresh', 0.3)
     )
-
-    print(f"Predictor initialized:")
-    print(f"  prob_thresh_nucleus: {predictor.prob_thresh_nucleus}")
-    print(f"  prob_thresh_cytoplasm: {predictor.prob_thresh_cytoplasm}")
-    print(f"  nms_thresh: {predictor.nms_thresh}")
+    print(f"Predictor initialized: prob_nuc={predictor.prob_thresh_nucleus}, "
+          f"prob_cyto={predictor.prob_thresh_cytoplasm}, nms={predictor.nms_thresh}")
 
     dataset_sources = []
-    if len(image_files) > 0 and "test" in str(image_files[0].parent.parent):
+    if any("test" in str(f.parent.parent) for f in image_files):
         dataset_sources.append("test")
-    if len(image_files) > len(dataset_sources) or any("val" in str(f.parent.parent) for f in image_files):
+    if any("val" in str(f.parent.parent) for f in image_files):
         dataset_sources.append("val")
-
     dataset_name = "_".join(dataset_sources) if dataset_sources else "inference"
+
     viz_dir = Path(model.basedir) / model.name / f'inference_{dataset_name}'
     viz_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir = viz_dir / 'pred_masks'
+    masks_dir.mkdir(parents=True, exist_ok=True)
 
-    # ========== Run Inference ==========
+    save_tiff = config_dict.get('inference', {}).get('save_pred_tiff', True)
+    mask_axes = 'ZYX' if ndim == 3 else 'YX'
+
+    def _save_mask(arr, path):
+        tifffile.imwrite(str(path), np.asarray(arr).astype(np.uint16),
+                         metadata={'axes': mask_axes})
+
+    # один раз, а не на каждом изображении
+    dice_callback = DiceCallback(model, None, eval_every=1, save_best=False)
+
+    # ========== Inference Loop ==========
     y_true_nucleus, y_pred_nucleus = [], []
     y_true_cytoplasm, y_pred_cytoplasm = [], []
-
+    pred_assignments = []
     for i in tqdm(range(len(image_files)), desc=f"Inference on {dataset_name}"):
-        # ============================================================
-        # ПРЯМАЯ ЗАГРУЗКА ПОЛНЫХ ИЗОБРАЖЕНИЙ
-        # ============================================================
-
         img_path = image_files[i]
         nuc_mask_path = nucleus_mask_files[i]
         cyto_mask_path = cytoplasm_mask_files[i]
-
-        # Проверка совпадения имён
         assert img_path.name == nuc_mask_path.name == cyto_mask_path.name, \
             f"Filename mismatch: {img_path.name}, {nuc_mask_path.name}, {cyto_mask_path.name}"
 
-        # Загрузка ПОЛНОГО изображения
-        img = imageio.volread(str(img_path))
-        nucleus_gt = imageio.volread(str(nuc_mask_path))
-        cytoplasm_gt = imageio.volread(str(cyto_mask_path))
-
-        # Debug первого изображения
-        if i == 0:
-            print(f"\n  📊 First image stats:")
-            print(f"    File: {img_path.name}")
-            print(f"    Image shape: {img.shape}, dtype: {img.dtype}")
-            print(f"    Range: [{img.min()}, {img.max()}]")
-            print(f"    Nucleus GT: {nucleus_gt.shape}, {nucleus_gt.max()} objects")
-            print(f"    Cytoplasm GT: {cytoplasm_gt.shape}, {cytoplasm_gt.max()} objects")
-            print(f"    Model patch size: {patch_size}")
-
-            # СОХРАНЯЕМ ОРИГИНАЛЬНОЕ ИЗОБРАЖЕНИЕ для проверки
-            imageio.imwrite(viz_dir / 'debug_input_raw.png', img)
-            print(f"    💾 Saved raw input: {viz_dir / 'debug_input_raw.png'}")
-
-        # ============================================================
-        # ПОДГОТОВКА ДЛЯ INFERENCE
-        # ============================================================
-
-        # 1. Определяем формат
-        if img.ndim == 3 and img.shape[-1] in [3, 4]:
-            # 2D RGB: (H, W, 3)
-            img_input = img
-            is_rgb = True
-        elif img.ndim == model_config.ndim:
-            # Grayscale без channel dim: (H, W) или (D, H, W)
-            img_input = img
-            is_rgb = False
-        elif img.ndim == model_config.ndim + 1:
-            # Grayscale с channel dim: (H, W, 1) или (D, H, W, 1)
-            img_input = img[..., 0]
-            is_rgb = False
-        else:
-            print(f"  ⚠️  Unexpected image shape: {img.shape}, skipping")
-            continue
-
-        # 2. НОРМАЛИЗАЦИЯ (как в training!)
-        if is_rgb:
-            # RGB: normalize each channel separately
-            img_normalized = normalize(
-                img_input.astype(np.float32),
-                1, 99.8,
-                axis=(0, 1)  # только spatial axes
-            )
-        else:
-            # Grayscale: normalize all spatial dimensions
-            img_normalized = normalize(
-                img_input.astype(np.float32),
-                1, 99.8,
-                axis=tuple(range(model_config.ndim))
-            )
+        img = _load_volume(img_path)
+        nucleus_gt = np.asarray(imageio.volread(str(nuc_mask_path)))
+        cytoplasm_gt = np.asarray(imageio.volread(str(cyto_mask_path)))
 
         if i == 0:
-            print(f"    After normalization: [{img_normalized.min():.4f}, {img_normalized.max():.4f}]")
+            print(f"\n  📊 First image: {img_path.name}")
+            print(f"    img {img.shape} {img.dtype} range[{img.min()},{img.max()}]")
+            print(f"    nuc GT {nucleus_gt.shape} "
+                  f"({len(np.unique(nucleus_gt)) - 1} obj), "
+                  f"cyto GT {cytoplasm_gt.shape} "
+                  f"({len(np.unique(cytoplasm_gt)) - 1} obj)")
+            print(f"    patch {patch_size}")
 
-            # СОХРАНЯЕМ НОРМАЛИЗОВАННОЕ для проверки
-            img_norm_vis = (img_normalized - img_normalized.min()) / (
-                    img_normalized.max() - img_normalized.min() + 1e-8)
-            img_norm_vis = (img_norm_vis * 255).astype(np.uint8)
-            imageio.imwrite(viz_dir / 'debug_input_normalized.png', img_norm_vis)
-            print(f"    💾 Saved normalized: {viz_dir / 'debug_input_normalized.png'}")
+        img_normalized = _to_model_input(img)
 
-        # ============================================================
-        # INFERENCE С TILING (если изображение больше patch size)
-        # ============================================================
+        img_shape = (
+            img_normalized.shape[:ndim]
+        )
 
-        img_shape = img_normalized.shape[:model_config.ndim]
-        needs_tiling = any(s > p for s, p in zip(img_shape, patch_size))
+        needs_tiling = any(
+            s > p
+            for s, p
+            in zip(
+                img_shape,
+                patch_size
+            )
+        )
 
         if needs_tiling:
-            print(f"  🔲 Image larger than patch size, using tiling...")
 
-            # Вычисляем количество тайлов
-            n_tiles = tuple(int(np.ceil(s / p)) for s, p in zip(img_shape, patch_size))
-            print(f"    Grid: {n_tiles} tiles")
+            n_tiles = tuple(
+                max(
+                    1,
+                    int(
+                        np.ceil(
+                            s / p
+                        )
+                    )
+                )
+                for s, p
+                in zip(
+                    img_shape,
+                    patch_size
+                )
+            )
 
-            # ИСПОЛЬЗУЕМ встроенный метод predict с tiling
-            nucleus_pred, cytoplasm_pred, details = predictor._predict_with_tiling(
+            # Z полностью контролируется внутри
+            # _predict_with_tiling через fixed-Z windows.
+            #
+            # Здесь n_tiles относится только к XY.
+            if ndim == 3:
+                n_tiles = (
+                    1,
+                    n_tiles[1],
+                    n_tiles[2]
+                )
+
+            if i == 0:
+                print(
+                    f"  🔲 Using tiling: "
+                    f"{n_tiles}"
+                )
+
+            (
+                nucleus_pred,
+                cytoplasm_pred,
+                details
+            ) = predictor._predict_with_tiling(
                 img_normalized,
                 n_tiles=n_tiles,
                 normalize_img=False
             )
+
         else:
-            # Изображение помещается в patch size
-            nucleus_pred, cytoplasm_pred, details = predictor.predict_instances(
+
+            (
+                nucleus_pred,
+                cytoplasm_pred,
+                details
+            ) = predictor.predict_instances(
                 img_normalized,
                 normalize_img=False
             )
 
-        # Проверка размеров
+        # Выравнивание форм pred/GT
         if nucleus_pred.shape != nucleus_gt.shape:
             print(f"  ⚠️  Shape mismatch: pred={nucleus_pred.shape}, gt={nucleus_gt.shape}")
-            # Crop/pad if needed
             min_shape = tuple(min(p, g) for p, g in zip(nucleus_pred.shape, nucleus_gt.shape))
-            slices = tuple(slice(0, s) for s in min_shape)
-            nucleus_pred = nucleus_pred[slices]
-            cytoplasm_pred = cytoplasm_pred[slices]
-            nucleus_gt = nucleus_gt[slices]
-            cytoplasm_gt = cytoplasm_gt[slices]
+            sl = tuple(slice(0, s) for s in min_shape)
+            nucleus_pred, cytoplasm_pred = nucleus_pred[sl], cytoplasm_pred[sl]
+            nucleus_gt, cytoplasm_gt = nucleus_gt[sl], cytoplasm_gt[sl]
 
-        y_true_nucleus.append(nucleus_gt)
-        y_pred_nucleus.append(nucleus_pred)
-        y_true_cytoplasm.append(cytoplasm_gt)
-        y_pred_cytoplasm.append(cytoplasm_pred)
+        y_true_nucleus.append(nucleus_gt);   y_pred_nucleus.append(nucleus_pred)
+        y_true_cytoplasm.append(cytoplasm_gt); y_pred_cytoplasm.append(cytoplasm_pred)
+        pred_assignments.append(dict(getattr(predictor, '_prompt_assignments', {}) or {}))
+        _pc = getattr(predictor, '_prompt_coords_nuc', None)
+        if _pc is not None and len(_pc) > 0:
+            _hi = np.array(nucleus_gt.shape) - 1
+            _lab = [int(nucleus_gt[tuple(np.clip(np.asarray(p, int), 0, _hi))])
+                    for p in _pc]
+            from collections import Counter
+            _cnt = Counter(l for l in _lab if l > 0)
+            _dup = {k: v for k, v in _cnt.items() if v > 1}
+            print(f"  [gt-diag] промптов {len(_lab)}: "
+                  f"в фоне {sum(1 for l in _lab if l == 0)}, "
+                  f"на GT-ядрах {len(_cnt)} уникальных, "
+                  f"дубликатов (>1 промпта на ядро) {len(_dup)}"
+                  + (f", распределение {sorted(_dup.values(), reverse=True)[:8]}" if _dup else ""))
+        sd_n = _semantic_dice(nucleus_gt, nucleus_pred)
+        sd_c = _semantic_dice(cytoplasm_gt, cytoplasm_pred)
+        print(f"  [{i}] semantic Dice  nuc={sd_n:.3f} cyto={sd_c:.3f} | "
+              f"ids pred nuc={len(np.unique(nucleus_pred))-1} cyto={len(np.unique(cytoplasm_pred))-1} | "
+              f"GT nuc={len(np.unique(nucleus_gt))-1} cyto={len(np.unique(cytoplasm_gt))-1}")
 
-        # ============================================================
-        # ВИЗУАЛИЗАЦИЯ ПЕРВОГО ИЗОБРАЖЕНИЯ
-        # ============================================================
+        if save_tiff:
+            stem = img_path.stem
+            _save_mask(nucleus_pred,   masks_dir / f'{stem}_nucleus_pred.tiff')
+            _save_mask(cytoplasm_pred, masks_dir / f'{stem}_cytoplasm_pred.tiff')
+            _save_mask(nucleus_gt,     masks_dir / f'{stem}_nucleus_gt.tiff')
+            _save_mask(cytoplasm_gt,   masks_dir / f'{stem}_cytoplasm_gt.tiff')
 
-
-        from cytonucs_trainer import DiceCallback
-
-        dice_callback = DiceCallback(model, None, eval_every=1, save_best=False)
-
-            # Для визуализации используем ОРИГИНАЛЬНОЕ изображение (не нормализованное!)
-        img_for_viz = img_input
-        output_filename = f"prediction_{i:04d}_{img_path.stem}.png"
         dice_callback._save_epoch_visualization_full(
-                epoch=i,  # используем индекс как "эпоху" для уникальности
-                img=img_for_viz,
-                nuc_gt=nucleus_gt,
-                cyto_gt=cytoplasm_gt,
-                nuc_pred=nucleus_pred,
-                cyto_pred=cytoplasm_pred,
-                details=details,
-                viz_dir=viz_dir,
-                filename=output_filename  # передаём кастомное имя
-            )
+            epoch=i, img=img,
+            nuc_gt=nucleus_gt, cyto_gt=cytoplasm_gt,
+            nuc_pred=nucleus_pred, cyto_pred=cytoplasm_pred,
+            details=details, viz_dir=viz_dir,
+            filename=f"prediction_{i:04d}_{img_path.stem}.png")
 
-        print(f"  📷 Saved visualization: {viz_dir / output_filename}")
-
-    # ========== Compute Metrics ==========
+    # ========== Metrics ==========
     print("\n📊 Computing metrics...")
+    mean_dice_nucleus = np.mean([compute_dice(g, p) for g, p in zip(y_true_nucleus, y_pred_nucleus)])
+    mean_dice_cytoplasm = np.mean([compute_dice(g, p) for g, p in zip(y_true_cytoplasm, y_pred_cytoplasm)])
 
-    # Dice (instance-based)
-    mean_dice_nucleus = np.mean([compute_dice(gt, pred) for gt, pred in zip(y_true_nucleus, y_pred_nucleus)])
-    mean_dice_cytoplasm = np.mean([compute_dice(gt, pred) for gt, pred in zip(y_true_cytoplasm, y_pred_cytoplasm)])
-
-    # AP через matching_dataset
     taus = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+    stats_nuc = matching_dataset(y_true_nucleus, y_pred_nucleus, thresh=taus, show_progress=False)
+    stats_cyto = matching_dataset(y_true_cytoplasm, y_pred_cytoplasm, thresh=taus, show_progress=False)
 
-    stats_nucleus_tuple = matching_dataset(y_true_nucleus, y_pred_nucleus, thresh=taus, show_progress=False)
-    stats_cytoplasm_tuple = matching_dataset(y_true_cytoplasm, y_pred_cytoplasm, thresh=taus, show_progress=False)
+    # AP в конвенции StarDist / DSB-2018 = accuracy = TP/(TP+FP+FN), среднее по
+    # taus. Раньше здесь печаталась precision = TP/(TP+FP) под именем «AP@50»
+    # и результат _calculate_ap (интегрирование PR-кривой по 10 точкам) под
+    # именем «AP» — обе величины несравнимы с тем, что печатает DiceCallback,
+    # так что val и test были в разных единицах.
+    acc_nuc = np.array([s.accuracy for s in stats_nuc])
+    acc_cyto = np.array([s.accuracy for s in stats_cyto])
+    precision_nucleus = np.array([s.precision for s in stats_nuc])
+    recall_nucleus = np.array([s.recall for s in stats_nuc])
+    precision_cytoplasm = np.array([s.precision for s in stats_cyto])
+    recall_cytoplasm = np.array([s.recall for s in stats_cyto])
+    ap_nucleus = float(np.mean(acc_nuc))
+    ap_cytoplasm = float(np.mean(acc_cyto))
+    ap50_nucleus = float(acc_nuc[0])
+    ap50_cytoplasm = float(acc_cyto[0])
 
-    # === ПРАВИЛЬНОЕ ИЗВЛЕЧЕНИЕ: из каждого DatasetMatching объекта ===
-    precision_nucleus = np.array([s.precision for s in stats_nucleus_tuple])
-    recall_nucleus = np.array([s.recall for s in stats_nucleus_tuple])
+    # Разбивка: без неё «AP@50 0.045» не отличает «не нашли» от «нашли, но IoU
+    # не дотянул» — это разные проблемы с разными лечениями. Обвал accuracy
+    # между 0.5 и 0.6 = систематически неверный размер масок; низкая уже на
+    # 0.5 = недодетекция.
+    s_n, s_c = stats_nuc[0], stats_cyto[0]
+    print(f"  @IoU=0.5 nucleus:   TP={s_n.tp} FP={s_n.fp} FN={s_n.fn} "
+          f"P={s_n.precision:.3f} R={s_n.recall:.3f}")
+    print(f"  @IoU=0.5 cytoplasm: TP={s_c.tp} FP={s_c.fp} FN={s_c.fn} "
+          f"P={s_c.precision:.3f} R={s_c.recall:.3f}")
+    print(f"  accuracy(tau) nucleus:   "
+          f"{' '.join(f'{t:.2f}:{a:.3f}' for t, a in zip(taus, acc_nuc))}")
+    print(f"  accuracy(tau) cytoplasm: "
+          f"{' '.join(f'{t:.2f}:{a:.3f}' for t, a in zip(taus, acc_cyto))}")
+    # compute_dice усредняет ТОЛЬКО по совпавшим парам (IoU>0.5) и за пропуски
+    # не штрафует: 6 совпадений из 61 дают ровную «Dice 0.69».
+    print(f"  instance Dice посчитан по: nucleus {s_n.tp}/{s_n.tp + s_n.fn} пар, "
+          f"cytoplasm {s_c.tp}/{s_c.tp + s_c.fn} пар")
 
-    precision_cytoplasm = np.array([s.precision for s in stats_cytoplasm_tuple])
-    recall_cytoplasm = np.array([s.recall for s in stats_cytoplasm_tuple])
-
-    print(f"  Precision nucleus shape: {precision_nucleus.shape}, values: {precision_nucleus}")
-    print(f"  Recall nucleus shape: {recall_nucleus.shape}, values: {recall_nucleus}")
-
-    # AP - average precision
-    ap_nucleus = _calculate_ap(precision_nucleus, recall_nucleus)
-    ap_cytoplasm = _calculate_ap(precision_cytoplasm, recall_cytoplasm)
-
-    ap50_nucleus = precision_nucleus[0]  # Просто берем первый элемент
-    ap50_cytoplasm = precision_cytoplasm[0]
-
-    print(f"\n  Final AP values:")
-    print(f"    Nucleus: AP={ap_nucleus:.4f}, AP@50={ap50_nucleus:.4f}")
-    print(f"    Cytoplasm: AP={ap_cytoplasm:.4f}, AP@50={ap50_cytoplasm:.4f}")
-
-    # ============================================================
-    # COMPUTE JTPR (Joint True Positive Rate)
-    # ============================================================
-    print("\n  Computing JTPR (Joint True Positive Rate)...")
-
-    from cytonucs_inference import compute_jtpr
-
-    jtpr_values = []
-    joint_tp_total = 0
-    total_pairs_total = 0
-
-    for nuc_pred, cyto_pred, nuc_gt, cyto_gt in zip(
-            y_pred_nucleus, y_pred_cytoplasm, y_true_nucleus, y_true_cytoplasm
-    ):
-        jtpr, details = compute_jtpr(
-            nucleus_pred=nuc_pred,
-            cytoplasm_pred=cyto_pred,
-            nucleus_gt=nuc_gt,
-            cytoplasm_gt=cyto_gt,
-            iou_thresh=0.5
-        )
+    print("\n  Computing JTPR...")
+    jtpr_values, joint_tp_total, total_pairs_total = [], 0, 0
+    for idx_img, (nuc_pred, cyto_pred, nuc_gt, cyto_gt) in enumerate(zip(
+            y_pred_nucleus, y_pred_cytoplasm, y_true_nucleus, y_true_cytoplasm)):
+        _ap = pred_assignments[idx_img] if idx_img < len(pred_assignments) else None
+        jtpr, d = compute_jtpr(nucleus_pred=nuc_pred, cytoplasm_pred=cyto_pred,
+                               nucleus_gt=nuc_gt, cytoplasm_gt=cyto_gt, iou_thresh=0.5,
+                               assignments_pred=_ap if _ap else None)
         jtpr_values.append(jtpr)
-        joint_tp_total += details['joint_tp']
-        total_pairs_total += details['total_pairs']
-
-    # Mean JTPR across all images
+        joint_tp_total += d['joint_tp']
+        total_pairs_total += d['total_pairs']
     mean_jtpr = np.mean(jtpr_values) if jtpr_values else 0.0
-
-    # Global JTPR (pooled across all images)
     global_jtpr = joint_tp_total / total_pairs_total if total_pairs_total > 0 else 0.0
 
-    print(f"    JTPR (mean): {mean_jtpr:.4f}")
-    print(f"    JTPR (global): {global_jtpr:.4f}")
-    print(f"    Joint TP: {joint_tp_total} / {total_pairs_total} pairs")
-
-    # ========== Results ==========
     print("\n" + "=" * 60)
     print(f"INFERENCE RESULTS ({dataset_name})")
     print("=" * 60)
+    print(f"  Rescale factor: {rescale_factor:.3f}")
     print(f"  Nucleus   | Dice: {mean_dice_nucleus:.4f} | AP: {ap_nucleus:.4f} (AP@50: {ap50_nucleus:.4f})")
-    print(
-        f"  Cytoplasm | Dice: {mean_dice_cytoplasm:.4f} | AP: {ap_cytoplasm:.4f} (AP@50: {ap50_cytoplasm:.4f})")
+    print(f"  Cytoplasm | Dice: {mean_dice_cytoplasm:.4f} | AP: {ap_cytoplasm:.4f} (AP@50: {ap50_cytoplasm:.4f})")
     print(f"  JTPR      | Mean: {mean_jtpr:.4f} | Global: {global_jtpr:.4f} ({joint_tp_total}/{total_pairs_total})")
+    print(f"  ▸ JTPR ограничен сверху min(nuc TP, cyto TP) = "
+          f"min({s_n.tp}, {s_c.tp}) из {total_pairs_total} пар")
     print("=" * 60)
 
     results = {
-        'dataset': dataset_name,
-        'n_images': len(y_true_nucleus),
+        'dataset': dataset_name, 'n_images': len(y_true_nucleus),
+        'rescale_factor': float(rescale_factor),
         'dice_nucleus_mean': float(mean_dice_nucleus),
         'dice_cytoplasm_mean': float(mean_dice_cytoplasm),
-        'ap_nucleus': float(ap_nucleus),
-        'ap_cytoplasm': float(ap_cytoplasm),
-        'ap50_nucleus': float(ap50_nucleus),
-        'ap50_cytoplasm': float(ap50_cytoplasm),
-        'jtpr_mean': float(mean_jtpr),
-        'jtpr_global': float(global_jtpr),
-        'joint_tp': int(joint_tp_total),
-        'total_pairs': int(total_pairs_total),
+        'ap_nucleus': float(ap_nucleus), 'ap_cytoplasm': float(ap_cytoplasm),
+        'ap50_nucleus': float(ap50_nucleus), 'ap50_cytoplasm': float(ap50_cytoplasm),
+        'accuracy_taus': [float(t) for t in taus],
+        'accuracy_nucleus': [float(a) for a in acc_nuc],
+        'accuracy_cytoplasm': [float(a) for a in acc_cyto],
+        'tp_fp_fn_nucleus': [int(s_n.tp), int(s_n.fp), int(s_n.fn)],
+        'tp_fp_fn_cytoplasm': [int(s_c.tp), int(s_c.fp), int(s_c.fn)],
+        'precision50_nucleus': float(precision_nucleus[0]),
+        'recall50_nucleus': float(recall_nucleus[0]),
+        'precision50_cytoplasm': float(precision_cytoplasm[0]),
+        'recall50_cytoplasm': float(recall_cytoplasm[0]),
+        'jtpr_mean': float(mean_jtpr), 'jtpr_global': float(global_jtpr),
+        'joint_tp': int(joint_tp_total), 'total_pairs': int(total_pairs_total),
         'checkpoint': str(checkpoint_path),
         'prob_thresh_nucleus': predictor.prob_thresh_nucleus,
         'prob_thresh_cytoplasm': predictor.prob_thresh_cytoplasm,
         'nms_thresh': predictor.nms_thresh,
     }
-
     with open(viz_dir / 'results.json', 'w') as f:
         json.dump(results, f, indent=2)
-
     print(f"\n✅ Results saved to: {viz_dir}")
-    print(f"✅ Visualization saved to: {viz_dir }")
-    print(f"✅ Debug images saved: debug_input_raw.png, debug_input_normalized.png")
-
     return model, predictor, results
+
+def run_threshold_optimization(config_dict, config_path):
+    """
+    Подбор порогов на ПОЛНЫХ ТОМАХ через тот же путь, что и inference
+    (тайлинг + промпт-ветка). Прежняя версия собирала патчи из val-генератора
+    и звала predict_instances без тайлинга — то есть подбирала пороги под
+    режим, которого на реальных данных не существует.
+    Пороги в конфиг НЕ пишет — впишешь найденное руками.
+    """
+    import imageio.v2 as imageio
+    from csbdeep.utils import normalize
+
+    model_config = CytoNucsConfig.from_json(config_path)
+    ndim = model_config.ndim
+    checkpoint_path = Path(config_dict['inference']['checkpoint_path'])
+    if not checkpoint_path.exists():
+        print(f"❌ Checkpoint not found: {checkpoint_path}")
+        return None
+
+    use_gpu = config_dict['model'].get('use_gpu', False)
+    if use_gpu:
+        gpu_config = config_dict.get('gpu_config', {})
+        setup_gpu(memory_limit=gpu_config.get('memory_limit', None),
+                  allow_growth=gpu_config.get('allow_growth', True),
+                  visible_devices=gpu_config.get('visible_devices', None))
+
+    print(f"\n📥 Loading checkpoint: {checkpoint_path}")
+    model = build_cytonucs_model(
+        config=model_config,
+        name=config_dict['experiment']['name'],
+        basedir=config_dict['output']['basedir'],
+    )
+    model.load_weights(checkpoint_path)
+
+    def _load_volume(path):
+        arr = np.asarray(imageio.volread(str(path)))
+        if ndim == 3 and arr.ndim == 4 and arr.shape[-1] not in (3, 4) and arr.shape[1] in (3, 4):
+            arr = np.moveaxis(arr, 1, -1)
+        return arr
+
+    def _to_model_input(img):
+        if img.ndim == ndim:
+            img = img[..., np.newaxis]
+        return normalize(img.astype(np.float32), 1, 99.8, axis=tuple(range(ndim)))
+
+    def find_all_images(path):
+        files = []
+        for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF', '*.png', '*.PNG',
+                    '*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
+            files.extend(list(path.glob(ext)))
+        return sorted(files)
+
+    # На каких сплитах подбирать. По умолчанию val: подбор на test — это
+    # подгонка под тестовую выборку, и в статье так писать нельзя.
+    splits = config_dict.get('evaluation', {}).get('threshold_opt_splits', ['val'])
+    image_files, nuc_files, cyto_files = [], [], []
+    for split in splits:
+        d = Path(config_dict['data']['dataset_dir']) / split
+        if d.exists():
+            image_files.extend(find_all_images(d / 'images'))
+            nuc_files.extend(find_all_images(d / 'nucleus_masks'))
+            cyto_files.extend(find_all_images(d / 'cytoplasm_masks'))
+    if len(image_files) == 0:
+        print(f"❌ Нет изображений в сплитах {splits}")
+        return None
+    print(f"📂 Подбор на {len(image_files)} томах из {splits}")
+
+    val_images, val_nuc, val_cyto = [], [], []
+    for f_img, f_n, f_c in zip(image_files, nuc_files, cyto_files):
+        assert f_img.name == f_n.name == f_c.name, f"Filename mismatch: {f_img.name}"
+        val_images.append(_to_model_input(_load_volume(f_img)))
+        val_nuc.append(np.asarray(imageio.volread(str(f_n))))
+        val_cyto.append(np.asarray(imageio.volread(str(f_c))))
+        print(f"   {f_img.name}: {val_images[-1].shape}, "
+              f"GT nuc={len(np.unique(val_nuc[-1]))-1} cyto={len(np.unique(val_cyto[-1]))-1}")
+
+    predictor = CytoNucsPredictor(
+        model=model, config=model_config,
+        prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
+        prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),
+        nms_thresh=config_dict['inference'].get('nms_thresh', 0.3),
+    )
+
+    eval_cfg = config_dict.get('evaluation', {})
+    best = predictor.optimize_thresholds(
+        val_images, val_nuc, val_cyto,
+        prob_thresh_range=eval_cfg.get('prob_thresh_range', [0.3, 0.4, 0.5, 0.6, 0.7]),
+        nms_thresh_range=eval_cfg.get('nms_thresh_range', [0.15, 0.2, 0.25, 0.3, 0.4]),
+        mask_thresh_range=eval_cfg.get('mask_thresh_range', [0.25, 0.35, 0.45, 0.55]),
+    )
+
+    thresh_path = (Path(config_dict['output']['basedir']) /
+                   config_dict['experiment']['name'] / 'optimized_thresholds.json')
+    thresh_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(thresh_path, 'w') as f:
+        json.dump(best, f, indent=2)
+    print(f"  ✅ Optimized thresholds saved to: {thresh_path}")
+    print(f"  ▶ Впиши в config.inference: {best}")
+    return best
+
 
 def main(config_path='config_cytonucs.json'):
     """
@@ -501,6 +553,10 @@ def main(config_path='config_cytonucs.json'):
         print("\n🔍 MODE: INFERENCE ONLY")
         result = run_inference_only(config_dict, config_path)  # ← СОХРАНЯЕМ результат
         return result
+    elif mode == 'optimize_thresholds':
+        print("\n🎯 MODE: THRESHOLD OPTIMIZATION ONLY")
+        result = run_threshold_optimization(config_dict, config_path)
+        return result
     else:
         print("\n🎓 MODE: TRAINING")
     # ========== Initialize Experiment Tracking ==========
@@ -522,14 +578,15 @@ def main(config_path='config_cytonucs.json'):
             raw_nucleus_masks_dir=config_dict['preprocessing']['raw_nucleus_masks_dir'],
             raw_cytoplasm_masks_dir=config_dict['preprocessing']['raw_cytoplasm_masks_dir'],
             output_dir=config_dict['preprocessing']['output_dir'],
-            validation_images=config_dict['data'].get('validation_images'),
+            validation_images=config_dict['data'].get('validation_images', []),
             test_split=config_dict['preprocessing'].get('test_split', 0.1),
             val_split=config_dict['preprocessing'].get('val_split', 0.1),
-            compute_assignments=config_dict['preprocessing']['compute_assignments'],
-            seed=config_dict['preprocessing'].get('seed', 42)
+            compute_assignments=config_dict['preprocessing'].get('compute_assignments', True),
+            seed=config_dict['preprocessing'].get('seed', 42),
+            train_patch_size=tuple(config_dict['training']['train_patch_size']),
+            ndim=config_dict['model']['ndim']
         )
 
-    # ========== Create Model Configuration ==========
     # ========== Create Model Configuration ==========
     model_config = CytoNucsConfig.from_json(config_path)
 
@@ -592,154 +649,173 @@ def main(config_path='config_cytonucs.json'):
 
     print(f"Training samples: {len(train_generator.image_files)}")
     print(f"Validation samples: {len(val_generator.image_files)}")
+
+    # ========== КАНОНИЧЕСКИЙ ЗАМЕР АНИЗОТРОПИИ ==========
+    # StarDist 3D выводит anisotropy из МЕДИАННЫХ BBOX ОБЪЕКТОВ, а не из шага
+    # между срезами (examples/3D/2_training.ipynb). От неё зависят и лучи, и
+    # grid. Делается ПОСЛЕ создания генераторов, потому что нужны загруженные
+    # маски, и ДО build_cytonucs_model, потому что модель читает гриды.
+    model_config.set_anisotropy_from_labels(
+        [s['nucleus_mask'] for s in train_generator.data_pool],
+        [s['cytoplasm_mask'] for s in train_generator.data_pool],
+        update_grid=True)
+    for _gen in (train_generator, val_generator):
+        _gen._nuc_grid = tuple(int(g) for g in model_config.nucleus_grid)
+        _gen._cyto_grid = tuple(int(g) for g in model_config.cytoplasm_grid)
+        _gen._nuc_rays = model_config.rays_nucleus
+        _gen._cyto_rays = model_config.rays_cytoplasm
+        _gen._nuc_aniso = model_config.rays_anisotropy_nucleus
+        _gen._cyto_aniso = model_config.rays_anisotropy_cytoplasm
+    print(f"  ✓ Гриды генераторов обновлены: nucleus={train_generator._nuc_grid}, "
+          f"cytoplasm={train_generator._cyto_grid}")
     # ============================================================
     # === COMPUTE MEDIAN RADIUS FOR ADAPTIVE FOOTPRINT ===
     # ============================================================
 
-    print("\n📊 Computing training statistics for adaptive footprint...")
+    # print("\n📊 Computing training statistics for adaptive footprint...")
+    #
+    # all_nuc_radii = []
+    # all_cyto_radii = []
+    #
+    # num_samples = min(10, len(train_generator.data_pool))
+    #
+    # for i in range(num_samples):
+    #     sample = train_generator.data_pool[i]
+    #
+    #     from skimage.measure import regionprops
+    #     from scipy.ndimage import distance_transform_edt
+    #
+    #     # === NUCLEUS STATISTICS ===
+    #     nuc_mask = sample['nucleus_mask']
+    #     nuc_props = regionprops(nuc_mask)
+    #
+    #     for prop in nuc_props:
+    #         # Метод 1: Через area (быстро, всегда работает)
+    #         if model_config.ndim == 2:
+    #             radius_from_area = np.sqrt(prop.area / np.pi)
+    #         else:
+    #             radius_from_area = (prop.area * 3 / (4 * np.pi)) ** (1 / 3)
+    #
+    #         # КРИТИЧНО: Пропускаем слишком маленькие объекты
+    #         if radius_from_area < 3.0:
+    #             continue
+    #
+    #         # Метод 2: Через StarDist distances (точно, но может fail)
+    #         obj_mask = (nuc_mask == prop.label).astype(np.int32)
+    #
+    #         try:
+    #             # Вызываем StarDist для получения distances
+    #             if model_config.ndim == 2:
+    #                 from stardist.geometry import star_dist
+    #                 dist_map = star_dist(obj_mask, model_config.n_rays, mode='cpp')
+    #             else:
+    #                 from stardist.geometry import star_dist3D
+    #                 dist_map = star_dist3D(obj_mask, model_config.rays, mode='cpp')
+    #
+    #             # Берём distances в центре объекта
+    #             center = tuple(int(c) for c in prop.centroid)
+    #
+    #             # ЗАЩИТА: проверяем, что центр внутри маски
+    #             if obj_mask[center] == 0:
+    #                 # Центр снаружи - используем центроид маски
+    #                 from scipy.ndimage import center_of_mass
+    #                 center = tuple(int(c) for c in center_of_mass(obj_mask))
+    #
+    #             dists_at_center = dist_map[center]
+    #
+    #             # ЗАЩИТА: фильтруем нулевые/NaN значения
+    #             valid_dists = dists_at_center[dists_at_center > 0.1]  # минимум 0.1 px
+    #
+    #             if len(valid_dists) >= model_config.n_rays * 0.5:  # минимум 50% лучей валидны
+    #                 mean_radius = np.mean(valid_dists)
+    #
+    #                 # ЗАЩИТА: проверяем разумность
+    #                 if 1.0 < mean_radius < 200.0:  # разумный диапазон для 2D
+    #                     all_nuc_radii.append(mean_radius)
+    #                 else:
+    #                     # Fallback: используем area-based
+    #                     all_nuc_radii.append(radius_from_area)
+    #             else:
+    #                 # Слишком мало валидных лучей
+    #                 all_nuc_radii.append(radius_from_area)
+    #
+    #         except Exception as e:
+    #             # StarDist failed - используем area-based
+    #             print(f"    Warning: StarDist failed for nucleus {prop.label}: {e}")
+    #             all_nuc_radii.append(radius_from_area)
+    #
+    #     # === CYTOPLASM STATISTICS (то же самое) ===
+    #     cyto_mask = sample['cytoplasm_mask']
+    #     cyto_props = regionprops(cyto_mask)
+    #
+    #     for prop in cyto_props:
+    #         if model_config.ndim == 2:
+    #             radius_from_area = np.sqrt(prop.area / np.pi)
+    #         else:
+    #             radius_from_area = (prop.area * 3 / (4 * np.pi)) ** (1 / 3)
+    #
+    #         # Пропускаем маленькие объекты
+    #         if radius_from_area < 5.0:  # cytoplasm обычно больше
+    #             continue
+    #
+    #         obj_mask = (cyto_mask == prop.label).astype(np.int32)
+    #
+    #         try:
+    #             if model_config.ndim == 2:
+    #                 from stardist.geometry import star_dist
+    #                 dist_map = star_dist(obj_mask, model_config.n_rays, mode='cpp')
+    #             else:
+    #                 from stardist.geometry import star_dist3D
+    #                 dist_map = star_dist3D(obj_mask, model_config.rays, mode='cpp')
+    #
+    #             center = tuple(int(c) for c in prop.centroid)
+    #
+    #             if obj_mask[center] == 0:
+    #                 from scipy.ndimage import center_of_mass
+    #                 center = tuple(int(c) for c in center_of_mass(obj_mask))
+    #
+    #             dists_at_center = dist_map[center]
+    #             valid_dists = dists_at_center[dists_at_center > 0.1]
+    #
+    #             if len(valid_dists) >= model_config.n_rays * 0.5:
+    #                 mean_radius = np.mean(valid_dists)
+    #
+    #                 if 2.0 < mean_radius < 500.0:  # разумный диапазон для cytoplasm
+    #                     all_cyto_radii.append(mean_radius)
+    #                 else:
+    #                     all_cyto_radii.append(radius_from_area)
+    #             else:
+    #                 all_cyto_radii.append(radius_from_area)
+    #
+    #         except Exception as e:
+    #             print(f"    Warning: StarDist failed for cytoplasm {prop.label}: {e}")
+    #             all_cyto_radii.append(radius_from_area)
+    #
+    # # === ВЫЧИСЛЯЕМ МЕДИАНЫ с FALLBACK ===
+    # if len(all_nuc_radii) > 0:
+    #     nuc_median_radius = np.median(all_nuc_radii)
+    #     print(f"  ✅ Median nucleus radius: {nuc_median_radius:.1f} px (from {len(all_nuc_radii)} objects)")
+    # else:
+    #     nuc_median_radius = 10.0
+    #     print(f"  ⚠️  No valid nucleus objects, using fallback: {nuc_median_radius} px")
+    #
+    # if len(all_cyto_radii) > 0:
+    #     cyto_median_radius = np.median(all_cyto_radii)
+    #     print(f"  ✅ Median cytoplasm radius: {cyto_median_radius:.1f} px (from {len(all_cyto_radii)} objects)")
+    # else:
+    #     cyto_median_radius = 30.0
+    #     print(f"  ⚠️  No valid cytoplasm objects, using fallback: {cyto_median_radius} px")
+    #
+    # # СОХРАНЯЕМ В CONFIG
+    # model_config.median_max_dist_nucleus = float(nuc_median_radius)
+    # model_config.median_max_dist_cytoplasm = float(cyto_median_radius)
+    # model_config.median_radius_train = float(cyto_median_radius)
 
-    all_nuc_radii = []
-    all_cyto_radii = []
-
-    num_samples = min(10, len(train_generator.data_pool))
-
-    for i in range(num_samples):
-        sample = train_generator.data_pool[i]
-
-        from skimage.measure import regionprops
-        from scipy.ndimage import distance_transform_edt
-
-        # === NUCLEUS STATISTICS ===
-        nuc_mask = sample['nucleus_mask']
-        nuc_props = regionprops(nuc_mask)
-
-        for prop in nuc_props:
-            # Метод 1: Через area (быстро, всегда работает)
-            if model_config.ndim == 2:
-                radius_from_area = np.sqrt(prop.area / np.pi)
-            else:
-                radius_from_area = (prop.area * 3 / (4 * np.pi)) ** (1 / 3)
-
-            # КРИТИЧНО: Пропускаем слишком маленькие объекты
-            if radius_from_area < 3.0:
-                continue
-
-            # Метод 2: Через StarDist distances (точно, но может fail)
-            obj_mask = (nuc_mask == prop.label).astype(np.int32)
-
-            try:
-                # Вызываем StarDist для получения distances
-                if model_config.ndim == 2:
-                    from stardist.geometry import star_dist
-                    dist_map = star_dist(obj_mask, model_config.n_rays, mode='cpp')
-                else:
-                    from stardist.geometry import star_dist3D
-                    dist_map = star_dist3D(obj_mask, model_config.rays, mode='cpp')
-
-                # Берём distances в центре объекта
-                center = tuple(int(c) for c in prop.centroid)
-
-                # ЗАЩИТА: проверяем, что центр внутри маски
-                if obj_mask[center] == 0:
-                    # Центр снаружи - используем центроид маски
-                    from scipy.ndimage import center_of_mass
-                    center = tuple(int(c) for c in center_of_mass(obj_mask))
-
-                dists_at_center = dist_map[center]
-
-                # ЗАЩИТА: фильтруем нулевые/NaN значения
-                valid_dists = dists_at_center[dists_at_center > 0.1]  # минимум 0.1 px
-
-                if len(valid_dists) >= model_config.n_rays * 0.5:  # минимум 50% лучей валидны
-                    mean_radius = np.mean(valid_dists)
-
-                    # ЗАЩИТА: проверяем разумность
-                    if 1.0 < mean_radius < 200.0:  # разумный диапазон для 2D
-                        all_nuc_radii.append(mean_radius)
-                    else:
-                        # Fallback: используем area-based
-                        all_nuc_radii.append(radius_from_area)
-                else:
-                    # Слишком мало валидных лучей
-                    all_nuc_radii.append(radius_from_area)
-
-            except Exception as e:
-                # StarDist failed - используем area-based
-                print(f"    Warning: StarDist failed for nucleus {prop.label}: {e}")
-                all_nuc_radii.append(radius_from_area)
-
-        # === CYTOPLASM STATISTICS (то же самое) ===
-        cyto_mask = sample['cytoplasm_mask']
-        cyto_props = regionprops(cyto_mask)
-
-        for prop in cyto_props:
-            if model_config.ndim == 2:
-                radius_from_area = np.sqrt(prop.area / np.pi)
-            else:
-                radius_from_area = (prop.area * 3 / (4 * np.pi)) ** (1 / 3)
-
-            # Пропускаем маленькие объекты
-            if radius_from_area < 5.0:  # cytoplasm обычно больше
-                continue
-
-            obj_mask = (cyto_mask == prop.label).astype(np.int32)
-
-            try:
-                if model_config.ndim == 2:
-                    from stardist.geometry import star_dist
-                    dist_map = star_dist(obj_mask, model_config.n_rays, mode='cpp')
-                else:
-                    from stardist.geometry import star_dist3D
-                    dist_map = star_dist3D(obj_mask, model_config.rays, mode='cpp')
-
-                center = tuple(int(c) for c in prop.centroid)
-
-                if obj_mask[center] == 0:
-                    from scipy.ndimage import center_of_mass
-                    center = tuple(int(c) for c in center_of_mass(obj_mask))
-
-                dists_at_center = dist_map[center]
-                valid_dists = dists_at_center[dists_at_center > 0.1]
-
-                if len(valid_dists) >= model_config.n_rays * 0.5:
-                    mean_radius = np.mean(valid_dists)
-
-                    if 2.0 < mean_radius < 500.0:  # разумный диапазон для cytoplasm
-                        all_cyto_radii.append(mean_radius)
-                    else:
-                        all_cyto_radii.append(radius_from_area)
-                else:
-                    all_cyto_radii.append(radius_from_area)
-
-            except Exception as e:
-                print(f"    Warning: StarDist failed for cytoplasm {prop.label}: {e}")
-                all_cyto_radii.append(radius_from_area)
-
-    # === ВЫЧИСЛЯЕМ МЕДИАНЫ с FALLBACK ===
-    if len(all_nuc_radii) > 0:
-        nuc_median_radius = np.median(all_nuc_radii)
-        print(f"  ✅ Median nucleus radius: {nuc_median_radius:.1f} px (from {len(all_nuc_radii)} objects)")
-    else:
-        nuc_median_radius = 10.0
-        print(f"  ⚠️  No valid nucleus objects, using fallback: {nuc_median_radius} px")
-
-    if len(all_cyto_radii) > 0:
-        cyto_median_radius = np.median(all_cyto_radii)
-        print(f"  ✅ Median cytoplasm radius: {cyto_median_radius:.1f} px (from {len(all_cyto_radii)} objects)")
-    else:
-        cyto_median_radius = 30.0
-        print(f"  ⚠️  No valid cytoplasm objects, using fallback: {cyto_median_radius} px")
-
-    # СОХРАНЯЕМ В CONFIG
-    model_config.median_max_dist_nucleus = float(nuc_median_radius)
-    model_config.median_max_dist_cytoplasm = float(cyto_median_radius)
-    model_config.median_radius_train = float(cyto_median_radius)
-
-    # Дополнительная статистика
-    if len(all_nuc_radii) > 0:
-        print(f"    Nucleus radius range: [{np.min(all_nuc_radii):.1f}, {np.max(all_nuc_radii):.1f}] px")
-    if len(all_cyto_radii) > 0:
-        print(f"    Cytoplasm radius range: [{np.min(all_cyto_radii):.1f}, {np.max(all_cyto_radii):.1f}] px")
+    # # Дополнительная статистика
+    # if len(all_nuc_radii) > 0:
+    #     print(f"    Nucleus radius range: [{np.min(all_nuc_radii):.1f}, {np.max(all_nuc_radii):.1f}] px")
+    # if len(all_cyto_radii) > 0:
+    #     print(f"    Cytoplasm radius range: [{np.min(all_cyto_radii):.1f}, {np.max(all_cyto_radii):.1f}] px")
 
 
     print(f"Steps per epoch: {model_config.train_steps_per_epoch} (from config)")
@@ -752,6 +828,8 @@ def main(config_path='config_cytonucs.json'):
         name=config_dict['experiment']['name'],
         basedir=config_dict['output']['basedir']
     )
+    # Stage 1: загрузить рабочие веса 0.85 Dice
+
     print("\n=== MODEL INITIALIZATION DEBUG ===")
     for var in model.keras_model.trainable_variables:
         if 'dist_linear' in var.name or 'dist_relu' in var.name:
@@ -788,12 +866,12 @@ def main(config_path='config_cytonucs.json'):
     model.summary()
 
     # Check FOV vs median object size
-    fov = np.array(model._axes_tile_overlap('ZYX') if model_config.ndim == 3 else model._axes_tile_overlap('YX'))
-    median_size = extents if 'extents' in locals() else np.array([96, 96])
-    print(f"\nMedian object size:     {median_size}")
-    print(f"Network field of view:  {fov}")
-    if any(np.array(median_size) > fov):
-        print("⚠️  WARNING: median object size larger than field of view of the neural network.")
+    # fov = np.array(model._axes_tile_overlap('ZYX') if model_config.ndim == 3 else model._axes_tile_overlap('YX'))
+    # median_size = extents if 'extents' in locals() else np.array([96, 96])
+    # print(f"\nMedian object size:     {median_size}")
+    # print(f"Network field of view:  {fov}")
+    # if any(np.array(median_size) > fov):
+    #     print("⚠️  WARNING: median object size larger than field of view of the neural network.")
 
     # ========== Training Setup ==========
     print("\nSetting up training...")
@@ -830,19 +908,21 @@ def main(config_path='config_cytonucs.json'):
         def get_config(self):
             return { "initial_lr": float(self.initial_lr), "warmup_steps": float(self.warmup_steps), "decay_steps": float(self.decay_steps), "decay_rate": float(self.decay_rate), "min_lr": float(self.min_lr) }
 
-    warmup_epochs = config_dict['loss_params']['wbr_warmup_epochs']
     initial_lr = config_dict['training']['initial_learning_rate']
     steps_per_epoch = model_config.train_steps_per_epoch
+    lr_warmup_epochs = config_dict['training'].get('lr_warmup_epochs', 3)
     decay_steps = config_dict['training'].get('lr_decay_steps', 10000)
     decay_rate = config_dict['training'].get('lr_decay_rate', 0.9)
     min_lr = config_dict['training'].get('min_learning_rate', 1e-7)
     schedule = WarmupExponentialDecay(
         initial_lr=initial_lr,
-        warmup_steps=warmup_epochs * steps_per_epoch,
+        warmup_steps=max(1, int(lr_warmup_epochs * steps_per_epoch)),
         decay_steps=decay_steps,
         decay_rate=decay_rate,
         min_lr=min_lr
     )
+    print(f"  ✓ LR: warmup {lr_warmup_epochs} эпох -> {initial_lr}, "
+          f"decay {decay_rate} / {decay_steps} шагов, floor {min_lr}")
     gradient_clip_norm = config_dict['training']['gradient_clip_norm']
     trainer = CytoNucsTrainer(
         model=model,
@@ -855,19 +935,68 @@ def main(config_path='config_cytonucs.json'):
     if 'loaded_history' in locals():
         trainer.history = loaded_history
         print(f"✓ Restored training history")
-    # ========== КОНЕЦ БЛОКА ==========
+
     # Callbacks
     callbacks = []
 
-    if config_dict['evaluation']['eval_dice_every'] > 0:
+    if (
+            config_dict[
+                'evaluation'
+            ][
+                'eval_dice_every'
+            ] > 0
+    ):
         dice_callback = DiceCallback(
             model=model,
-            val_generator=val_generator,
-            eval_every=config_dict['evaluation']['eval_dice_every'],
-            save_best=config_dict['output']['save_best_dice'],
-            experiment=experiment
+
+            val_generator=
+            val_generator,
+
+            eval_every=
+            config_dict[
+                'evaluation'
+            ][
+                'eval_dice_every'
+            ],
+
+            save_best=
+            config_dict[
+                'output'
+            ][
+                'save_best_dice'
+            ],
+
+            experiment=
+            experiment,
+
+            prob_thresh_nucleus=
+            config_dict[
+                'inference'
+            ].get(
+                'prob_thresh_nucleus',
+                0.5
+            ),
+
+            prob_thresh_cytoplasm=
+            config_dict[
+                'inference'
+            ].get(
+                'prob_thresh_cytoplasm',
+                0.75
+            ),
+
+            nms_thresh=
+            config_dict[
+                'inference'
+            ].get(
+                'nms_thresh',
+                0.3
+            )
         )
-        callbacks.append(dice_callback)
+
+        callbacks.append(
+            dice_callback
+        )
 
     # ========== Training Loop ==========
     print("\n" + "=" * 60)
@@ -883,54 +1012,216 @@ def main(config_path='config_cytonucs.json'):
         experiment=experiment,
         start_epoch=start_epoch
     )
+    # ============================================================
+    # RESTORE BEST FULL-VOLUME MODEL
+    # ============================================================
 
+    best_fullval_path = (
+            Path(
+                config_dict[
+                    'output'
+                ][
+                    'basedir'
+                ]
+            )
+            / config_dict[
+                'experiment'
+            ][
+                'name'
+            ]
+            / 'weights_best.weights.h5'
+    )
+
+    if best_fullval_path.exists():
+
+        print(
+            f"\n📥 Loading best "
+            f"FULL-VOLUME checkpoint:"
+        )
+
+        print(
+            f"   {best_fullval_path}"
+        )
+
+        model.load_weights(
+            best_fullval_path
+        )
+
+    else:
+
+        print(
+            "\n⚠️ No full-volume best checkpoint found. "
+            "Using final epoch weights."
+        )
     # ========== Threshold Optimization ==========
-    if config_dict['evaluation']['optimize_thresholds']:
+
+    print("\n" + "=" * 60)
+    print("Optimizing thresholds...")
+    print("=" * 60 + "\n")
+
+    # Create predictor
+    predictor = CytoNucsPredictor(
+        model=model,
+        config=model_config,
+        prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
+        prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),  # ← Проверьте эту строку!
+        nms_thresh=config_dict['inference'].get('nms_thresh', 0.3)
+    )
+
+    # Collect validation data
+    # ============================================================
+    # COLLECT FULL VALIDATION VOLUMES
+    # ============================================================
+    #
+    # НЕ используем val_generator[i]:
+    # это train_patch_size crops.
+    #
+    # val_generator.data_pool содержит исходные полные,
+    # уже нормализованные volumes.
+    # ============================================================
+
+    if (
+            val_generator.data_pool is None
+            or len(
+        val_generator.data_pool
+    )
+            != len(
+        val_generator.image_files
+    )
+    ):
+        raise RuntimeError(
+            "Full validation requires "
+            "the complete val data_pool."
+        )
+
+    val_images = []
+    val_nucleus_masks = []
+    val_cytoplasm_masks = []
+    val_filenames = []
+
+    print(
+        "\nLoading FULL validation volumes..."
+    )
+
+    for sample in val_generator.data_pool:
+        img = np.asarray(
+            sample['image'],
+            dtype=np.float32
+        )
+
+        nucleus_gt = np.asarray(
+            sample['nucleus_mask']
+        )
+
+        cytoplasm_gt = np.asarray(
+            sample['cytoplasm_mask']
+        )
+
+        val_images.append(
+            img
+        )
+
+        val_nucleus_masks.append(
+            nucleus_gt
+        )
+
+        val_cytoplasm_masks.append(
+            cytoplasm_gt
+        )
+
+        val_filenames.append(
+            sample.get(
+                'filename',
+                f'val_{len(val_images):03d}'
+            )
+        )
+
+        print(
+            f"   {val_filenames[-1]}: "
+            f"{img.shape}, "
+            f"GT nuc="
+            f"{len(np.unique(nucleus_gt)) - 1}, "
+            f"cyto="
+            f"{len(np.unique(cytoplasm_gt)) - 1}"
+        )
+
+    def _predict_full_validation(
+            predictor_,
+            img_
+    ):
+        ndim_ = int(
+            model_config.ndim
+        )
+
+        patch_ = tuple(
+            int(p)
+            for p in model_config.train_patch_size
+        )
+
+        spatial_ = tuple(
+            int(s)
+            for s in img_.shape[:ndim_]
+        )
+
+        needs_tiling_ = any(
+            s > p
+            for s, p in zip(
+                spatial_,
+                patch_
+            )
+        )
+
+        if needs_tiling_:
+
+            n_tiles_ = tuple(
+                max(
+                    1,
+                    int(
+                        np.ceil(
+                            s / p
+                        )
+                    )
+                )
+                for s, p in zip(
+                    spatial_,
+                    patch_
+                )
+            )
+
+            if ndim_ == 3:
+                n_tiles_ = (
+                    1,
+                    n_tiles_[1],
+                    n_tiles_[2]
+                )
+
+            return predictor_._predict_with_tiling(
+                img_,
+                n_tiles=n_tiles_,
+                normalize_img=False
+            )
+
+        return predictor_.predict_instances(
+            img_,
+            normalize_img=False
+        )
+
+    # ========== Threshold Optimization (опционально) ==========
+    if config_dict.get('evaluation', {}).get('optimize_thresholds', False):
         print("\n" + "=" * 60)
         print("Optimizing thresholds...")
         print("=" * 60 + "\n")
 
-        # Create predictor
-        predictor = CytoNucsPredictor(
-            model=model,
-            config=model_config,
-            prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
-            prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),  # ← Проверьте эту строку!
-            nms_thresh=config_dict['inference'].get('nms_thresh', 0.3)
-        )
-
-        # Collect validation data
-        val_images = []
-        val_nucleus_masks = []
-        val_cytoplasm_masks = []
-
-        print("Loading validation data...")
-        for i in tqdm(range(len(val_generator))):
-            x_batch, y_batch = val_generator[i]
-            if i >= 1:  # Берем только первый батч для быстрой оптимизации
-                break
-
-            for j in range(len(x_batch)):
-                # Для RGB берём ВСЕ каналы, для grayscale - один
-                if x_batch.shape[-1] == 3:
-                    val_images.append(x_batch[j])  # RGB: (H, W, 3)
-                else:
-                    val_images.append(x_batch[j, ..., 0])  # Grayscale: (H, W)
-
-                val_nucleus_masks.append(y_batch['nucleus_instances'][j])
-                val_cytoplasm_masks.append(y_batch['cytoplasm_instances'][j])
-
-        # Optimize
+        eval_cfg = config_dict['evaluation']
         best_params = predictor.optimize_thresholds(
             val_images, val_nucleus_masks, val_cytoplasm_masks,
-            prob_thresh_range=config_dict['evaluation']['prob_thresh_range'],
-            nms_thresh_range=config_dict['evaluation']['nms_thresh_range']
+            prob_thresh_range=eval_cfg.get('prob_thresh_range', [0.2, 0.3, 0.4, 0.5]),
+            nms_thresh_range=eval_cfg.get('nms_thresh_range', [0.2, 0.3, 0.4, 0.5])
         )
 
         if experiment:
             experiment.log_parameters(best_params)
 
-        # Save optimized thresholds
         thresh_path = Path(config_dict['output']['basedir']) / config_dict['experiment'][
             'name'] / 'optimized_thresholds.json'
         with open(thresh_path, 'w') as f:
@@ -961,10 +1252,7 @@ def main(config_path='config_cytonucs.json'):
     predictions_cytoplasm = []
 
     for i, img in enumerate(tqdm(val_images)):
-        nuc_pred, cyto_pred, details = predictor.predict_instances(
-            img,
-            normalize_img=False  # Already normalized in generator
-        )
+        nuc_pred, cyto_pred, details = _predict_full_validation(predictor,img)
         predictions_nucleus.append(nuc_pred)
         predictions_cytoplasm.append(cyto_pred)
 
@@ -978,8 +1266,10 @@ def main(config_path='config_cytonucs.json'):
 
         # Compute JTPR if requested
         if config_dict['evaluation']['compute_jtpr']:
-            jtpr, jtpr_details = compute_jtpr(nuc_pred, cyto_pred,
-                                   val_nucleus_masks[i], val_cytoplasm_masks[i])
+            jtpr, jtpr_details = compute_jtpr(
+                nuc_pred, cyto_pred,
+                val_nucleus_masks[i], val_cytoplasm_masks[i],
+                assignments_pred=dict(getattr(predictor, '_prompt_assignments', {}) or {}) or None)
             jtpr_scores.append(jtpr)
             print(f"    JTPR details: {jtpr_details}")
         # Save predictions if requested
@@ -1126,8 +1416,8 @@ def main(config_path='config_cytonucs.json'):
     print(f"✓ Model saved to: {Path(config_dict['output']['basedir']) / config_dict['experiment']['name']}/")
 
     # Final FOV check
-    print(f"\nMedian object size:     {median_size}")
-    print(f"Network field of view:  {fov}")
+    # print(f"\nMedian object size:     {median_size}")
+    # print(f"Network field of view:  {fov}")
 
     print("\n🎉 Training complete!")
 
@@ -1165,7 +1455,9 @@ if __name__ == '__main__':
         sys.exit(1)
 
     try:
-        model, predictor, results = main(args.config)
+        _out = main(args.config)
+        model, predictor, results = (_out if isinstance(_out, tuple) and len(_out) == 3
+                                     else (None, None, _out))
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user.")
         sys.exit(0)

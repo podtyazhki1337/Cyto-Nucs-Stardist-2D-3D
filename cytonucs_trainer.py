@@ -54,7 +54,68 @@ def _calculate_ap(precision, recall):
     ap = np.sum((recall[x] - recall[x - 1]) * precision[x])
 
     return ap
+class _Prefetcher:
+    """Готовит батчи в фоновых потоках. Несколько воркеров, потому что одного
+    не хватало: T_gen ~50 с против T_gpu ~21 с, очередь пустела и шаги шли
+    вперемешку 21/76 с."""
 
+    def __init__(self, gen, depth=3, workers=3):
+        import threading, queue
+        self._gen = gen
+        self._q = queue.Queue(maxsize=depth)
+        self._stop = threading.Event()
+        self._err = None
+        self._times = []
+        self._lock = threading.Lock()
+        self._n = max(1, int(workers))
+        self._threads = [threading.Thread(target=self._work, args=(w,), daemon=True)
+                         for w in range(self._n)]
+        for t in self._threads:
+            t.start()
+
+    def _work(self, w):
+        import queue, time, traceback
+        i = w
+        while not self._stop.is_set():
+            try:
+                t0 = time.time()
+                batch = self._gen[i % max(1, len(self._gen))]
+                dt = time.time() - t0
+            except Exception as e:
+                # НЕ глотаем: прежний `except: continue` оставлял поток крутиться
+                # вхолостую, очередь пустела и next() висел без трейсбека.
+                self._err = e
+                traceback.print_exc()
+                return
+            with self._lock:
+                self._times.append(dt)
+                if len(self._times) > 50:
+                    self._times.pop(0)
+            while not self._stop.is_set():
+                try:
+                    self._q.put(batch, timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
+            i += self._n
+
+    def gen_time(self):
+        with self._lock:
+            return float(np.mean(self._times)) if self._times else 0.0
+
+    def next(self):
+        import queue
+        while True:
+            try:
+                return self._q.get(timeout=1.0)
+            except queue.Empty:
+                if self._err is not None:
+                    raise RuntimeError("Prefetcher: ошибка в генераторе") from self._err
+                if self._stop.is_set():
+                    raise RuntimeError("Prefetcher остановлен")
+
+    def stop(self):
+        self._stop.set()
 class CytoNucsTrainer:
     """
     Custom trainer for CytoNucs StarDist model.
@@ -107,43 +168,92 @@ class CytoNucsTrainer:
 
         # cytonucs_trainer.py - ЛУЧШИЙ ВАРИАНТ с tf.py_function
 
-    # cytonucs_trainer.py - train_step БЕЗ промежуточного create_targets
+
     @tf.function
     def train_step(self, x_batch, y_batch_dict):
 
         with tf.GradientTape() as tape:
-            # Forward pass
             y_pred = self.model.keras_model(x_batch, training=True)
-
-            # Loss (внутри: StarDist C++ + WBR + Containment + Consistency!)
             loss = self.loss_fn(y_batch_dict, y_pred, current_epoch=self.current_epoch_var)
 
-        # Backward pass
         gradients = tape.gradient(loss, self.model.keras_model.trainable_variables)
 
-        valid_gradients = []
-        valid_vars = []
+        # Имена слоёв статичны на этапе трейса — группируем по веткам.
+        # ВАЖНО: в Keras 3 var.name = 'kernel'/'bias' БЕЗ префикса слоя, полный путь
+        # в var.path -> группируем по var.path, иначе всё валится в один backbone.
+        # refinement (mask/boundary) stop_gradient'нут от декодера -> его градиент
+        # НЕ течёт в общий encoder/decoder, клипаем его ОТДЕЛЬНОЙ группой (когда он
+        # снова включён), чтобы его Dice-градиент не масштабировал вниз prob/dist.
+        prob_layers = {'nucleus_prob', 'cytoplasm_prob',
+                       'nucleus_prob_logit', 'cytoplasm_prob_logit'}
+        dist_layers = {'nucleus_dist', 'cytoplasm_dist'}
+        refine_subs = ('_refine', 'prompt_gate', 'nucleus_mask', 'cytoplasm_mask',
+                       'geo_dist_compress')
+        # Декодер цитоплазмы — ОТДЕЛЬНАЯ группа. Он не разделяется с ядром
+        # (общий только энкодер), а его градиент пришёл к насыщению обеих
+        # цито-голов при целом ядре. В общей группе backbone его норма
+        # усреднялась с энкодером и декодером ядра, и всплеск был не виден.
+        cyto_dec_subs = ('cyto_dec_', 'cyto_features')
+
+        prob_grads, prob_vars = [], []
+        dist_grads, dist_vars = [], []
+        backbone_grads, backbone_vars = [], []
+        refine_grads, refine_vars = [], []
+        cdec_grads, cdec_vars = [], []
+
         for grad, var in zip(gradients, self.model.keras_model.trainable_variables):
-            if grad is not None:
-                valid_gradients.append(grad)
-                valid_vars.append(var)
+            if grad is None:
+                continue
+            path = getattr(var, 'path', None) or var.name
+            layer = path.split('/')[0]
+            if any(s in layer for s in refine_subs):
+                refine_grads.append(grad);
+                refine_vars.append(var)
+            elif layer in prob_layers:
+                prob_grads.append(grad);
+                prob_vars.append(var)
+            elif layer in dist_layers:
+                dist_grads.append(grad);
+                dist_vars.append(var)
+            elif any(s in layer for s in cyto_dec_subs):
+                cdec_grads.append(grad);
+                cdec_vars.append(var)
+            else:
+                backbone_grads.append(grad);
+                backbone_vars.append(var)
 
-        # Gradient clipping
-        clip_norm =  getattr(self.config, 'gradient_clip_norm', 10)
-        clipped_gradients, global_norm = tf.clip_by_global_norm(valid_gradients, clip_norm)
+        clip_norm = tf.cast(getattr(self.config, 'gradient_clip_norm', 0), tf.float32)
 
-        # Debug
-        if self.current_step < 10 or self.current_step % 100 == 0:
-            tf.print("  [GRADIENTS] Global norm:", global_norm, "Clipped:", global_norm > clip_norm)
+        def _group_norm(grads):
+            if len(grads) == 0:
+                return tf.constant(0.0, tf.float32)
+            return tf.linalg.global_norm(grads)
 
-        # Apply
-        self.optimizer.apply_gradients(zip(clipped_gradients, valid_vars))
+        # Нормы — ТОЛЬКО для лога. Канон (base.py:308) применяет Adam без
+        # клиппинга вообще. Клип по группам множит градиент на 20/norm, а norm
+        # скачет по шагам (prob 499 -> 68 -> 1.4): постоянный множитель Adam
+        # сокращает, ПЕРЕМЕННЫЙ — нет, потому что v накоплен по одному масштабу,
+        # а m по другому. Плюс группы режутся независимо, и заданный конфигом
+        # баланс lambda_prob/lambda_dist = 1/0.2 динамически переопределяется
+        # каждым шагом. gradient_clip_norm=0 отключает клип (каноническое
+        # поведение); >0 оставлен как аварийный тормоз.
+        prob_norm = _group_norm(prob_grads)
+        dist_norm = _group_norm(dist_grads)
+        bb_norm = _group_norm(backbone_grads)
+        rf_norm = _group_norm(refine_grads)
+        cd_norm = _group_norm(cdec_grads)
 
-        # Update metrics
+        all_grads = prob_grads + dist_grads + backbone_grads + refine_grads + cdec_grads
+        all_vars = prob_vars + dist_vars + backbone_vars + refine_vars + cdec_vars
+
+        if clip_norm > 0:
+            # ОДИН глобальный клип на всю сеть, как делал бы Adam(clipnorm=...):
+            # относительный баланс между группами сохраняется.
+            all_grads, _ = tf.clip_by_global_norm(all_grads, clip_norm)
+
+        self.optimizer.apply_gradients(zip(all_grads, all_vars))
         self.train_loss_metric.update_state(loss)
-        self.current_step += 1
-
-        return loss
+        return loss, prob_norm, dist_norm, bb_norm, rf_norm, cd_norm
 
 
 
@@ -187,6 +297,7 @@ class CytoNucsTrainer:
             """
             Train the model.
             """
+
             epochs = epochs or self.config.train_epochs
             steps_per_epoch = steps_per_epoch or self.config.train_steps_per_epoch
 
@@ -197,7 +308,10 @@ class CytoNucsTrainer:
             print(f"Config: {self.config}")
 
             best_val_loss = np.inf
-
+            prefetch = _Prefetcher(
+                train_generator,
+                depth=int(getattr(self.config, 'prefetch_depth', 3)),
+                workers=int(getattr(self.config, 'prefetch_workers', 3)))
             for epoch in range(start_epoch, epochs):
                 print(f"\n{'=' * 50}")
                 print(f"Epoch {epoch + 1}/{epochs}")
@@ -212,8 +326,7 @@ class CytoNucsTrainer:
                 train_pbar = tqdm(range(steps_per_epoch), desc='Training')
                 for step in train_pbar:
                     # Get batch
-                    batch_idx = step % len(train_generator)
-                    x_batch, y_batch = train_generator[batch_idx]
+                    x_batch, y_batch = prefetch.next()
 
                     # Конвертируем x в tensor
                     x_batch = tf.convert_to_tensor(x_batch, dtype=tf.float32)
@@ -232,7 +345,13 @@ class CytoNucsTrainer:
                             y_batch_tf[k] = v
 
                     # Train step
-                    loss = self.train_step(x_batch, y_batch_tf)
+                    loss, p_n, d_n, b_n, r_n, c_n = self.train_step(x_batch, y_batch_tf)
+                    self.current_step += 1
+                    if self.current_step % 1 == 0:
+                        print(f"  [GRAD NORMS] prob: {float(p_n):.3f} dist: {float(d_n):.3f} "
+                              f"backbone: {float(b_n):.3f} cyto_dec: {float(c_n):.3f} "
+                              f"|| refine: {float(r_n):.3f} "
+                              f"| clip: {float(self.config.gradient_clip_norm)}")
 
                     # Update progress bar
                     train_pbar.set_postfix({'loss': f'{loss.numpy():.4f}'})
@@ -275,8 +394,11 @@ class CytoNucsTrainer:
                             y_true_sample['cytoplasm_dist'], y_pred_sample['cytoplasm_dist'],
                             name='cytoplasm'
                         )
+                        _cyto_fg = self.loss_fn._grid_subsample_cytoplasm(
+                            tf.expand_dims(tf.cast(
+                                y_sample_tf['cytoplasm_instances'] > 0, tf.float32), -1))
                         loss_wbr_val = self.loss_fn._wbr_loss(
-                            y_pred_sample['nucleus_prob'], y_pred_sample['cytoplasm_prob']
+                            y_pred_sample['nucleus_prob'], _cyto_fg
                         )
                         loss_containment_val = self.loss_fn._containment_loss(
                             y_true_sample, y_pred_sample, y_sample_tf
@@ -336,11 +458,33 @@ class CytoNucsTrainer:
                     if experiment:
                         experiment.log_metric("val_loss", val_loss, epoch=epoch + 1)
 
+                        # СНАРУЖИ if experiment: при use_comet=false чекпоинт
+                        # не сохранялся вовсе.
+                        # Состав лосса меняется на warmup -> val_loss несравним
+                        # между регимами. Сбрасываем отсчёт, когда warmup доехал
+                        # до 1.0, иначе best замерзает на предпоследней эпохе hold.
+                    _warm = int(getattr(self.config, 'loss_warmup_epochs',
+                                        getattr(self.config, 'wbr_warmup_epochs', 20)))
+                    if (epoch + 1) == 2 * _warm:
+                        best_val_loss = np.inf
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        best_path = self.checkpoint_dir / 'weights_best.weights.h5'
-                        self.model.save_weights(best_path)
-                        print(f"  ✅ Best model saved: {best_path}")
+
+                        # val_loss считается на deterministic train-sized patches.
+                        # Это полезная training diagnostic, но НЕ production quality metric.
+                        best_path = (
+                                self.checkpoint_dir
+                                / 'weights_best_val_loss.weights.h5'
+                        )
+
+                        self.model.save_weights(
+                            best_path
+                        )
+
+                        print(
+                            f"  ✅ Best PATCH val-loss checkpoint saved: "
+                            f"{best_path}"
+                        )
 
                 # Save checkpoints
                 save_every = getattr(self.config, 'save_every_n_epochs', 10)
@@ -354,14 +498,21 @@ class CytoNucsTrainer:
                     if hasattr(callback, 'on_epoch_end'):
                         callback.on_epoch_end(epoch, self.history)
 
+                if hasattr(train_generator, 'on_epoch_end'):
+                    train_generator.on_epoch_end()
+                if val_generator is not None and hasattr(val_generator, 'on_epoch_end'):
+                    val_generator.on_epoch_end()
                 # Save history
                 with open(self.checkpoint_dir / 'history.json', 'w') as f:
                     json.dump(self.history, f, indent=2)
+            prefetch.stop()
 
             print(f"\n{'=' * 50}")
             print("Training complete!")
             print(f"Best val loss: {best_val_loss:.4f}")
             print(f"Model saved to: {self.checkpoint_dir}")
+
+
 
     def load_weights(self, weights_path):
         """Load model weights"""
@@ -375,109 +526,946 @@ class DiceCallback:
     Similar to DiceCheckpoint in original code.
     """
 
-    def __init__(self, model, val_generator, eval_every=5, save_best=True, experiment=None):
+    def __init__(
+            self,
+            model,
+            val_generator,
+            eval_every=5,
+            save_best=True,
+            experiment=None,
+            prob_thresh_nucleus=None,
+            prob_thresh_cytoplasm=None,
+            nms_thresh=None
+    ):
         """
-        Args:
-            model: CytoNucsStarDistModel
-            val_generator: validation data generator
-            eval_every: evaluate every N epochs
-            save_best: save best model by Dice
-            experiment: Comet ML experiment
+        Full-volume quality validation.
+
+        val_loss по-прежнему считается отдельно на deterministic patches.
+
+        Этот callback:
+            full validation volume
+            -> production-like tiled inference
+            -> sparse StarDist NMS
+            -> prompted refinement
+            -> AP / AP@50 / semantic Dice / JTPR
+
+        Лучший checkpoint выбирается по:
+            mean(AP_nucleus, AP_cytoplasm)
+
+        где AP = mean accuracy TP/(TP+FP+FN)
+        по IoU thresholds 0.50...0.95.
         """
 
         self.model = model
         self.val_generator = val_generator
-        self.eval_every = eval_every
-        self.save_best = save_best
-        self.best_dice = -np.inf
-        self.best_metric = -np.inf  # ИСПРАВЛЕНО: добавлена инициализация
+
+        self.eval_every = int(
+            eval_every
+        )
+
+        self.save_best = bool(
+            save_best
+        )
+
         self.experiment = experiment
 
-    def on_epoch_end(self, epoch, history):
-        if (epoch + 1) % self.eval_every != 0:
+        self.best_metric = -np.inf
+
+        self.prob_thresh_nucleus = (
+            prob_thresh_nucleus
+        )
+
+        self.prob_thresh_cytoplasm = (
+            prob_thresh_cytoplasm
+        )
+
+        self.nms_thresh = (
+            nms_thresh
+        )
+
+        self.min_eval_epoch = int(
+            getattr(
+                model.config,
+                'min_eval_epoch',
+                1
+            )
+        )
+
+    @staticmethod
+    def _semantic_dice(gt, pred):
+        """
+        Foreground/background Dice по полному volume.
+
+        В отличие от compute_dice(), штрафует и FP, и FN,
+        потому что считается по всей бинарной маске.
+        """
+        g = np.asarray(gt) > 0
+        p = np.asarray(pred) > 0
+
+        if g.shape != p.shape:
+            raise ValueError(
+                f"Semantic Dice shape mismatch: "
+                f"GT={g.shape}, pred={p.shape}"
+            )
+
+        if not g.any() and not p.any():
+            return 1.0
+
+        denom = int(g.sum()) + int(p.sum())
+
+        if denom == 0:
+            return 0.0
+
+        return float(
+            2.0
+            * np.logical_and(
+                g,
+                p
+            ).sum()
+            / denom
+        )
+
+    def _predict_full_volume(
+            self,
+            predictor,
+            img
+    ):
+        """
+        Тот же выбор tiled/non-tiled inference,
+        который используется в run_inference_only().
+
+        img уже нормализован на полном volume внутри
+        val_generator.repool().
+        """
+        config = self.model.config
+
+        ndim = int(
+            config.ndim
+        )
+
+        patch = tuple(
+            int(p)
+            for p in config.train_patch_size
+        )
+
+        spatial = tuple(
+            int(s)
+            for s in img.shape[:ndim]
+        )
+
+        needs_tiling = any(
+            s > p
+            for s, p in zip(
+                spatial,
+                patch
+            )
+        )
+
+        if needs_tiling:
+
+            n_tiles = tuple(
+                max(
+                    1,
+                    int(
+                        np.ceil(
+                            s / p
+                        )
+                    )
+                )
+                for s, p in zip(
+                    spatial,
+                    patch
+                )
+            )
+
+            # Z полностью обрабатывается fixed-Z
+            # логикой внутри _predict_with_tiling().
+            if ndim == 3:
+                n_tiles = (
+                    1,
+                    n_tiles[1],
+                    n_tiles[2]
+                )
+
+            return predictor._predict_with_tiling(
+                img,
+                n_tiles=n_tiles,
+                normalize_img=False
+            )
+
+        return predictor.predict_instances(
+            img,
+            normalize_img=False
+        )
+
+    def on_epoch_end(
+            self,
+            epoch,
+            history
+    ):
+        epoch_num = int(epoch) + 1
+
+        # ============================================================
+        # SCHEDULE
+        # ============================================================
+
+        if (
+                epoch_num
+                % self.eval_every
+                != 0
+        ):
             return
 
-        print(f"\n Computing Dice & AP scores...")
-        viz_dir = Path(self.model.basedir) / self.model.name / 'visualizations'
-        viz_dir.mkdir(exist_ok=True)
-        print("  Warming up BatchNorm statistics...")
+        if epoch_num < self.min_eval_epoch:
+            print(
+                f"\n  Skipping full-volume validation: "
+                f"epoch {epoch_num} < "
+                f"{self.min_eval_epoch}"
+            )
 
-        # Прогоняем несколько батчей validation в inference mode
-        # чтобы обновить moving average
-        for i in range(min(3, len(self.val_generator))):
-            x_batch, y_batch = self.val_generator[i]
-            x_batch_tf = tf.convert_to_tensor(x_batch, dtype=tf.float32)
+            return
 
-            # Forward pass в inference mode (обновляет moving average!)
-            _ = self.model.keras_model(x_batch_tf, training=False)
+        if self.val_generator is None:
+            print(
+                "\n  ⚠️ Full-volume validation skipped: "
+                "val_generator=None"
+            )
 
-        print("  ✓ BatchNorm warmed up")
+            return
+
+        # ============================================================
+        # VALIDATION DATA
+        # ============================================================
+        #
+        # ВАЖНО:
+        # НЕ используем:
+        #
+        #     self.val_generator[i]
+        #
+        # потому что __getitem__ возвращает train-sized patch.
+        #
+        # data_pool содержит исходные ПОЛНЫЕ volumes,
+        # нормализованные один раз по всему тому.
+        # ============================================================
+
+        data_pool = getattr(
+            self.val_generator,
+            'data_pool',
+            None
+        )
+
+        image_files = getattr(
+            self.val_generator,
+            'image_files',
+            None
+        )
+
+        if (
+                data_pool is None
+                or image_files is None
+        ):
+            raise RuntimeError(
+                "DiceCallback: "
+                "val_generator не содержит "
+                "data_pool/image_files"
+            )
+
+        if len(data_pool) != len(image_files):
+            raise RuntimeError(
+                "Full-volume validation требует "
+                "ВСЮ validation выборку в data_pool. "
+                f"data_pool={len(data_pool)}, "
+                f"image_files={len(image_files)}. "
+                "Для val_generator не задавайте "
+                "уменьшенный pool_size."
+            )
+
+        print(
+            "\n"
+            + "=" * 70
+        )
+
+        print(
+            f"FULL-VOLUME VALIDATION | "
+            f"epoch {epoch_num}"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        # ============================================================
+        # THRESHOLDS
+        # ============================================================
+
         config = self.model.config
-        prob_thresh_nucleus = getattr(config, 'prob_thresh_nucleus', 0.3)
-        prob_thresh_cytoplasm = getattr(config, 'prob_thresh_cytoplasm', 0.4)
-        nms_thresh = getattr(config, 'nms_thresh', 0.3)
-        # Теперь создаём predictor
+
+        prob_thresh_nucleus = (
+            float(
+                self.prob_thresh_nucleus
+            )
+            if self.prob_thresh_nucleus
+               is not None
+            else float(
+                getattr(
+                    config,
+                    'prob_thresh_nucleus',
+                    0.5
+                )
+            )
+        )
+
+        prob_thresh_cytoplasm = (
+            float(
+                self.prob_thresh_cytoplasm
+            )
+            if self.prob_thresh_cytoplasm
+               is not None
+            else float(
+                getattr(
+                    config,
+                    'prob_thresh_cytoplasm',
+                    0.75
+                )
+            )
+        )
+
+        nms_thresh = (
+            float(
+                self.nms_thresh
+            )
+            if self.nms_thresh
+               is not None
+            else float(
+                getattr(
+                    config,
+                    'nms_thresh',
+                    0.3
+                )
+            )
+        )
+
+        print(
+            f"  thresholds: "
+            f"nucleus={prob_thresh_nucleus:.3f}, "
+            f"cytoplasm={prob_thresh_cytoplasm:.3f}, "
+            f"nms={nms_thresh:.3f}"
+        )
 
         predictor = CytoNucsPredictor(
             model=self.model,
             config=config,
-            prob_thresh_nucleus=prob_thresh_nucleus,
-            prob_thresh_cytoplasm= prob_thresh_cytoplasm,
-            nms_thresh=nms_thresh
+            prob_thresh_nucleus=
+            prob_thresh_nucleus,
+            prob_thresh_cytoplasm=
+            prob_thresh_cytoplasm,
+            nms_thresh=
+            nms_thresh
         )
 
-        y_true_nucleus, y_pred_nucleus = [], []
-        y_true_cytoplasm, y_pred_cytoplasm = [], []
+        # ============================================================
+        # STORAGE
+        # ============================================================
 
-        for i in range(len(self.val_generator)):
-            x_batch, y_batch = self.val_generator[i]
-            for j in range(len(x_batch)):
-                img = x_batch[j]
-                img_input = img[..., 0] if img.shape[-1] == 1 else img
-                nucleus_pred, cytoplasm_pred, details = predictor.predict_instances(img_input, normalize_img=False)
-                y_true_nucleus.append(y_batch['nucleus_instances'][j])
-                y_pred_nucleus.append(nucleus_pred)
-                y_true_cytoplasm.append(y_batch['cytoplasm_instances'][j])
-                y_pred_cytoplasm.append(cytoplasm_pred)
-                if i == 0 and j == 0:
-                    self._save_epoch_visualization_full(epoch + 1, img_input, y_batch['nucleus_instances'][j],
-                                                        y_batch['cytoplasm_instances'][j], nucleus_pred, cytoplasm_pred,
-                                                        details, viz_dir)
+        y_true_nucleus = []
+        y_pred_nucleus = []
 
-        mean_dice_nucleus = np.mean([compute_dice(gt, pred) for gt, pred in zip(y_true_nucleus, y_pred_nucleus)])
-        mean_dice_cytoplasm = np.mean([compute_dice(gt, pred) for gt, pred in zip(y_true_cytoplasm, y_pred_cytoplasm)])
+        y_true_cytoplasm = []
+        y_pred_cytoplasm = []
 
-        taus = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+        semantic_nucleus = []
+        semantic_cytoplasm = []
 
-        stats_nucleus_tuple = matching_dataset(y_true_nucleus, y_pred_nucleus, thresh=taus, show_progress=False)
-        stats_cytoplasm_tuple = matching_dataset(y_true_cytoplasm, y_pred_cytoplasm, thresh=taus, show_progress=False)
+        pred_assignments = []
 
-        precision_nucleus = np.array([s.precision for s in stats_nucleus_tuple])
-        recall_nucleus = np.array([s.recall for s in stats_nucleus_tuple])
+        viz_dir = (
+                Path(
+                    self.model.basedir
+                )
+                / self.model.name
+                / 'visualizations'
+        )
 
-        precision_cytoplasm = np.array([s.precision for s in stats_cytoplasm_tuple])
-        recall_cytoplasm = np.array([s.recall for s in stats_cytoplasm_tuple])
+        viz_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
-        ap_nucleus = _calculate_ap(precision_nucleus, recall_nucleus)
-        ap_cytoplasm = _calculate_ap(precision_cytoplasm, recall_cytoplasm)
+        # ============================================================
+        # FULL-VOLUME INFERENCE
+        # ============================================================
 
-        ap50_nucleus = precision_nucleus[0]
-        ap50_cytoplasm = precision_cytoplasm[0]
-        print(f"  Nucleus   | Dice: {mean_dice_nucleus:.4f} | AP: {ap_nucleus:.4f} (AP@50: {ap50_nucleus:.4f})")
-        print(f"  Cytoplasm | Dice: {mean_dice_cytoplasm:.4f} | AP: {ap_cytoplasm:.4f} (AP@50: {ap50_cytoplasm:.4f})")
+        for i, sample in enumerate(
+                data_pool
+        ):
+
+            img = np.asarray(
+                sample['image'],
+                dtype=np.float32
+            )
+
+            nucleus_gt = np.asarray(
+                sample['nucleus_mask']
+            )
+
+            cytoplasm_gt = np.asarray(
+                sample['cytoplasm_mask']
+            )
+
+            filename = sample.get(
+                'filename',
+                f'val_{i:03d}'
+            )
+
+            print(
+                f"\n  [{i + 1}/"
+                f"{len(data_pool)}] "
+                f"{filename}"
+            )
+
+            print(
+                f"    img={img.shape} | "
+                f"GT nuc="
+                f"{len(np.unique(nucleus_gt)) - 1} "
+                f"cyto="
+                f"{len(np.unique(cytoplasm_gt)) - 1}"
+            )
+
+            (
+                nucleus_pred,
+                cytoplasm_pred,
+                details
+            ) = self._predict_full_volume(
+                predictor,
+                img
+            )
+
+            # Никакого silent cropping validation результатов.
+            # Shape mismatch здесь означает реальную ошибку pipeline.
+            if (
+                    nucleus_pred.shape
+                    != nucleus_gt.shape
+            ):
+                raise RuntimeError(
+                    f"{filename}: "
+                    f"nucleus shape mismatch: "
+                    f"pred={nucleus_pred.shape}, "
+                    f"GT={nucleus_gt.shape}"
+                )
+
+            if (
+                    cytoplasm_pred.shape
+                    != cytoplasm_gt.shape
+            ):
+                raise RuntimeError(
+                    f"{filename}: "
+                    f"cytoplasm shape mismatch: "
+                    f"pred={cytoplasm_pred.shape}, "
+                    f"GT={cytoplasm_gt.shape}"
+                )
+
+            sd_n = self._semantic_dice(
+                nucleus_gt,
+                nucleus_pred
+            )
+
+            sd_c = self._semantic_dice(
+                cytoplasm_gt,
+                cytoplasm_pred
+            )
+
+            semantic_nucleus.append(
+                sd_n
+            )
+
+            semantic_cytoplasm.append(
+                sd_c
+            )
+
+            y_true_nucleus.append(
+                nucleus_gt
+            )
+
+            y_pred_nucleus.append(
+                nucleus_pred
+            )
+
+            y_true_cytoplasm.append(
+                cytoplasm_gt
+            )
+
+            y_pred_cytoplasm.append(
+                cytoplasm_pred
+            )
+
+            pred_assignments.append(
+                dict(
+                    getattr(
+                        predictor,
+                        '_prompt_assignments',
+                        {}
+                    ) or {}
+                )
+            )
+
+            print(
+                f"    semantic Dice: "
+                f"nuc={sd_n:.3f} "
+                f"cyto={sd_c:.3f} | "
+                f"pred nuc="
+                f"{len(np.unique(nucleus_pred)) - 1} "
+                f"cyto="
+                f"{len(np.unique(cytoplasm_pred)) - 1}"
+            )
+
+            # Один полный validation example
+            # на каждую evaluation epoch.
+            if i == 0:
+                self._save_epoch_visualization_full(
+                    epoch=epoch_num,
+                    img=img,
+                    nuc_gt=nucleus_gt,
+                    cyto_gt=cytoplasm_gt,
+                    nuc_pred=nucleus_pred,
+                    cyto_pred=cytoplasm_pred,
+                    details=details,
+                    viz_dir=viz_dir,
+                    filename=(
+                        f'epoch_'
+                        f'{epoch_num:04d}_'
+                        f'fullval.png'
+                    )
+                )
+
+        # ============================================================
+        # INSTANCE METRICS
+        # ============================================================
+
+        taus = [
+            0.50,
+            0.55,
+            0.60,
+            0.65,
+            0.70,
+            0.75,
+            0.80,
+            0.85,
+            0.90,
+            0.95
+        ]
+
+        stats_nucleus = matching_dataset(
+            y_true_nucleus,
+            y_pred_nucleus,
+            thresh=taus,
+            show_progress=False
+        )
+
+        stats_cytoplasm = matching_dataset(
+            y_true_cytoplasm,
+            y_pred_cytoplasm,
+            thresh=taus,
+            show_progress=False
+        )
+
+        acc_nucleus = np.asarray(
+            [
+                s.accuracy
+                for s in stats_nucleus
+            ],
+            dtype=np.float64
+        )
+
+        acc_cytoplasm = np.asarray(
+            [
+                s.accuracy
+                for s in stats_cytoplasm
+            ],
+            dtype=np.float64
+        )
+
+        ap_nucleus = float(
+            np.mean(
+                acc_nucleus
+            )
+        )
+
+        ap_cytoplasm = float(
+            np.mean(
+                acc_cytoplasm
+            )
+        )
+
+        ap50_nucleus = float(
+            acc_nucleus[0]
+        )
+
+        ap50_cytoplasm = float(
+            acc_cytoplasm[0]
+        )
+
+        semantic_dice_nucleus = float(
+            np.mean(
+                semantic_nucleus
+            )
+        )
+
+        semantic_dice_cytoplasm = float(
+            np.mean(
+                semantic_cytoplasm
+            )
+        )
+
+        s_n = stats_nucleus[0]
+        s_c = stats_cytoplasm[0]
+
+        # ============================================================
+        # JTPR
+        # ============================================================
+
+        from cytonucs_inference import (
+            compute_jtpr
+        )
+
+        jtpr_values = []
+
+        joint_tp_total = 0
+        total_pairs_total = 0
+
+        for idx_img, (
+                nucleus_pred,
+                cytoplasm_pred,
+                nucleus_gt,
+                cytoplasm_gt
+        ) in enumerate(
+            zip(
+                y_pred_nucleus,
+                y_pred_cytoplasm,
+                y_true_nucleus,
+                y_true_cytoplasm
+            )
+        ):
+            assignments_pred = (
+                pred_assignments[idx_img]
+                if idx_img
+                   < len(pred_assignments)
+                else None
+            )
+
+            jtpr, jtpr_details = (
+                compute_jtpr(
+                    nucleus_pred=
+                    nucleus_pred,
+
+                    cytoplasm_pred=
+                    cytoplasm_pred,
+
+                    nucleus_gt=
+                    nucleus_gt,
+
+                    cytoplasm_gt=
+                    cytoplasm_gt,
+
+                    iou_thresh=0.5,
+
+                    assignments_pred=(
+                        assignments_pred
+                        if assignments_pred
+                        else None
+                    )
+                )
+            )
+
+            jtpr_values.append(
+                float(jtpr)
+            )
+
+            joint_tp_total += int(
+                jtpr_details[
+                    'joint_tp'
+                ]
+            )
+
+            total_pairs_total += int(
+                jtpr_details[
+                    'total_pairs'
+                ]
+            )
+
+        jtpr_mean = (
+            float(
+                np.mean(
+                    jtpr_values
+                )
+            )
+            if jtpr_values
+            else 0.0
+        )
+
+        jtpr_global = (
+            float(
+                joint_tp_total
+                / total_pairs_total
+            )
+            if total_pairs_total > 0
+            else 0.0
+        )
+
+        # ============================================================
+        # CHECKPOINT METRIC
+        # ============================================================
+        #
+        # compute_dice() здесь СПЕЦИАЛЬНО не используем:
+        # он считает Dice только по matched instances и
+        # не штрафует достаточным образом FP/FN.
+        #
+        # AP/accuracy учитывает:
+        # TP, FP и FN.
+        # ============================================================
+
+        current_metric = float(
+            0.5
+            * (
+                    ap_nucleus
+                    + ap_cytoplasm
+            )
+        )
+
+        print(
+            "\n  FULL-VOLUME METRICS"
+        )
+
+        print(
+            f"  Nucleus   | "
+            f"semantic Dice="
+            f"{semantic_dice_nucleus:.4f} "
+            f"| AP={ap_nucleus:.4f} "
+            f"| AP@50="
+            f"{ap50_nucleus:.4f} "
+            f"| TP/FP/FN@50="
+            f"{s_n.tp}/{s_n.fp}/{s_n.fn}"
+        )
+
+        print(
+            f"  Cytoplasm | "
+            f"semantic Dice="
+            f"{semantic_dice_cytoplasm:.4f} "
+            f"| AP={ap_cytoplasm:.4f} "
+            f"| AP@50="
+            f"{ap50_cytoplasm:.4f} "
+            f"| TP/FP/FN@50="
+            f"{s_c.tp}/{s_c.fp}/{s_c.fn}"
+        )
+
+        print(
+            f"  JTPR      | "
+            f"mean={jtpr_mean:.4f} "
+            f"| global={jtpr_global:.4f} "
+            f"({joint_tp_total}/"
+            f"{total_pairs_total})"
+        )
+
+        print(
+            f"  CHECKPOINT METRIC "
+            f"(mean AP heads) = "
+            f"{current_metric:.4f}"
+        )
+
+        # ============================================================
+        # HISTORY
+        # ============================================================
+
+        history.setdefault(
+            'fullval_epoch',
+            []
+        ).append(
+            epoch_num
+        )
+
+        history.setdefault(
+            'fullval_semantic_dice_nucleus',
+            []
+        ).append(
+            semantic_dice_nucleus
+        )
+
+        history.setdefault(
+            'fullval_semantic_dice_cytoplasm',
+            []
+        ).append(
+            semantic_dice_cytoplasm
+        )
+
+        history.setdefault(
+            'fullval_ap_nucleus',
+            []
+        ).append(
+            ap_nucleus
+        )
+
+        history.setdefault(
+            'fullval_ap_cytoplasm',
+            []
+        ).append(
+            ap_cytoplasm
+        )
+
+        history.setdefault(
+            'fullval_ap50_nucleus',
+            []
+        ).append(
+            ap50_nucleus
+        )
+
+        history.setdefault(
+            'fullval_ap50_cytoplasm',
+            []
+        ).append(
+            ap50_cytoplasm
+        )
+
+        history.setdefault(
+            'fullval_jtpr',
+            []
+        ).append(
+            jtpr_global
+        )
+
+        history.setdefault(
+            'fullval_metric',
+            []
+        ).append(
+            current_metric
+        )
+
+        # ============================================================
+        # COMET
+        # ============================================================
 
         if self.experiment:
             self.experiment.log_metrics(
-                {"dice_nucleus": mean_dice_nucleus, "dice_cytoplasm": mean_dice_cytoplasm, "ap_nucleus": ap_nucleus,
-                 "ap_cytoplasm": ap_cytoplasm, "ap50_nucleus": ap50_nucleus, "ap50_cytoplasm": ap50_cytoplasm},
-                epoch=epoch + 1)
-        mean_dice= (mean_dice_nucleus + mean_dice_cytoplasm) / 2.0
-        current_metric = mean_dice
-        if self.save_best and current_metric > self.best_metric:
-            self.best_metric = current_metric
-            save_path = Path(self.model.basedir) / self.model.name / f"weights_best_dice_{current_metric:.4f}.weights.h5"
-            self.model.save_weights(save_path)
-            print(f"  ✅ New best DICE! Saved to {save_path}")
+                {
+                    'fullval_semantic_dice_nucleus':
+                        semantic_dice_nucleus,
+
+                    'fullval_semantic_dice_cytoplasm':
+                        semantic_dice_cytoplasm,
+
+                    'fullval_ap_nucleus':
+                        ap_nucleus,
+
+                    'fullval_ap_cytoplasm':
+                        ap_cytoplasm,
+
+                    'fullval_ap50_nucleus':
+                        ap50_nucleus,
+
+                    'fullval_ap50_cytoplasm':
+                        ap50_cytoplasm,
+
+                    'fullval_jtpr':
+                        jtpr_global,
+
+                    'fullval_metric':
+                        current_metric,
+                },
+                epoch=epoch_num
+            )
+
+        # ============================================================
+        # BEST MODEL
+        # ============================================================
+
+        if (
+                self.save_best
+                and current_metric
+                > self.best_metric
+        ):
+            self.best_metric = (
+                current_metric
+            )
+
+            # Главный production checkpoint.
+            save_path = (
+                    Path(
+                        self.model.basedir
+                    )
+                    / self.model.name
+                    / 'weights_best.weights.h5'
+            )
+
+            self.model.save_weights(
+                save_path
+            )
+
+            best_info = {
+                'epoch':
+                    epoch_num,
+
+                'metric_name':
+                    'mean_fullval_ap',
+
+                'metric':
+                    current_metric,
+
+                'ap_nucleus':
+                    ap_nucleus,
+
+                'ap_cytoplasm':
+                    ap_cytoplasm,
+
+                'ap50_nucleus':
+                    ap50_nucleus,
+
+                'ap50_cytoplasm':
+                    ap50_cytoplasm,
+
+                'semantic_dice_nucleus':
+                    semantic_dice_nucleus,
+
+                'semantic_dice_cytoplasm':
+                    semantic_dice_cytoplasm,
+
+                'jtpr_global':
+                    jtpr_global,
+
+                'prob_thresh_nucleus':
+                    prob_thresh_nucleus,
+
+                'prob_thresh_cytoplasm':
+                    prob_thresh_cytoplasm,
+
+                'nms_thresh':
+                    nms_thresh,
+            }
+
+            best_info_path = (
+                    Path(
+                        self.model.basedir
+                    )
+                    / self.model.name
+                    / 'best_fullval.json'
+            )
+
+            with open(
+                    best_info_path,
+                    'w'
+            ) as f:
+                json.dump(
+                    best_info,
+                    f,
+                    indent=2
+                )
+
+            print(
+                f"  ✅ New best FULL-VOLUME model: "
+                f"{current_metric:.4f}"
+            )
+
+            print(
+                f"     saved to: "
+                f"{save_path}"
+            )
 
     def _save_epoch_visualization_full(self, epoch, img, nuc_gt, cyto_gt, nuc_pred, cyto_pred, details, viz_dir, filename=None):
         """
@@ -486,19 +1474,55 @@ class DiceCallback:
         import matplotlib.pyplot as plt
         from skimage.segmentation import find_boundaries
         from matplotlib.colors import ListedColormap
-        import matplotlib.patches as mpatches
 
-        # Compute Dice
-        dice_nuc = compute_dice(nuc_gt, nuc_pred)
-        dice_cyto = compute_dice(cyto_gt, cyto_pred)
+        def _quick_dice(gt, pred):
+            g, p = np.asarray(gt) > 0, np.asarray(pred) > 0
+            if g.shape != p.shape:
+                return 0.0  # размеры разошлись (пустой pred в grid-разрешении) — пропускаем
+            denom = g.sum() + p.sum()
+            return float(2 * np.logical_and(g, p).sum() / denom) if denom else 0.0
+        dice_nuc = _quick_dice(nuc_gt, nuc_pred)
+        dice_cyto = _quick_dice(cyto_gt, cyto_pred)
+
+        def _n_obj(a):
+            """Число объектов = уникальные ненулевые лейблы.
+            `.max()` даёт максимальный ID: GT-маска после кропа сохраняет
+            нумерацию исходного тома (ядра 3, 7, 10 -> max 10 при трёх
+            объектах), а предсказание перенумеровано подряд -> панели GT и
+            Pred считали разное, и «10 GT против 3 Pred» выглядело как
+            недодетекция там, где было попадание 3/3."""
+            return int(len(np.unique(np.asarray(a))) - (1 if 0 in np.unique(np.asarray(a)) else 0))
+
+        _vmax = {}
+        for _k in ('nucleus_prob', 'cytoplasm_prob'):
+            _v = details.get(_k)
+            _vmax[_k] = float(np.asarray(_v).max()) if _v is not None else 0.0
+        if self.model.config.ndim == 3:
+            def _mid(a):
+                return a[a.shape[0] // 2] if a is not None else None
+
+            img = _mid(img)
+            nuc_gt, cyto_gt = _mid(nuc_gt), _mid(cyto_gt)
+            nuc_pred, cyto_pred = _mid(nuc_pred), _mid(cyto_pred)
+            details = {
+                'nucleus_prob': _mid(details.get('nucleus_prob')),
+                'cytoplasm_prob': _mid(details.get('cytoplasm_prob')),
+                'nucleus_dist': _mid(details.get('nucleus_dist')) if details.get('nucleus_dist') is not None else None,
+                'cytoplasm_dist': _mid(details.get('cytoplasm_dist')) if details.get('cytoplasm_dist') is not None else None,
+                'cytoplasm_mask': _mid(details.get('cytoplasm_mask')) if details.get(
+                    'cytoplasm_mask') is not None else None,
+
+            }
         # Конвертируем и нормализуем
         if img.ndim == 3 and img.shape[-1] in [3, 4]:
             import cv2
-            # КРИТИЧНО: нормализуем RGB к [0, 1] для matplotlib
+            # перцентильная нормализация для показа (как вход модели, устойчиво
+            # к горячим пикселям) — иначе один яркий выброс гасит всю картинку.
             img_display = img.astype(np.float32)
-            img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min() + 1e-8)
-            img_display = np.clip(img_display, 0, 1)  # ← ИСПРАВЛЕНИЕ
-
+            p_lo = np.percentile(img_display, 1)
+            p_hi = np.percentile(img_display, 99.5)
+            img_display = (img_display - p_lo) / (p_hi - p_lo + 1e-8)
+            img_display = np.clip(img_display, 0, 1)
             img_gray = cv2.cvtColor((img_display * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
             is_rgb = True
         else:
@@ -513,7 +1537,7 @@ class DiceCallback:
         # ============================================================
 
         # Генерируем яркие, насыщенные цвета
-        np.random.seed(42)  # Фиксируем для воспроизводимости
+
         n_colors = max(nuc_pred.max(), cyto_pred.max(), nuc_gt.max(), cyto_gt.max()) + 1
 
         # HSV colorspace для максимальной контрастности
@@ -545,10 +1569,26 @@ class DiceCallback:
         # ============================================================
 
         # 1. Original Image
-        if img.ndim == 3 and img.shape[-1] in [3, 4]:
-            axes[0, 0].imshow(img)
+        if (
+                img.ndim == 3
+                and img.shape[-1] in [3, 4]
+        ):
+            axes[1, 0].imshow(
+                img_display
+            )
         else:
-            axes[0, 0].imshow(img, cmap='gray', vmin=np.percentile(img, 1), vmax=np.percentile(img, 99))
+            axes[1, 0].imshow(
+                img,
+                cmap='gray',
+                vmin=np.percentile(
+                    img,
+                    1
+                ),
+                vmax=np.percentile(
+                    img,
+                    99
+                )
+            )
         axes[0, 0].set_title(' Original Image', fontsize=16, fontweight='bold', pad=10)
         axes[0, 0].axis('off')
 
@@ -560,7 +1600,7 @@ class DiceCallback:
             # Границы белым
             boundaries = find_boundaries(nuc_gt, mode='thick')
             axes[0, 1].contour(boundaries, colors='white', linewidths=1.5, levels=[0.5])
-        axes[0, 1].set_title(f' Nucleus GT\n({nuc_gt.max()} objects)',
+        axes[0, 1].set_title(f' Nucleus GT\n({_n_obj(nuc_gt)} objects)',
                              fontsize=16, fontweight='bold', pad=10, color='green')
         axes[0, 1].axis('off')
 
@@ -571,7 +1611,7 @@ class DiceCallback:
                               vmin=0, vmax=n_colors - 1, alpha=0.8)
             boundaries = find_boundaries(nuc_pred, mode='thick')
             axes[0, 2].contour(boundaries, colors='white', linewidths=1.5, levels=[0.5])
-        axes[0, 2].set_title(f' Nucleus Pred\n({nuc_pred.max()} objects) | Dice={dice_nuc:.3f}',
+        axes[0, 2].set_title(f' Nucleus Pred\n({_n_obj(nuc_pred)} objects) | Dice={dice_nuc:.3f}',
                              fontsize=16, fontweight='bold', pad=10,
                              color='darkblue' if dice_nuc > 0.8 else 'red')
         axes[0, 2].axis('off')
@@ -603,7 +1643,7 @@ class DiceCallback:
 
         # 5. Original (again)
         if img.ndim == 3 and img.shape[-1] in [3, 4]:
-            axes[1, 0].imshow(img)
+            axes[0, 0].imshow(img_display)
         else:
             axes[1, 0].imshow(img, cmap='gray', vmin=np.percentile(img, 1), vmax=np.percentile(img, 99))
         axes[1, 0].set_title(' Original Image', fontsize=16, fontweight='bold', pad=10)
@@ -616,7 +1656,7 @@ class DiceCallback:
                               vmin=0, vmax=n_colors - 1, alpha=0.8)
             boundaries = find_boundaries(cyto_gt, mode='thick')
             axes[1, 1].contour(boundaries, colors='white', linewidths=1.5, levels=[0.5])
-        axes[1, 1].set_title(f' Cytoplasm GT\n({cyto_gt.max()} objects)',
+        axes[1, 1].set_title(f' Cytoplasm GT\n({_n_obj(cyto_gt)} objects)',
                              fontsize=16, fontweight='bold', pad=10, color='green')
         axes[1, 1].axis('off')
 
@@ -627,7 +1667,7 @@ class DiceCallback:
                               vmin=0, vmax=n_colors - 1, alpha=0.8)
             boundaries = find_boundaries(cyto_pred, mode='thick')
             axes[1, 2].contour(boundaries, colors='white', linewidths=1.5, levels=[0.5])
-        axes[1, 2].set_title(f' Cytoplasm Pred\n({cyto_pred.max()} objects) | Dice={dice_cyto:.3f}',
+        axes[1, 2].set_title(f' Cytoplasm Pred\n({_n_obj(cyto_pred)} objects) | Dice={dice_cyto:.3f}',
                              fontsize=16, fontweight='bold', pad=10,
                              color='darkblue' if dice_cyto > 0.7 else 'red')
         axes[1, 2].axis('off')
@@ -651,21 +1691,28 @@ class DiceCallback:
         # ROW 3: PROBABILITY & DISTANCE MAPS
         # ============================================================
 
-        nuc_prob = details.get('nucleus_prob', np.zeros_like(nuc_gt, dtype=float))
-        cyto_prob = details.get('cytoplasm_prob', np.zeros_like(cyto_gt, dtype=float))
-        nuc_dist = details.get('nucleus_dist', np.zeros((*nuc_gt.shape, 1)))
-        cyto_dist = details.get('cytoplasm_dist', np.zeros((*cyto_gt.shape, 1)))
+        nuc_prob = details.get('nucleus_prob')
+        cyto_prob = details.get('cytoplasm_prob')
+        nuc_dist = details.get('nucleus_dist')
+        cyto_dist = details.get('cytoplasm_dist')
+        # карты могут отсутствовать или быть None (убраны для экономии RAM) — дефолты
+        if nuc_prob is None:  nuc_prob = np.zeros_like(nuc_gt, dtype=float)
+        if cyto_prob is None: cyto_prob = np.zeros_like(cyto_gt, dtype=float)
+        if nuc_dist is None:  nuc_dist = np.zeros((*nuc_gt.shape, 1), dtype=float)
+        if cyto_dist is None: cyto_dist = np.zeros((*cyto_gt.shape, 1), dtype=float)
 
         # 9. Nucleus Probability
         im1 = axes[2, 0].imshow(nuc_prob, cmap='hot', vmin=0, vmax=1)
-        axes[2, 0].set_title(f' Nucleus Prob\nMax={nuc_prob.max():.3f}',
+        axes[2, 0].set_title(f' Nucleus Prob\nMax(срез)={nuc_prob.max():.3f} '
+                             f'Max(том)={_vmax["nucleus_prob"]:.3f}',
                              fontsize=14, fontweight='bold', pad=10)
         axes[2, 0].axis('off')
         plt.colorbar(im1, ax=axes[2, 0], fraction=0.046, pad=0.04)
 
         # 10. Cytoplasm Probability
         im2 = axes[2, 1].imshow(cyto_prob, cmap='hot', vmin=0, vmax=1)
-        axes[2, 1].set_title(f' Cytoplasm Prob\nMax={cyto_prob.max():.3f}',
+        axes[2, 1].set_title(f' Cytoplasm Prob\nMax(срез)={cyto_prob.max():.3f} '
+                             f'Max(том)={_vmax["cytoplasm_prob"]:.3f}',
                              fontsize=14, fontweight='bold', pad=10)
         axes[2, 1].axis('off')
         plt.colorbar(im2, ax=axes[2, 1], fraction=0.046, pad=0.04)
@@ -708,114 +1755,10 @@ class DiceCallback:
         plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
 
+
         print(f"  📷 Saved full visualization: {save_path.name}")
 
-    def _save_epoch_visualization(self, epoch, img, nuc_gt, cyto_gt,
-                                  nuc_pred_prob, cyto_pred_prob, viz_dir):
-        """Save visualization with GT vs Pred overlay + DISTANCE MAPS"""
-        import matplotlib.pyplot as plt
-        from skimage.segmentation import find_boundaries
 
-        # Threshold predictions
-        nuc_pred = (nuc_pred_prob > 0.5).astype(np.uint8)
-        cyto_pred = (cyto_pred_prob > 0.5).astype(np.uint8)
-
-        # Compute Dice
-        from cytonucs_trainer import compute_dice
-        dice_nuc = compute_dice(nuc_gt, nuc_pred)
-        dice_cyto = compute_dice(cyto_gt, cyto_pred)
-
-        # === РАСШИРЕННАЯ ВИЗУАЛИЗАЦИЯ: 3 ряда ===
-        fig, axes = plt.subplots(3, 4, figsize=(16, 12))
-
-        # === ROW 1: NUCLEUS ===
-        if img.ndim == 3 and img.shape[-1] in [3, 4]:
-            axes[0, 0].imshow(img)
-            img_for_bottom = img
-        else:
-            axes[0, 0].imshow(img, cmap='gray')
-            img_for_bottom = img
-
-        axes[0, 0].set_title('Input Image')
-        axes[0, 0].axis('off')
-
-        axes[0, 1].imshow(nuc_gt, cmap='tab20')
-        axes[0, 1].set_title(f'Nucleus GT ({nuc_gt.max()} objects)')
-        axes[0, 1].axis('off')
-
-        axes[0, 2].imshow(nuc_pred_prob, cmap='hot', vmin=0, vmax=1)
-        axes[0, 2].set_title(f'Nucleus Pred (Dice={dice_nuc:.3f})')
-        axes[0, 2].axis('off')
-
-        # Overlay nucleus
-        overlay_nuc = np.zeros((*nuc_gt.shape, 3))
-        boundaries_gt = find_boundaries(nuc_gt, mode='inner')
-        overlay_nuc[boundaries_gt] = [0, 1, 0]
-        boundaries_pred = find_boundaries(nuc_pred, mode='inner')
-        overlay_nuc[boundaries_pred] = [1, 0, 0]
-        overlap = boundaries_gt & boundaries_pred
-        overlay_nuc[overlap] = [1, 1, 0]
-
-        axes[0, 3].imshow(overlay_nuc)
-        axes[0, 3].set_title('Overlay (G=GT, R=Pred, Y=Match)')
-        axes[0, 3].axis('off')
-
-        # === ROW 2: CYTOPLASM ===
-        if img_for_bottom.ndim == 3 and img_for_bottom.shape[-1] in [3, 4]:
-            axes[1, 0].imshow(img_for_bottom)
-        else:
-            axes[1, 0].imshow(img_for_bottom, cmap='gray')
-
-        axes[1, 0].set_title('Input Image')
-        axes[1, 0].axis('off')
-
-        axes[1, 1].imshow(cyto_gt, cmap='tab20')
-        axes[1, 1].set_title(f'Cytoplasm GT ({cyto_gt.max()} objects)')
-        axes[1, 1].axis('off')
-
-        axes[1, 2].imshow(cyto_pred_prob, cmap='hot', vmin=0, vmax=1)
-        axes[1, 2].set_title(f'Cytoplasm Pred (Dice={dice_cyto:.3f})')
-        axes[1, 2].axis('off')
-
-        # Overlay cytoplasm
-        overlay_cyto = np.zeros((*cyto_gt.shape, 3))
-        boundaries_gt = find_boundaries(cyto_gt, mode='inner')
-        overlay_cyto[boundaries_gt] = [0, 1, 0]
-        boundaries_pred = find_boundaries(cyto_pred, mode='inner')
-        overlay_cyto[boundaries_pred] = [1, 0, 0]
-        overlap = boundaries_gt & boundaries_pred
-        overlay_cyto[overlap] = [1, 1, 0]
-
-        axes[1, 3].imshow(overlay_cyto)
-        axes[1, 3].set_title('Overlay (G=GT, R=Pred, Y=Match)')
-        axes[1, 3].axis('off')
-
-        # === ROW 3: DISTANCE MAPS (НОВОЕ!) ===
-        # Нужно получить distance predictions из модели
-        # Это временный workaround - в следующей версии сохраняй dist в callback
-
-        axes[2, 0].text(0.5, 0.5, 'Distance maps\nnot available\nin this version',
-                        ha='center', va='center', transform=axes[2, 0].transAxes)
-        axes[2, 0].axis('off')
-
-        axes[2, 1].text(0.5, 0.5, f'WBR: ???\nContainment: ???',
-                        ha='center', va='center', transform=axes[2, 1].transAxes,
-                        fontsize=12)
-        axes[2, 1].axis('off')
-
-        axes[2, 2].text(0.5, 0.5, 'See console\nfor loss\ncomponents',
-                        ha='center', va='center', transform=axes[2, 2].transAxes)
-        axes[2, 2].axis('off')
-
-        axes[2, 3].axis('off')
-
-        plt.suptitle(f'Epoch {epoch} - Nucleus Dice: {dice_nuc:.3f}, Cytoplasm Dice: {dice_cyto:.3f}')
-        plt.tight_layout()
-
-        plt.savefig(viz_dir / f'epoch_{epoch:04d}.png', dpi=150, bbox_inches='tight')
-        plt.close()
-
-        print(f"  📷 Saved visualization: epoch_{epoch:04d}.png")
 
 
 def compute_dice(gt, pred):

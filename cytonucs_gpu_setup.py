@@ -6,7 +6,7 @@ and ensures stable training on GPU.
 """
 import tensorflow as tf
 import os
-
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 
 def setup_gpu(memory_limit=None, allow_growth=True, visible_devices=None):
     """
