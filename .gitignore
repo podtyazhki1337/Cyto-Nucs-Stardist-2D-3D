@@ -1,1 +1,21 @@
-models/
+# Only code is tracked. Models, data, run results, audit history and notes stay local.
+/*
+!/.gitignore
+!/Readme.md
+!/*.py
+!/config_cytonucs*.json
+
+!/dataset_prep/
+/dataset_prep/*
+!/dataset_prep/*.py
+
+!/tests/
+/tests/*
+!/tests/*.py
+
+!/audit/
+/audit/*
+!/audit/*.py
+
+__pycache__/
+*.pyc

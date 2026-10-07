@@ -55,67 +55,191 @@ def _calculate_ap(precision, recall):
 
     return ap
 class _Prefetcher:
-    """Готовит батчи в фоновых потоках. Несколько воркеров, потому что одного
-    не хватало: T_gen ~50 с против T_gpu ~21 с, очередь пустела и шаги шли
-    вперемешку 21/76 с."""
-
-    def __init__(self, gen, depth=3, workers=3):
-        import threading, queue
-        self._gen = gen
-        self._q = queue.Queue(maxsize=depth)
-        self._stop = threading.Event()
-        self._err = None
-        self._times = []
-        self._lock = threading.Lock()
-        self._n = max(1, int(workers))
-        self._threads = [threading.Thread(target=self._work, args=(w,), daemon=True)
-                         for w in range(self._n)]
-        for t in self._threads:
-            t.start()
-
-    def _work(self, w):
-        import queue, time, traceback
-        i = w
-        while not self._stop.is_set():
-            try:
-                t0 = time.time()
-                batch = self._gen[i % max(1, len(self._gen))]
-                dt = time.time() - t0
-            except Exception as e:
-                # НЕ глотаем: прежний `except: continue` оставлял поток крутиться
-                # вхолостую, очередь пустела и next() висел без трейсбека.
-                self._err = e
-                traceback.print_exc()
-                return
-            with self._lock:
-                self._times.append(dt)
-                if len(self._times) > 50:
-                    self._times.pop(0)
-            while not self._stop.is_set():
-                try:
-                    self._q.put(batch, timeout=0.5)
-                    break
-                except queue.Full:
-                    continue
-            i += self._n
-
-    def gen_time(self):
-        with self._lock:
-            return float(np.mean(self._times)) if self._times else 0.0
-
+    """Bounded ordered prefetch: reproducible samples regardless of worker timing."""
+    def __init__(self, gen, depth=3, workers=3, count=None):
+        from concurrent.futures import ThreadPoolExecutor
+        from collections import deque
+        self._gen, self._next = gen, 0
+        self._count = len(gen) if count is None else int(count)
+        self._pool = ThreadPoolExecutor(max_workers=max(1, workers))
+        self._futures = deque()
+        for _ in range(min(max(1, depth), self._count)):
+            self._submit()
+    def _submit(self):
+        self._futures.append(self._pool.submit(self._gen.__getitem__, self._next))
+        self._next += 1
     def next(self):
-        import queue
-        while True:
-            try:
-                return self._q.get(timeout=1.0)
-            except queue.Empty:
-                if self._err is not None:
-                    raise RuntimeError("Prefetcher: ошибка в генераторе") from self._err
-                if self._stop.is_set():
-                    raise RuntimeError("Prefetcher остановлен")
-
+        result = self._futures.popleft().result()
+        if self._next < self._count:
+            self._submit()
+        return result
     def stop(self):
-        self._stop.set()
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+def align_fullval_history(history, lengths_before):
+    """Keep every fullval_* list index-aligned with fullval_epoch.
+
+    A key first logged now gets leading None for earlier validations; a key not
+    logged now gets a trailing None. Values are never moved or invented.
+    """
+    n = len(history.get('fullval_epoch', []))
+    for key, values in history.items():
+        if not key.startswith('fullval_') or key == 'fullval_epoch' or len(values) >= n:
+            continue
+        if len(values) > lengths_before.get(key, 0):
+            values[:0] = [None] * (n - len(values))
+        else:
+            values.extend([None] * (n - len(values)))
+
+
+def sync_object_min_area(loss_fn, gates):
+    """Object-level probability losses skip objects below the calibrated size gates.
+
+    Only with loss_params.object_losses_min_area_from_gate; missing gates keep 0 (no filter).
+    """
+    if not getattr(loss_fn.config, 'object_losses_min_area_from_gate', False) or not gates:
+        return None
+    values = [float(gates.get(h + '_min_area', 0.0) or 0.0) for h in ('nucleus', 'cytoplasm')]
+    loss_fn.object_min_voxels.assign(values)
+    print(f"  Object losses: skip objects below {values[0]:.0f} / {values[1]:.0f} voxels (nucleus / cytoplasm)")
+    return values
+
+
+def _write_epoch_calibration(model, state_epoch, path):
+    """Attach quality gates calibrated by this epoch's full validation, never older ones.
+
+    Mask thresholds are calibrated once after training (calibrate_mask_thresholds).
+    """
+    gates = getattr(model, 'pending_quality_gates', None)
+    if gates is not None and gates['epoch'] == int(state_epoch.numpy()):
+        from cytonucs_runtime import write_quality_gates
+        write_quality_gates(path, gates)
+
+
+# Per-object probability diagnostics: a batch without sampled objects reports 0 and
+# must not dilute the epoch value, so these are averaged with the object count as weight.
+OBJECT_WEIGHTED_PREFIX = 'nucleus_prob_gt_max_'
+OBJECT_COUNT_KEY = 'nucleus_prob_sampled_object_count'
+
+
+OPTIMIZER_PATHS_ATTR = 'cytonucs_optimizer_paths'
+
+
+def verify_state_order(prefix, ordered_variables, saved_paths=None, weights_loaded=False):
+    """The .state checkpoint restores model variables and Adam slots by optimizer index; a
+    different variable order would silently put moments (and values) on the wrong variables.
+
+    Checkpoints that record their optimizer variable paths are checked by name (variables added
+    later may follow). Older ones are checked by shape and, when the weights of this checkpoint
+    were just loaded by name, by the exact saved values."""
+    path = lambda v: getattr(v, 'path', None) or v.name
+    if saved_paths is not None:
+        current = [path(v) for v in ordered_variables]
+        if current[:len(saved_paths)] != list(saved_paths):
+            first = next(i for i, (a, b) in enumerate(zip(current, saved_paths)) if a != b) \
+                if len(current) >= len(saved_paths) else len(current)
+            raise ValueError(f'Optimizer state order differs from the checkpoint at index {first}; '
+                             'refusing to restore Adam state')
+        return
+    reader = tf.train.load_checkpoint(prefix)
+    for index, variable in enumerate(ordered_variables):
+        key = f'optimizer/_trainable_variables/{index}/.ATTRIBUTES/VARIABLE_VALUE'
+        if not reader.has_tensor(key):
+            continue                               # variable added after this checkpoint
+        saved = reader.get_tensor(key)
+        if saved.shape != tuple(variable.shape) or (weights_loaded and not np.array_equal(saved, variable.numpy())):
+            raise ValueError(f'Optimizer state order differs from the checkpoint at index {index} '
+                             f'({path(variable)}); refusing to restore Adam state')
+
+
+def accumulate_components(sums, components):
+    counts = {head: float(components.get(OBJECT_COUNT_KEY.replace('nucleus', head), 0.0))
+              for head in ('nucleus', 'cytoplasm')}
+    for key, value in components.items():
+        weight = next((counts[head] for head in counts
+                       if key.startswith(OBJECT_WEIGHTED_PREFIX.replace('nucleus', head))), 1.0)
+        total, weights = sums.get(key, (0.0, 0.0))
+        sums[key] = (total + float(value) * weight, weights + weight)
+
+
+def component_means(sums):
+    return {key: (total / weights if weights else None) for key, (total, weights) in sums.items()}
+
+
+def calibrate_mask_thresholds(predictor, samples):
+    """Per-head thresholds for mask_thresh_*='auto' from one pass over validation volumes.
+
+    Run once after training (or with mode 'calibrate'), not at every full validation.
+    Candidates of each volume are cached; the other thresholds of mask_thresh_range (below
+    and above mask_thresh) re-assemble one head without new network passes. The threshold
+    maximizing the checkpoint metric is kept (default mask_thresh if nothing improves).
+    samples: dicts with normalized 'image', 'nucleus_mask', 'cytoplasm_mask', 'assignments'.
+    Returns (thresholds, statistics); empty when no head uses 'auto'.
+    """
+    from types import SimpleNamespace
+    from stardist.matching import matching
+    from cytonucs_inference import compute_jtpr, rethreshold_prediction
+    from cytonucs_runtime import select_mask_thresholds
+    config = predictor.config
+    heads = [h for h in ('nucleus', 'cytoplasm') if getattr(config, 'mask_thresh_' + h) == 'auto']
+    if not heads:
+        return {}, {}
+    thresholds = sorted(float(t) for t in set(config.mask_thresh_range) if t != config.mask_thresh)
+    taus = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+
+    def empty():
+        return dict(tp=np.zeros(len(taus), np.int64), fp=np.zeros(len(taus), np.int64),
+                    fn=np.zeros(len(taus), np.int64), joint_tp=0)
+
+    def add(slot, gt, pred):
+        result = matching(gt, pred, thresh=taus, criterion='iou')
+        for k, r in enumerate(result if isinstance(result, (list, tuple)) else [result]):
+            slot['tp'][k] += int(r.tp); slot['fp'][k] += int(r.fp); slot['fn'][k] += int(r.fn)
+
+    base = {h: dict(empty(), threshold=config.mask_thresh) for h in heads}
+    evaluated = {h: {t: empty() for t in thresholds} for h in heads}
+    total_pairs = 0
+    saved = getattr(predictor, 'calibrating', False)
+    predictor.calibrating = True
+    runner = SimpleNamespace(model=predictor.model)
+    try:
+        for index, sample in enumerate(samples):
+            sink = {} if thresholds else None
+            predictor._refinement_candidate_sink = sink
+            try:
+                nuclei, cells, _ = DiceCallback._predict_full_volume(
+                    runner, predictor, np.asarray(sample['image'], np.float32))
+            finally:
+                predictor._refinement_candidate_sink = None
+            gt = {'nucleus': np.asarray(sample['nucleus_mask']), 'cytoplasm': np.asarray(sample['cytoplasm_mask'])}
+            _, joint = compute_jtpr(nuclei, cells, gt['nucleus'], gt['cytoplasm'], iou_thresh=0.5,
+                                    assignments_pred=getattr(predictor, '_prompt_assignments', None),
+                                    assignments_gt=sample.get('assignments'))
+            total_pairs += int(joint['total_pairs'])
+            for head in heads:
+                add(base[head], gt[head], nuclei if head == 'nucleus' else cells)
+                base[head]['joint_tp'] += int(joint['joint_tp'])
+                for threshold in thresholds:
+                    nuc_t, cell_t, pairs_t = rethreshold_prediction(config, sink, head, threshold, nuclei, cells)
+                    slot = evaluated[head][threshold]
+                    add(slot, gt[head], nuc_t if head == 'nucleus' else cell_t)
+                    _, joint_t = compute_jtpr(nuc_t, cell_t, gt['nucleus'], gt['cytoplasm'], iou_thresh=0.5,
+                                              assignments_pred=pairs_t, assignments_gt=sample.get('assignments'))
+                    slot['joint_tp'] += int(joint_t['joint_tp'])
+            print(f"  [mask calibration {index + 1}/{len(samples)}] {sample.get('filename', index)}")
+    finally:
+        predictor.calibrating = saved
+    chosen, stats = select_mask_thresholds(base, evaluated, total_pairs,
+                                           float(getattr(config, 'checkpoint_w_jtpr', 0.7)))
+    for head in heads:
+        print(f"  Mask threshold {head}: {config.mask_thresh:.3f} -> {chosen[head]:.3f}; "
+              f"AP {stats[head]['ap_default']:.4f} -> {stats[head]['ap']:.4f}, "
+              f"JTPR {stats[head]['jtpr_default']:.4f} -> {stats[head]['jtpr']:.4f}")
+    stats = dict(heads=stats, candidates=thresholds, default=config.mask_thresh, volumes=len(samples),
+                 total_pairs=total_pairs)
+    return chosen, stats
+
+
 class CytoNucsTrainer:
     """
     Custom trainer for CytoNucs StarDist model.
@@ -132,6 +256,11 @@ class CytoNucsTrainer:
         self.model = model
         self.config = config
         self.loss_fn = loss_fn
+        self.prompt_detector = None
+        if config.predicted_prompt_fraction or config.detector_prompt_slots:
+            self.prompt_detector = tf.keras.Model(model.keras_model.inputs,
+                {h+'_'+kind:model.keras_model.output[h+'_'+kind]
+                 for h in ('nucleus','cytoplasm') for kind in ('prob','dist')})
         self.current_step = 0
         self.current_epoch_var = tf.Variable(1, dtype=tf.int32, trainable=False)
         # Setup optimizer
@@ -151,6 +280,7 @@ class CytoNucsTrainer:
         else:
             self.optimizer = optimizer
 
+
         # Metrics
         self.train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
         self.val_loss_metric = tf.keras.metrics.Mean(name='val_loss')
@@ -165,17 +295,74 @@ class CytoNucsTrainer:
         # Checkpoint directory
         self.checkpoint_dir = Path(model.basedir) / model.name
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.loss_metrics_train = {}
+        self.loss_metrics_val = {}
+        self.state_epoch = tf.Variable(0, dtype=tf.int64, trainable=False)
+        self.state_best_val = tf.Variable(float('inf'), dtype=tf.float32, trainable=False)
+        self.state_best_full = tf.Variable(float('-inf'), dtype=tf.float32, trainable=False)
+        self.state_selection_start = tf.Variable(0, dtype=tf.int64, trainable=False)
+        # Stable slot order for both fresh training and optimizer restoration.
+        self.optimizer.build(self.model.optimizer_variables())
+        self.checkpoint = tf.train.Checkpoint(model=self.model.keras_model, optimizer=self.optimizer,
+                                             epoch=self.state_epoch, best_val=self.state_best_val,
+                                             best_full=self.state_best_full,
+                                             selection_start=self.state_selection_start)
+
+    def save_checkpoint(self, path):
+        self.model.save_weights(path)
+        import h5py
+        with h5py.File(path, 'a') as weights:
+            weights.attrs['cytonucs_epoch'] = int(self.state_epoch.numpy())
+            weights.attrs[OPTIMIZER_PATHS_ATTR] = json.dumps(
+                [getattr(v, 'path', None) or v.name for v in self.model.optimizer_variables()])
+        _write_epoch_calibration(self.model, self.state_epoch, path)
+        self.checkpoint.write(str(path) + '.state')
+
+    def restore_training_state(self, weights_path):
+        prefix = str(weights_path) + '.state'
+        if not Path(prefix + '.index').exists():
+            print('WARNING: weights-only resume; Adam state unavailable')
+            return False
+        self.optimizer.build(self.model.optimizer_variables())
+        import h5py
+        saved_paths = None
+        if Path(weights_path).exists():
+            with h5py.File(weights_path, 'r') as weights:
+                if OPTIMIZER_PATHS_ATTR in weights.attrs:
+                    saved_paths = json.loads(weights.attrs[OPTIMIZER_PATHS_ATTR])
+        loaded = str(getattr(self.model, 'loaded_weights_path', '')) == str(weights_path)
+        verify_state_order(prefix, self.model.optimizer_variables(), saved_paths, loaded)
+        self.checkpoint.restore(prefix).expect_partial()
+        if self.config.reset_best_on_resume:
+            self.state_best_val.assign(float('inf'))
+            self.state_best_full.assign(float('-inf'))
+            self.state_selection_start.assign(self.state_epoch)
+            print('Reset best selection for changed loss/evaluation; epoch and Adam preserved')
+        print(f'Restored Adam and epoch {int(self.state_epoch.numpy())}')
+        return True
 
         # cytonucs_trainer.py - ЛУЧШИЙ ВАРИАНТ с tf.py_function
 
-
     @tf.function
     def train_step(self, x_batch, y_batch_dict):
-
+        original_prompts = x_batch
+        nuclear_cell_fraction = tf.constant(0., tf.float32)
+        if self.prompt_detector is not None:
+            x_batch, nuclear_cell_fraction = tf.cond(self.current_epoch_var >= self.config.predicted_prompt_start_epoch,
+                lambda: self._predicted_prompts(x_batch, y_batch_dict, return_stats=True),
+                lambda: (x_batch, tf.constant(0., tf.float32)))
+        y_batch_dict = self._mask_quality_inputs(x_batch, y_batch_dict)
         with tf.GradientTape() as tape:
             y_pred = self.model.keras_model(x_batch, training=True)
             loss = self.loss_fn(y_batch_dict, y_pred, current_epoch=self.current_epoch_var)
 
+        for hi, head in enumerate(('nucleus', 'cytoplasm')):
+            changed = tf.reduce_any(tf.not_equal(
+                x_batch[..., self.config.n_channel_in+hi::2],
+                original_prompts[..., self.config.n_channel_in+hi::2]),
+                axis=list(range(1, self.config.ndim+1)))
+            self.loss_fn.last_components[head + '_detector_prompt_changed_fraction'] = tf.reduce_mean(tf.cast(changed, tf.float32))
+        self.loss_fn.last_components['cytoplasm_nuclear_detector_prompt_fraction'] = nuclear_cell_fraction
         gradients = tape.gradient(loss, self.model.keras_model.trainable_variables)
 
         # Имена слоёв статичны на этапе трейса — группируем по веткам.
@@ -243,20 +430,124 @@ class CytoNucsTrainer:
         rf_norm = _group_norm(refine_grads)
         cd_norm = _group_norm(cdec_grads)
 
-        all_grads = prob_grads + dist_grads + backbone_grads + refine_grads + cdec_grads
-        all_vars = prob_vars + dist_vars + backbone_vars + refine_vars + cdec_vars
+        active = [(g, v) for g, v in zip(gradients, self.model.keras_model.trainable_variables)
+                  if g is not None]
+        all_grads, all_vars = map(list, zip(*active))
 
         if clip_norm > 0:
-            # ОДИН глобальный клип на всю сеть, как делал бы Adam(clipnorm=...):
+            # ОДИН глобальный клип на всю сеть, эквивалент global_clipnorm:
             # относительный баланс между группами сохраняется.
             all_grads, _ = tf.clip_by_global_norm(all_grads, clip_norm)
 
         self.optimizer.apply_gradients(zip(all_grads, all_vars))
         self.train_loss_metric.update_state(loss)
-        return loss, prob_norm, dist_norm, bb_norm, rf_norm, cd_norm
+        return loss, prob_norm, dist_norm, bb_norm, rf_norm, cd_norm, self.loss_fn.last_components
 
+    def _mask_quality_inputs(self, x, targets):
+        if self.config.mask_quality_target != 'component' or not self.config.mask_quality_weight:
+            return targets
+        result = dict(targets)
+        for hi, head in enumerate(('nucleus', 'cytoplasm')):
+            result[head + '_quality_prompt'] = tf.concat([
+                x[..., self.config.n_channel_in + 2*k + hi]
+                for k in range(self.config.prompts_per_crop)], axis=0)
+        return result
 
+    def _predicted_prompts(self, x, targets, return_stats=False):
+        """Detached detector prompts with existing GT ownership and hard negatives.
 
+        Select a detector peak inside the selected GT target and derive its
+        width from predicted rays. Empty targets use a detector peak on GT background.
+        No arbitrary positive instance is mislabeled as a negative.
+        """
+        pred = self.prompt_detector(x, training=False)
+        nd, batch = self.config.ndim, tf.shape(x)[0]
+        shape = tf.shape(x)[1:nd+1]
+        axes = tf.meshgrid(*[tf.cast(tf.range(shape[a]), tf.float32) for a in range(nd)], indexing='ij')
+        channels = [x[..., :self.config.n_channel_in]]
+        seed = tf.stack([tf.cast(self.config.seed, tf.int32), tf.cast(self.optimizer.iterations, tf.int32)])
+        decisions = tf.random.stateless_uniform((self.config.prompts_per_crop, batch, 1, 1), seed)
+        def propose(source, head, k, hi):
+            grid = getattr(self.config, source + '_grid')
+            target = targets[head + '_target'][k*batch:(k+1)*batch]
+            sl = (slice(None),) + tuple(slice(None,None,g) for g in grid)
+            target_grid = tf.cast(target[sl] > .5, tf.bool)
+            # Positive targets may disappear on the detector grid. They must
+            # retain their GT prompt, not become background negatives.
+            nonempty = tf.reduce_any(target > .5,axis=list(range(1,nd+1)))
+            background = targets['nucleus_instances'][sl] == 0
+            if head == 'cytoplasm':
+                # An unassigned real nucleus is not a reliable cell negative.
+                background &= targets['cytoplasm_instances'][sl] == 0
+            valid_points = tf.where(tf.reshape(nonempty,[-1]+[1]*nd), target_grid, background)
+            probability = pred[source+'_prob'][...,0]
+            scores = tf.where(valid_points, probability, -tf.ones_like(probability))
+            valid = tf.reduce_any(valid_points,axis=list(range(1,nd+1)))
+            if self.config.predicted_prompt_sample_peaks:
+                # Repeated targets should expose different detector hypotheses,
+                # not always the same argmax (which trivializes consistency).
+                pool = tf.nn.max_pool3d if nd == 3 else tf.nn.max_pool2d
+                # Find peaks before GT ownership filtering; otherwise a
+                # stronger neighbour outside the target is hidden by GT.
+                # Same window/border rule as inference, including null (auto) values.
+                from cytonucs_geometry import proposal_peak_settings
+                window, border = proposal_peak_settings(
+                    self.config, source, [p // g for p, g in zip(self.config.train_patch_size, grid)], peaks=True)
+                peak_probability = probability
+                if border:
+                    coords_grid = tf.meshgrid(*[tf.range(tf.shape(probability)[a+1]) for a in range(nd)], indexing='ij')
+                    interior = tf.ones(tf.shape(probability)[1:], tf.bool)
+                    for a in range(nd-2, nd):
+                        interior &= (coords_grid[a] >= border) & (coords_grid[a] < tf.shape(probability)[a+1]-border)
+                    valid_points &= interior[None]
+                    peak_probability = tf.where(interior[None], probability, tf.constant(-float('inf'), tf.float32))
+                local_max = pool(peak_probability[..., None], ksize=window, strides=1, padding='SAME')[..., 0]
+                peaks = valid_points & (probability >= local_max) & (probability > getattr(self.config, 'prob_thresh_'+source))
+                random = tf.random.stateless_uniform(tf.shape(scores),
+                    tf.random.experimental.stateless_fold_in(seed, 2*k+hi+1))
+                has_peaks = tf.reduce_any(peaks, axis=list(range(1, nd+1)), keepdims=True)
+                scores = tf.where(peaks, random, -tf.ones_like(random))
+                valid = valid & tf.reshape(has_peaks, [-1])
+            flat = tf.argmax(tf.reshape(scores, (batch,-1)), axis=1, output_type=tf.int32)
+            coords = tf.transpose(tf.unravel_index(flat, tf.shape(scores)[1:]))
+            gather = tf.concat([tf.range(batch)[:,None], coords], axis=1)
+            distances = tf.maximum(tf.gather_nd(pred[source+'_dist'], gather), 1e-3)
+            verts = tf.constant(getattr(self.config,'rays_'+source).vertices, tf.float32)
+            points = distances[...,None]*verts[None]
+            sigma = tf.maximum((tf.reduce_max(points,axis=1)-tf.reduce_min(points,axis=1))/4.,1.)
+            center = tf.cast(coords,tf.float32)*tf.constant(grid,tf.float32)
+            d2 = sum(tf.square((ax[None]-tf.reshape(center[:,a],[-1]+[1]*nd)) /
+                               tf.reshape(sigma[:,a],[-1]+[1]*nd)) for a,ax in enumerate(axes))
+            prompt = tf.exp(-.5*d2)[...,None]
+            return prompt, valid
+
+        nuclear_cell_replacements = []
+        for k in range(self.config.prompts_per_crop):
+            for hi, head in enumerate(('nucleus', 'cytoplasm')):
+                prompt, valid = propose(head, head, k, hi)
+                use_nucleus = tf.zeros([batch], tf.bool)
+                if head == 'cytoplasm' and self.config.cell_predicted_nucleus_fraction:
+                    nuclear_prompt, nuclear_valid = propose('nucleus', head, k, hi)
+                    source_draw = tf.random.stateless_uniform([batch],
+                        tf.random.experimental.stateless_fold_in(seed, 10000+k))
+                    use_nucleus = (source_draw < self.config.cell_predicted_nucleus_fraction) & nuclear_valid
+                    # Keep the cell-source candidate when there is no owned nuclear
+                    # candidate, rather than silently dropping detector exposure.
+                    prompt = tf.where(tf.reshape(use_nucleus, [-1]+[1]*(nd+1)), nuclear_prompt, prompt)
+                    valid = tf.where(use_nucleus, nuclear_valid, valid)
+                fraction = (1.0 if k >= self.config.prompts_per_crop - self.config.detector_prompt_slots
+                            else self.config.predicted_prompt_fraction)
+                selected = (tf.reshape(decisions[k],[-1]) < fraction) & valid
+                if k < 2 and head + '_z_prompt_pair' in targets:
+                    selected &= ~tf.cast(targets[head + '_z_prompt_pair'], tf.bool)
+                choose = tf.reshape(selected, [-1]+[1]*(nd+1))
+                offset = self.config.n_channel_in+2*k+hi
+                channels.append(tf.where(choose,prompt,x[...,offset:offset+1]))
+                if head == 'cytoplasm':
+                    nuclear_cell_replacements.append(tf.cast(selected & use_nucleus, tf.float32))
+        result = tf.stop_gradient(tf.concat(channels,axis=-1))
+        fraction = tf.reduce_mean(tf.stack(nuclear_cell_replacements))
+        return (result, fraction) if return_stats else result
 
     @tf.function
     def val_step(self, x_batch, y_batch):
@@ -274,12 +565,13 @@ class CytoNucsTrainer:
         y_pred = self.model.keras_model(x_batch, training=False)
 
         # ИСПРАВЛЕНИЕ: убрать assignments=None
-        loss = self.loss_fn(y_batch, y_pred, current_epoch=self.current_epoch_var)
+        loss = self.loss_fn(self._mask_quality_inputs(x_batch, y_batch), y_pred,
+                            current_epoch=self.current_epoch_var)
 
         # Update validation metric
         self.val_loss_metric.update_state(loss)
 
-        return loss
+        return loss, self.loss_fn.last_components
 
     # Основной цикл тренировки
 
@@ -302,61 +594,72 @@ class CytoNucsTrainer:
             steps_per_epoch = steps_per_epoch or self.config.train_steps_per_epoch
 
             callbacks = callbacks or []
+            from cytonucs_runtime import align_training_history
+            self.history = align_training_history(self.history, start_epoch)
 
             print(f"Training for {epochs} epochs, {steps_per_epoch} steps/epoch")
             print(f"Model: {self.model.name}")
             print(f"Config: {self.config}")
 
-            best_val_loss = np.inf
-            prefetch = _Prefetcher(
-                train_generator,
-                depth=int(getattr(self.config, 'prefetch_depth', 3)),
-                workers=int(getattr(self.config, 'prefetch_workers', 3)))
+            best_val_loss = float(self.state_best_val.numpy())
             for epoch in range(start_epoch, epochs):
                 print(f"\n{'=' * 50}")
                 print(f"Epoch {epoch + 1}/{epochs}")
                 print(f"{'=' * 50}")
 
                 self.current_epoch_var.assign(epoch + 1)
+                self.state_epoch.assign(epoch + 1)
+                epoch_checkpoint_paths = []
+                train_generator.set_epoch(epoch)
+                prefetch = _Prefetcher(train_generator,
+                    depth=int(getattr(self.config, 'prefetch_depth', 3)),
+                    workers=int(getattr(self.config, 'prefetch_workers', 3)), count=steps_per_epoch)
+                component_sums = {}
                 # Reset metrics
                 self.train_loss_metric.reset_state()
                 self.val_loss_metric.reset_state()
 
                 # Training loop
                 train_pbar = tqdm(range(steps_per_epoch), desc='Training')
-                for step in train_pbar:
-                    # Get batch
-                    x_batch, y_batch = prefetch.next()
+                try:
+                    for step in train_pbar:
+                        # Get batch
+                        x_batch, y_batch = prefetch.next()
 
-                    # Конвертируем x в tensor
-                    x_batch = tf.convert_to_tensor(x_batch, dtype=tf.float32)
+                        # Конвертируем x в tensor
+                        x_batch = tf.convert_to_tensor(x_batch, dtype=tf.float32)
 
-                    # Конвертируем y_batch ЦЕЛИКОМ (включая instance masks)
-                    y_batch_tf = {}
-                    for k, v in y_batch.items():
-                        if isinstance(v, np.ndarray):
-                            if v.dtype.kind == 'f':  # float
-                                y_batch_tf[k] = tf.convert_to_tensor(v, dtype=tf.float32)
-                            elif v.dtype.kind in ['i', 'u']:  # int/uint
-                                y_batch_tf[k] = tf.convert_to_tensor(v, dtype=tf.int32)
+                        # Конвертируем y_batch ЦЕЛИКОМ (включая instance masks)
+                        y_batch_tf = {}
+                        for k, v in y_batch.items():
+                            if isinstance(v, np.ndarray):
+                                if v.dtype.kind == 'f':  # float
+                                    y_batch_tf[k] = tf.convert_to_tensor(v, dtype=tf.float32)
+                                elif v.dtype.kind in ['i', 'u']:  # int/uint
+                                    y_batch_tf[k] = tf.convert_to_tensor(v, dtype=tf.int32)
+                                else:
+                                    y_batch_tf[k] = tf.convert_to_tensor(v)
                             else:
-                                y_batch_tf[k] = tf.convert_to_tensor(v)
-                        else:
-                            y_batch_tf[k] = v
+                                y_batch_tf[k] = v
 
-                    # Train step
-                    loss, p_n, d_n, b_n, r_n, c_n = self.train_step(x_batch, y_batch_tf)
-                    self.current_step += 1
-                    if self.current_step % 1 == 0:
-                        print(f"  [GRAD NORMS] prob: {float(p_n):.3f} dist: {float(d_n):.3f} "
-                              f"backbone: {float(b_n):.3f} cyto_dec: {float(c_n):.3f} "
-                              f"|| refine: {float(r_n):.3f} "
-                              f"| clip: {float(self.config.gradient_clip_norm)}")
 
-                    # Update progress bar
-                    train_pbar.set_postfix({'loss': f'{loss.numpy():.4f}'})
+                        # Train step
+                        loss, p_n, d_n, b_n, r_n, c_n, components = self.train_step(x_batch, y_batch_tf)
+                        self.current_step += 1
+                        accumulate_components(component_sums, components)
+                        if self.current_step % max(1, int(getattr(self.config, 'log_every_steps', 20))) == 0:
+                            print(f"  [GRAD NORMS] prob: {float(p_n):.3f} dist: {float(d_n):.3f} "
+                                  f"backbone: {float(b_n):.3f} cyto_dec: {float(c_n):.3f} "
+                                  f"|| refine: {float(r_n):.3f} "
+                                  f"| clip: {float(self.config.gradient_clip_norm)}")
 
-                # Record training loss
+                        # Update progress bar
+                        train_pbar.set_postfix({'loss': f'{loss.numpy():.4f}'})
+           
+                finally:
+                    prefetch.stop()
+                for key, value in component_means(component_sums).items():
+                    self.history.setdefault('train_' + key, [None] * epoch).append(value)
                 train_loss = self.train_loss_metric.result().numpy()
                 self.history['train_loss'].append(float(train_loss))
                 self.history['lr'].append(float(self.optimizer.learning_rate.numpy()))
@@ -364,73 +667,13 @@ class CytoNucsTrainer:
                 print(f"Train Loss: {train_loss:.4f}")
 
                 # Log loss components
-                if (epoch + 1) % 1 == 0:
-                    try:
-                        x_sample, y_sample = train_generator[0]
-                        x_sample_tf = tf.convert_to_tensor(x_sample, dtype=tf.float32)
-
-                        y_sample_tf = {}
-                        for k, v in y_sample.items():
-                            if isinstance(v, np.ndarray):
-                                if v.dtype.kind == 'f':
-                                    y_sample_tf[k] = tf.convert_to_tensor(v, dtype=tf.float32)
-                                elif v.dtype.kind in ['i', 'u']:
-                                    y_sample_tf[k] = tf.convert_to_tensor(v, dtype=tf.int32)
-                                else:
-                                    y_sample_tf[k] = tf.convert_to_tensor(v)
-                            else:
-                                y_sample_tf[k] = v
-
-                        y_pred_sample = self.model.keras_model(x_sample_tf, training=True)
-                        y_true_sample = self.loss_fn._create_gt_from_instances(y_sample_tf)
-
-                        loss_nuc = self.loss_fn._stardist_loss(
-                            y_true_sample['nucleus_prob'], y_pred_sample['nucleus_prob'],
-                            y_true_sample['nucleus_dist'], y_pred_sample['nucleus_dist'],
-                            name='nucleus'
-                        )
-                        loss_cyto = self.loss_fn._stardist_loss(
-                            y_true_sample['cytoplasm_prob'], y_pred_sample['cytoplasm_prob'],
-                            y_true_sample['cytoplasm_dist'], y_pred_sample['cytoplasm_dist'],
-                            name='cytoplasm'
-                        )
-                        _cyto_fg = self.loss_fn._grid_subsample_cytoplasm(
-                            tf.expand_dims(tf.cast(
-                                y_sample_tf['cytoplasm_instances'] > 0, tf.float32), -1))
-                        loss_wbr_val = self.loss_fn._wbr_loss(
-                            y_pred_sample['nucleus_prob'], _cyto_fg
-                        )
-                        loss_containment_val = self.loss_fn._containment_loss(
-                            y_true_sample, y_pred_sample, y_sample_tf
-                        )
-
-                        print(f"   Loss components:")
-                        print(
-                            f"     Nucleus BCE: {loss_nuc['bce'].numpy():.4f}, Distance: {loss_nuc['distance'].numpy():.4f}")
-                        print(
-                            f"     Cytoplasm BCE: {loss_cyto['bce'].numpy():.4f}, Distance: {loss_cyto['distance'].numpy():.4f}")
-                        print(f"     WBR penalty: {loss_wbr_val.numpy():.4f}")
-                        print(f"     Containment: {loss_containment_val.numpy():.4f}")
-
-                        if experiment:
-                            experiment.log_metrics({
-                                'nucleus_bce': float(loss_nuc['bce'].numpy()),
-                                'nucleus_distance': float(loss_nuc['distance'].numpy()),
-                                'cytoplasm_bce': float(loss_cyto['bce'].numpy()),
-                                'cytoplasm_distance': float(loss_cyto['distance'].numpy()),
-                                'wbr_penalty': float(loss_wbr_val.numpy()),
-                                'containment': float(loss_containment_val.numpy()),
-                            }, epoch=epoch + 1)
-                    except Exception as e:
-                        print(f"  └─ Could not compute loss components: {e}")
-
-                # Log to Comet
                 if experiment:
                     experiment.log_metric("train_loss", train_loss, epoch=epoch + 1)
                     experiment.log_metric("learning_rate", self.optimizer.learning_rate.numpy(), epoch=epoch + 1)
 
                 # Validation loop
                 if val_generator is not None:
+                    val_sums = {}
                     val_pbar = tqdm(range(len(val_generator)), desc='Validation')
                     for step in val_pbar:
                         x_batch, y_batch = val_generator[step]
@@ -449,8 +692,11 @@ class CytoNucsTrainer:
                             else:
                                 y_batch_tf[k] = v
 
-                        self.val_step(x_batch, y_batch_tf)
+                        _, components = self.val_step(x_batch, y_batch_tf)
+                        accumulate_components(val_sums, components)
 
+                    for key, value in component_means(val_sums).items():
+                        self.history.setdefault('val_' + key, [None] * epoch).append(value)
                     val_loss = self.val_loss_metric.result().numpy()
                     self.history['val_loss'].append(float(val_loss))
                     print(f"Val Loss: {val_loss:.4f}")
@@ -469,6 +715,7 @@ class CytoNucsTrainer:
                         best_val_loss = np.inf
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
+                        self.state_best_val.assign(val_loss)
 
                         # val_loss считается на deterministic train-sized patches.
                         # Это полезная training diagnostic, но НЕ production quality metric.
@@ -477,9 +724,10 @@ class CytoNucsTrainer:
                                 / 'weights_best_val_loss.weights.h5'
                         )
 
-                        self.model.save_weights(
+                        self.save_checkpoint(
                             best_path
                         )
+                        epoch_checkpoint_paths.append(best_path)
 
                         print(
                             f"  ✅ Best PATCH val-loss checkpoint saved: "
@@ -490,13 +738,20 @@ class CytoNucsTrainer:
                 save_every = getattr(self.config, 'save_every_n_epochs', 10)
                 if (epoch + 1) % save_every == 0:
                     latest_path = self.checkpoint_dir / f'weights_epoch_{epoch + 1:03d}.weights.h5'
-                    self.model.save_weights(latest_path)
+                    self.save_checkpoint(latest_path)
+                    epoch_checkpoint_paths.append(latest_path)
                     print(f"  💾 Checkpoint saved: {latest_path}")
 
                 # Call callbacks
                 for callback in callbacks:
                     if hasattr(callback, 'on_epoch_end'):
                         callback.on_epoch_end(epoch, self.history)
+
+                # Keep the early weights checkpoint available if validation is
+                # interrupted, but commit its updated best state after callbacks.
+                for path in epoch_checkpoint_paths:
+                    _write_epoch_calibration(self.model, self.state_epoch, path)
+                    self.checkpoint.write(str(path) + '.state')
 
                 if hasattr(train_generator, 'on_epoch_end'):
                     train_generator.on_epoch_end()
@@ -505,8 +760,6 @@ class CytoNucsTrainer:
                 # Save history
                 with open(self.checkpoint_dir / 'history.json', 'w') as f:
                     json.dump(self.history, f, indent=2)
-            prefetch.stop()
-
             print(f"\n{'=' * 50}")
             print("Training complete!")
             print(f"Best val loss: {best_val_loss:.4f}")
@@ -862,21 +1115,48 @@ class DiceCallback:
             nms_thresh=
             nms_thresh
         )
+        # Calibration must see ungated candidates, whatever the loaded checkpoint says.
+        predictor.calibrating = True
+        fullval_lengths = {k: len(v) for k, v in history.items() if k.startswith('fullval_')}
 
         # ============================================================
-        # STORAGE
+        # НАКАПЛИВАЕМ СЧЁТЧИКИ, А НЕ МАСКИ
+        # ============================================================
+        #
+        # matching_dataset агрегирует пулом — складывает tp/fp/fn по
+        # изображениям. Складываем сами сразу после прогона тома и отпускаем
+        # маски: числа те же, но в памяти не висит 4 набора полных масок по
+        # всей валидации. JTPR и semantic Dice тоже считаются на месте.
         # ============================================================
 
-        y_true_nucleus = []
-        y_pred_nucleus = []
+        from stardist.matching import matching
+        from cytonucs_inference import compute_jtpr
+        from types import SimpleNamespace
 
-        y_true_cytoplasm = []
-        y_pred_cytoplasm = []
+        taus = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+
+        cnt = {h: {k: np.zeros(len(taus), np.int64) for k in ('tp', 'fp', 'fn')}
+               for h in ('nucleus', 'cytoplasm')}
 
         semantic_nucleus = []
         semantic_cytoplasm = []
 
-        pred_assignments = []
+        jtpr_values = []
+        joint_tp_total = 0
+        total_pairs_total = 0
+        pair_failures = dict(joint_fail_nucleus=0, joint_fail_cell=0, joint_fail_link=0)
+        interior = dict(interior_joint_tp=0, interior_total_pairs=0)
+        # Written masks per head: (predicted quality, IoU with best GT, joint pairs lost
+        # if removed, written area) for the joint quality/size gate calibration.
+        gated_heads = [h for h in ('nucleus', 'cytoplasm')
+                       if config.mask_quality_head and
+                       getattr(config, 'mask_assembly_' + h).startswith('object_quality')]
+        written_quality = {h: [] for h in gated_heads}
+        # Same masks and every GT with the patch-face contact of their GT, for the AP that treats
+        # patch-edge fragments as ignore regions (reported next to the standard metric).
+        edge_rows = {h: dict(masks=[], gt=[]) for h in gated_heads}
+        # Same masks with the Z-slice / XY-contour split of their error (matched masks only).
+        boundary_rows = {h: [] for h in gated_heads}
 
         viz_dir = (
                 Path(
@@ -895,321 +1175,214 @@ class DiceCallback:
         # FULL-VOLUME INFERENCE
         # ============================================================
 
-        for i, sample in enumerate(
-                data_pool
-        ):
+        diagnostic_path = viz_dir / f'epoch_{epoch_num:04d}_refinement.jsonl'
+        diagnostic_path.write_text('', encoding='utf-8')
+        monitoring_totals = {}
+        for i, sample in enumerate(data_pool):
 
-            img = np.asarray(
-                sample['image'],
-                dtype=np.float32
-            )
+            img = np.asarray(sample['image'], dtype=np.float32)
+            nucleus_gt = np.asarray(sample['nucleus_mask'])
+            cytoplasm_gt = np.asarray(sample['cytoplasm_mask'])
+            filename = sample.get('filename', f'val_{i:03d}')
 
-            nucleus_gt = np.asarray(
-                sample['nucleus_mask']
-            )
-
-            cytoplasm_gt = np.asarray(
-                sample['cytoplasm_mask']
-            )
-
-            filename = sample.get(
-                'filename',
-                f'val_{i:03d}'
-            )
-
-            print(
-                f"\n  [{i + 1}/"
-                f"{len(data_pool)}] "
-                f"{filename}"
-            )
-
-            print(
-                f"    img={img.shape} | "
-                f"GT nuc="
-                f"{len(np.unique(nucleus_gt)) - 1} "
-                f"cyto="
-                f"{len(np.unique(cytoplasm_gt)) - 1}"
-            )
-
-            (
-                nucleus_pred,
-                cytoplasm_pred,
-                details
-            ) = self._predict_full_volume(
-                predictor,
-                img
-            )
+            from cytonucs_refinement_audit import RefinementStageAudit
+            audits = ({'nucleus': RefinementStageAudit(nucleus_gt),
+                       'cytoplasm': RefinementStageAudit(cytoplasm_gt)}
+                      if config.refinement_stage_audit else None)
+            self.model.last_refinement_diagnostics = None
+            predictor._refinement_stage_audit = audits
+            try:
+                nucleus_pred, cytoplasm_pred, details = self._predict_full_volume(predictor, img)
+            finally:
+                predictor._refinement_stage_audit = None
 
             # Никакого silent cropping validation результатов.
-            # Shape mismatch здесь означает реальную ошибку pipeline.
-            if (
-                    nucleus_pred.shape
-                    != nucleus_gt.shape
-            ):
+            if nucleus_pred.shape != nucleus_gt.shape:
                 raise RuntimeError(
-                    f"{filename}: "
-                    f"nucleus shape mismatch: "
-                    f"pred={nucleus_pred.shape}, "
-                    f"GT={nucleus_gt.shape}"
-                )
-
-            if (
-                    cytoplasm_pred.shape
-                    != cytoplasm_gt.shape
-            ):
+                    f"{filename}: nucleus shape mismatch: "
+                    f"pred={nucleus_pred.shape}, GT={nucleus_gt.shape}")
+            if cytoplasm_pred.shape != cytoplasm_gt.shape:
                 raise RuntimeError(
-                    f"{filename}: "
-                    f"cytoplasm shape mismatch: "
-                    f"pred={cytoplasm_pred.shape}, "
-                    f"GT={cytoplasm_gt.shape}"
-                )
+                    f"{filename}: cytoplasm shape mismatch: "
+                    f"pred={cytoplasm_pred.shape}, GT={cytoplasm_gt.shape}")
 
-            sd_n = self._semantic_dice(
-                nucleus_gt,
-                nucleus_pred
-            )
+            sd_n = self._semantic_dice(nucleus_gt, nucleus_pred)
+            sd_c = self._semantic_dice(cytoplasm_gt, cytoplasm_pred)
+            semantic_nucleus.append(sd_n)
+            semantic_cytoplasm.append(sd_c)
 
-            sd_c = self._semantic_dice(
-                cytoplasm_gt,
-                cytoplasm_pred
-            )
+            for head, gt_, pr_ in (('nucleus', nucleus_gt, nucleus_pred),
+                                   ('cytoplasm', cytoplasm_gt, cytoplasm_pred)):
+                res = matching(gt_, pr_, thresh=taus, criterion='iou')
+                res = list(res) if isinstance(res, (list, tuple)) else [res]
+                for k, r in enumerate(res):
+                    cnt[head]['tp'][k] += int(r.tp)
+                    cnt[head]['fp'][k] += int(r.fp)
+                    cnt[head]['fn'][k] += int(r.fn)
 
-            semantic_nucleus.append(
-                sd_n
-            )
+            jtpr, jtpr_details = compute_jtpr(
+                nucleus_pred=nucleus_pred,
+                cytoplasm_pred=cytoplasm_pred,
+                nucleus_gt=nucleus_gt,
+                cytoplasm_gt=cytoplasm_gt,
+                iou_thresh=0.5,
+                assignments_pred=getattr(predictor, '_prompt_assignments', None),
+                assignments_gt=sample.get('assignments'), with_pairs=True)
+            joint_pairs = jtpr_details.pop('joint_pairs')
+            jtpr_values.append(float(jtpr))
+            joint_tp_total += int(jtpr_details['joint_tp'])
+            total_pairs_total += int(jtpr_details['total_pairs'])
+            for key in pair_failures:
+                pair_failures[key] += int(jtpr_details[key])
+            for key in interior:
+                interior[key] += int(jtpr_details[key])
 
-            semantic_cytoplasm.append(
-                sd_c
-            )
+            print(f"  [{i + 1}/{len(data_pool)}] {filename} | "
+                  f"GT nuc={len(np.unique(nucleus_gt)) - 1} "
+                  f"cyto={len(np.unique(cytoplasm_gt)) - 1} | "
+                  f"pred nuc={len(np.unique(nucleus_pred)) - 1} "
+                  f"cyto={len(np.unique(cytoplasm_pred)) - 1} | "
+                  f"semantic Dice nuc={sd_n:.3f} cyto={sd_c:.3f} | "
+                  f"JTPR={jtpr:.3f}")
+            stage_reports = {h:a.report() for h,a in audits.items()} if audits is not None else None
+            if stage_reports is not None:
+                for head, report in stage_reports.items():
+                    for key, value in report['monitoring'].items():
+                        name = head + '_' + key
+                        monitoring_totals[name] = monitoring_totals.get(name, 0) + value
+                    if head in written_quality:
+                        joint_owner = [n if head == 'nucleus' else c for n, c in joint_pairs]
+                        edge_gt = {str(g): ('y' in v['faces'] or 'x' in v['faces'], v['volume'])
+                                   for g, v in report.get('gt_geometry', {}).items()}
+                        edge_rows[head]['gt'].extend(edge_gt.values())
+                        for d in report['assembly_decisions']:
+                            if d['reason'] != 'written':
+                                continue
+                            gt_id, iou = max(d['written_gt_iou'].items(), key=lambda kv: kv[1],
+                                             default=(None, 0.))
+                            lost = joint_owner.count(int(gt_id)) if iou >= .5 else 0
+                            written_quality[head].append((d['quality'], iou, lost,
+                                                          d.get('connected_voxels', d['area'])))
+                            edge_rows[head]['masks'].append((d['quality'], iou, d.get('connected_voxels', d['area']),
+                                                             edge_gt.get(str(gt_id))))
+                            boundary_rows[head].append((d['quality'], iou, d.get('connected_voxels', d['area']),
+                                                        d.get('boundary')))
+            with diagnostic_path.open('a', encoding='utf-8') as diagnostic_file:
+                json.dump(dict(epoch=epoch_num, filename=filename,
+                    refinement=getattr(self.model, 'last_refinement_diagnostics', None),
+                    stage_audit=stage_reports,
+                    jtpr=float(jtpr), pair_failures=jtpr_details), diagnostic_file, default=int)
+                diagnostic_file.write('\n')
 
-            y_true_nucleus.append(
-                nucleus_gt
-            )
-
-            y_pred_nucleus.append(
-                nucleus_pred
-            )
-
-            y_true_cytoplasm.append(
-                cytoplasm_gt
-            )
-
-            y_pred_cytoplasm.append(
-                cytoplasm_pred
-            )
-
-            pred_assignments.append(
-                dict(
-                    getattr(
-                        predictor,
-                        '_prompt_assignments',
-                        {}
-                    ) or {}
-                )
-            )
-
-            print(
-                f"    semantic Dice: "
-                f"nuc={sd_n:.3f} "
-                f"cyto={sd_c:.3f} | "
-                f"pred nuc="
-                f"{len(np.unique(nucleus_pred)) - 1} "
-                f"cyto="
-                f"{len(np.unique(cytoplasm_pred)) - 1}"
-            )
-
-            # Один полный validation example
-            # на каждую evaluation epoch.
+            # Визуализация — только первый том: она стоит дороже самого
+            # прогона и на 61 картинке в эпоху не нужна.
             if i == 0:
                 self._save_epoch_visualization_full(
-                    epoch=epoch_num,
-                    img=img,
-                    nuc_gt=nucleus_gt,
-                    cyto_gt=cytoplasm_gt,
-                    nuc_pred=nucleus_pred,
-                    cyto_pred=cytoplasm_pred,
-                    details=details,
-                    viz_dir=viz_dir,
-                    filename=(
-                        f'epoch_'
-                        f'{epoch_num:04d}_'
-                        f'fullval.png'
-                    )
-                )
+                    epoch=epoch_num, img=img,
+                    nuc_gt=nucleus_gt, cyto_gt=cytoplasm_gt,
+                    nuc_pred=nucleus_pred, cyto_pred=cytoplasm_pred,
+                    details=details, viz_dir=viz_dir,
+                    filename=f'epoch_{epoch_num:04d}_fullval.png')
+
+            del nucleus_pred, cytoplasm_pred, details
 
         # ============================================================
-        # INSTANCE METRICS
+        # АГРЕГАЦИЯ
         # ============================================================
 
-        taus = [
-            0.50,
-            0.55,
-            0.60,
-            0.65,
-            0.70,
-            0.75,
-            0.80,
-            0.85,
-            0.90,
-            0.95
-        ]
+        print(f'  Pair failure counts: {pair_failures}')
+        if monitoring_totals:
+            print(f'  Refinement monitoring: {monitoring_totals}')
+            for key, value in monitoring_totals.items():
+                name = 'fullval_' + key
+                history.setdefault(name, [None] * len(history.get('fullval_epoch', []))).append(value)
+        for key, value in pair_failures.items():
+            history.setdefault('fullval_' + key, []).append(value)
+        interior_jtpr = (interior['interior_joint_tp'] / interior['interior_total_pairs']
+                         if interior['interior_total_pairs'] else None)
+        jtpr_weight = float(getattr(config, 'checkpoint_w_jtpr', 0.7))
+        quality_gates, gate_stats = {}, {}
+        if config.refinement_stage_audit and written_quality:
+            from cytonucs_runtime import calibrate_quality_gates
+            quality_gates, gate_stats = calibrate_quality_gates(
+                written_quality, {h: cnt[h] for h in written_quality}, taus, total_pairs_total, jtpr_weight)
+        padded = dict(interior_jtpr=interior_jtpr, interior_total_pairs=interior['interior_total_pairs'])
+        for head in gate_stats:
+            padded[head + '_quality_gate'] = quality_gates[head]
+            padded[head + '_area_gate'] = gate_stats[head]['min_area']
+            for key in ('fp_removed', 'tp_removed', 'pairs_lost'):
+                padded[head + '_quality_gate_' + key] = gate_stats[head][key]
+            padded['ap_' + head + '_quality_gated'] = gate_stats[head]['ap']
+            print(f"  Quality gate {head}: {quality_gates[head]:.4f}, min area {gate_stats[head]['min_area']} "
+                  f"removes {gate_stats[head]['fp_removed']} FP, "
+                  f"{gate_stats[head]['tp_removed']} TP ({gate_stats[head]['pairs_lost']} pairs); "
+                  f"AP {gate_stats[head]['ap_ungated']:.4f} -> {gate_stats[head]['ap']:.4f}")
+            if edge_rows[head]['gt']:
+                from cytonucs_runtime import edge_fragment_ignored_ap
+                min_area = gate_stats[head]['min_area']
+                fragment = lambda info: bool(info and info[0] and info[1] < min_area)
+                edge = edge_fragment_ignored_ap(
+                    [(q, iou, area, fragment(info)) for q, iou, area, info in edge_rows[head]['masks']],
+                    [fragment(info) for info in edge_rows[head]['gt']], quality_gates[head], min_area, taus)
+                padded['ap_' + head + '_quality_gated_edge_ignored'] = edge['ap']
+                padded[head + '_recall50_quality_gated_edge_ignored'] = edge['recall50']
+                padded[head + '_edge_fragments_ignored'] = edge['ignored_gt']
+                print(f"  Without patch-edge fragments {head} (reporting only): {edge['ignored_gt']} GT and "
+                      f"{edge['ignored_masks']} masks ignored; AP after gates {edge['ap']:.4f}, "
+                      f"recall@0.5 {edge['recall50']:.4f}")
+            # Written every validation (None when nothing is matched): history keys stay aligned.
+            from cytonucs_runtime import boundary_error_ap
+            split = boundary_error_ap(boundary_rows[head], cnt[head], quality_gates[head],
+                                      gate_stats[head]['min_area'], taus) if boundary_rows[head] else {}
+            measured = bool(split.get('matched_masks'))
+            for part in ('z', 'xy', 'mixed'):
+                padded[f'ap_{head}_quality_gated_{part}_exact'] = split[f'ap_{part}_exact'] if measured else None
+                padded[f'{head}_{part}_error_voxel_share'] = split.get(f'{part}_error_voxel_share')
+            for key in ('z_extent_exact_fraction', 'z_extent_one_slice_fraction'):
+                padded[head + '_' + key] = split.get(key)
+            if measured:
+                print(f"  Boundary error {head} (reporting only, {split['matched_masks']} matched masks): "
+                      f"AP after gates {split['ap']:.4f}; with exact whole Z slices {split['ap_z_exact']:.4f}, "
+                      f"exact XY projection {split['ap_xy_exact']:.4f}, exact rims {split['ap_mixed_exact']:.4f}; "
+                      f"error voxels Z/XY/rims {split['z_error_voxel_share']:.3f}/{split['xy_error_voxel_share']:.3f}/"
+                      f"{split['mixed_error_voxel_share']:.3f}; slice set exact {split['z_extent_exact_fraction']:.3f}, "
+                      f"off by one slice {split['z_extent_one_slice_fraction']:.3f}")
+        for key, value in padded.items():
+            history.setdefault('fullval_' + key, [None] * len(history.get('fullval_epoch', []))).append(value)
 
-        stats_nucleus = matching_dataset(
-            y_true_nucleus,
-            y_pred_nucleus,
-            thresh=taus,
-            show_progress=False
-        )
+        def _agg(head):
+            tp = cnt[head]['tp'].astype(np.float64)
+            fp = cnt[head]['fp'].astype(np.float64)
+            fn = cnt[head]['fn'].astype(np.float64)
+            acc = tp / np.maximum(tp + fp + fn, 1.0)
+            s = SimpleNamespace(
+                tp=int(tp[0]), fp=int(fp[0]), fn=int(fn[0]),
+                precision=float(tp[0] / max(tp[0] + fp[0], 1.0)),
+                recall=float(tp[0] / max(tp[0] + fn[0], 1.0)))
+            return acc, s
 
-        stats_cytoplasm = matching_dataset(
-            y_true_cytoplasm,
-            y_pred_cytoplasm,
-            thresh=taus,
-            show_progress=False
-        )
+        acc_nucleus, s_n = _agg('nucleus')
+        acc_cytoplasm, s_c = _agg('cytoplasm')
 
-        acc_nucleus = np.asarray(
-            [
-                s.accuracy
-                for s in stats_nucleus
-            ],
-            dtype=np.float64
-        )
+        for head, stats in (('nucleus', s_n), ('cytoplasm', s_c)):
+            for key in ('tp', 'fp', 'fn', 'precision', 'recall'):
+                history.setdefault('fullval_' + head + '_' + key, []).append(getattr(stats, key))
+        ap_nucleus = float(np.mean(acc_nucleus))
+        ap_cytoplasm = float(np.mean(acc_cytoplasm))
+        ap50_nucleus = float(acc_nucleus[0])
+        ap50_cytoplasm = float(acc_cytoplasm[0])
+        # Stored with this epoch's checkpoints for the 'auto' inference settings.
+        if quality_gates:
+            self.model.pending_quality_gates = dict(epoch=epoch_num, **quality_gates)
+            if hasattr(self, 'trainer'):
+                sync_object_min_area(self.trainer.loss_fn, quality_gates)
 
-        acc_cytoplasm = np.asarray(
-            [
-                s.accuracy
-                for s in stats_cytoplasm
-            ],
-            dtype=np.float64
-        )
+        semantic_dice_nucleus = float(np.mean(semantic_nucleus))
+        semantic_dice_cytoplasm = float(np.mean(semantic_cytoplasm))
 
-        ap_nucleus = float(
-            np.mean(
-                acc_nucleus
-            )
-        )
-
-        ap_cytoplasm = float(
-            np.mean(
-                acc_cytoplasm
-            )
-        )
-
-        ap50_nucleus = float(
-            acc_nucleus[0]
-        )
-
-        ap50_cytoplasm = float(
-            acc_cytoplasm[0]
-        )
-
-        semantic_dice_nucleus = float(
-            np.mean(
-                semantic_nucleus
-            )
-        )
-
-        semantic_dice_cytoplasm = float(
-            np.mean(
-                semantic_cytoplasm
-            )
-        )
-
-        s_n = stats_nucleus[0]
-        s_c = stats_cytoplasm[0]
-
-        # ============================================================
-        # JTPR
-        # ============================================================
-
-        from cytonucs_inference import (
-            compute_jtpr
-        )
-
-        jtpr_values = []
-
-        joint_tp_total = 0
-        total_pairs_total = 0
-
-        for idx_img, (
-                nucleus_pred,
-                cytoplasm_pred,
-                nucleus_gt,
-                cytoplasm_gt
-        ) in enumerate(
-            zip(
-                y_pred_nucleus,
-                y_pred_cytoplasm,
-                y_true_nucleus,
-                y_true_cytoplasm
-            )
-        ):
-            assignments_pred = (
-                pred_assignments[idx_img]
-                if idx_img
-                   < len(pred_assignments)
-                else None
-            )
-
-            jtpr, jtpr_details = (
-                compute_jtpr(
-                    nucleus_pred=
-                    nucleus_pred,
-
-                    cytoplasm_pred=
-                    cytoplasm_pred,
-
-                    nucleus_gt=
-                    nucleus_gt,
-
-                    cytoplasm_gt=
-                    cytoplasm_gt,
-
-                    iou_thresh=0.5,
-
-                    assignments_pred=(
-                        assignments_pred
-                        if assignments_pred
-                        else None
-                    )
-                )
-            )
-
-            jtpr_values.append(
-                float(jtpr)
-            )
-
-            joint_tp_total += int(
-                jtpr_details[
-                    'joint_tp'
-                ]
-            )
-
-            total_pairs_total += int(
-                jtpr_details[
-                    'total_pairs'
-                ]
-            )
-
-        jtpr_mean = (
-            float(
-                np.mean(
-                    jtpr_values
-                )
-            )
-            if jtpr_values
-            else 0.0
-        )
-
-        jtpr_global = (
-            float(
-                joint_tp_total
-                / total_pairs_total
-            )
-            if total_pairs_total > 0
-            else 0.0
-        )
+        jtpr_mean = float(np.mean(jtpr_values)) if jtpr_values else 0.0
+        jtpr_global = (float(joint_tp_total / total_pairs_total)
+                       if total_pairs_total > 0 else 0.0)
 
         # ============================================================
         # CHECKPOINT METRIC
@@ -1222,19 +1395,28 @@ class DiceCallback:
         # AP/accuracy учитывает:
         # TP, FP и FN.
         # ============================================================
-
+        _w_jtpr = float(getattr(self.model.config, 'checkpoint_w_jtpr', 0.7))
         current_metric = float(
-            0.5
-            * (
-                    ap_nucleus
-                    + ap_cytoplasm
-            )
+            _w_jtpr * jtpr_global
+            + (1.0 - _w_jtpr) * 0.5 * (ap_nucleus + ap_cytoplasm)
         )
-
+        # Full validation runs without the gates so they can be calibrated, but inference
+        # applies them (mask_quality_min='auto'): select checkpoints by the gated result.
+        selection_metric = current_metric
+        if config.mask_quality_min == 'auto' and gate_stats:
+            from cytonucs_runtime import deployed_metric
+            selection_metric = float(deployed_metric(
+                jtpr_global, total_pairs_total,
+                {h: gate_stats[h]['ap'] if h in gate_stats else ap
+                 for h, ap in (('nucleus', ap_nucleus), ('cytoplasm', ap_cytoplasm))},
+                {h: gate_stats[h]['pairs_lost'] for h in gate_stats}, _w_jtpr))
         print(
             "\n  FULL-VOLUME METRICS"
         )
-
+        print(
+            f"  GT объектов: nuc={s_n.tp + s_n.fn} cyto={s_c.tp + s_c.fn} | "
+            f"ступенька accuracy ~1/{max(1, s_n.tp + s_n.fp + s_n.fn)}"
+        )
         print(
             f"  Nucleus   | "
             f"semantic Dice="
@@ -1264,11 +1446,16 @@ class DiceCallback:
             f"({joint_tp_total}/"
             f"{total_pairs_total})"
         )
+        # Diagnostic only: pairs whose GT nucleus and cell do not touch XY volume faces.
+        print(f"  JTPR interior (no XY-face GT) | "
+              f"{interior['interior_joint_tp']}/{interior['interior_total_pairs']}")
 
         print(
             f"  CHECKPOINT METRIC "
             f"(mean AP heads) = "
-            f"{current_metric:.4f}"
+            f"{current_metric:.4f} without gates"
+            + (f", {selection_metric:.4f} after quality/size gates (used for best)"
+               if selection_metric != current_metric else "")
         )
 
         # ============================================================
@@ -1337,6 +1524,10 @@ class DiceCallback:
         ).append(
             current_metric
         )
+        history.setdefault('fullval_metric_deployed', []).append(selection_metric)
+        history.setdefault('fullval_total_pairs', []).append(int(total_pairs_total))
+
+        align_fullval_history(history, fullval_lengths)
 
         # ============================================================
         # COMET
@@ -1368,6 +1559,9 @@ class DiceCallback:
 
                     'fullval_metric':
                         current_metric,
+
+                    'fullval_metric_deployed':
+                        selection_metric,
                 },
                 epoch=epoch_num
             )
@@ -1378,11 +1572,11 @@ class DiceCallback:
 
         if (
                 self.save_best
-                and current_metric
+                and selection_metric
                 > self.best_metric
         ):
             self.best_metric = (
-                current_metric
+                selection_metric
             )
 
             # Главный production checkpoint.
@@ -1394,18 +1588,24 @@ class DiceCallback:
                     / 'weights_best.weights.h5'
             )
 
-            self.model.save_weights(
-                save_path
-            )
+            if hasattr(self, 'trainer'):
+                self.trainer.state_best_full.assign(selection_metric)
+                self.trainer.save_checkpoint(save_path)
+            else:
+                self.model.save_weights(save_path)
 
             best_info = {
                 'epoch':
                     epoch_num,
 
                 'metric_name':
-                    'mean_fullval_ap',
+                    f'{_w_jtpr:g}_jtpr_plus_{1-_w_jtpr:g}_mean_ap'
+                    + ('_after_quality_gates' if selection_metric != current_metric else ''),
 
                 'metric':
+                    selection_metric,
+
+                'metric_without_gates':
                     current_metric,
 
                 'ap_nucleus':
@@ -1437,6 +1637,9 @@ class DiceCallback:
 
                 'nms_thresh':
                     nms_thresh,
+
+                'quality_gates':
+                    quality_gates,
             }
 
             best_info_path = (
@@ -1459,7 +1662,7 @@ class DiceCallback:
 
             print(
                 f"  ✅ New best FULL-VOLUME model: "
-                f"{current_metric:.4f}"
+                f"{selection_metric:.4f}"
             )
 
             print(
@@ -1524,13 +1727,11 @@ class DiceCallback:
             img_display = (img_display - p_lo) / (p_hi - p_lo + 1e-8)
             img_display = np.clip(img_display, 0, 1)
             img_gray = cv2.cvtColor((img_display * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
-            is_rgb = True
         else:
             img_gray = img.astype(np.float32)
             # Normalize grayscale to [0, 1]
             img_display = (img_gray - img_gray.min()) / (img_gray.max() - img_gray.min() + 1e-8)
             img_display = np.clip(img_display, 0, 1)
-            is_rgb = False
 
         # ============================================================
         # СОЗДАЁМ КОНТРАСТНУЮ COLORMAP
@@ -1595,8 +1796,8 @@ class DiceCallback:
         # 2. Nucleus GT
         axes[0, 1].imshow(img, cmap='gray', alpha=0.3)
         if nuc_gt.max() > 0:
-            mask = axes[0, 1].imshow(nuc_gt, cmap=cmap_contrast, interpolation='nearest',
-                                     vmin=0, vmax=n_colors - 1, alpha=0.8)
+            axes[0, 1].imshow(nuc_gt, cmap=cmap_contrast, interpolation='nearest',
+                              vmin=0, vmax=n_colors - 1, alpha=0.8)
             # Границы белым
             boundaries = find_boundaries(nuc_gt, mode='thick')
             axes[0, 1].contour(boundaries, colors='white', linewidths=1.5, levels=[0.5])
