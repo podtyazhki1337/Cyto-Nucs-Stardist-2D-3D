@@ -23,7 +23,7 @@ class CytoNucsConfig:
     # Public fixes_v1 settings: canonical JSON section and effective default.
     # Keep config_cytonucs.json and the loader regression test in sync.
     FIXES_SETTINGS = {
-        'evaluation': dict(refinement_stage_audit=False),
+        'evaluation': dict(refinement_stage_audit=False, fullval_train_volumes=0),
         'model': dict(unet_pool_schedule=None, unet_kernel_schedule=None,
                       refinement_depth=0, refinement_gradient_scale=0.0, mask_quality_head=False,
                       mask_quality_pooling='global', refinement_pool='isotropic',
@@ -32,7 +32,8 @@ class CytoNucsConfig:
                          log_every_steps=20, prefetch_workers=3, prefetch_depth=3,
                          predicted_prompt_fraction=0.0, predicted_prompt_start_epoch=10,
                          detector_prompt_slots=0, cell_predicted_nucleus_fraction=0.0,
-                         predicted_prompt_sample_peaks=False, reset_best_on_resume=False),
+                         predicted_prompt_sample_peaks=False, reset_best_on_resume=False,
+                         dist_target_stride=None),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25,
@@ -296,7 +297,7 @@ class CytoNucsConfig:
         return float(self.mask_thresh if value is None else value)
 
     def _validate_runtime_settings(self):
-        for key in ('detector_prompt_slots', 'cell_roi_expansion_steps'):
+        for key in ('detector_prompt_slots', 'cell_roi_expansion_steps', 'fullval_train_volumes'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f'{key} must be a nonnegative integer')
@@ -368,6 +369,16 @@ class CytoNucsConfig:
             raise ValueError('proposal_mode must be stardist or peaks')
         if self.proposal_mode == 'peaks' and self.refinement_mode != 'mask':
             raise ValueError('peak proposals require refinement_mode=mask')
+        stride = self.dist_target_stride
+        if stride is not None:
+            if (not isinstance(stride, (list, tuple)) or len(stride) != self.ndim or
+                    any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in stride)):
+                raise ValueError('dist_target_stride must be null or one positive integer per axis')
+            for head in ('nucleus', 'cytoplasm'):
+                if any((p // g) % s for p, g, s in zip(self.train_patch_size, getattr(self, head + '_grid'), stride)):
+                    raise ValueError('train patch on the head grid must be divisible by dist_target_stride')
+            if self.w_center_separation:
+                raise ValueError('dist_target_stride requires w_center_separation=0 (it reads ray targets on the head grid)')
         if self.refinement_patch_size is not None:
             if len(self.refinement_patch_size) != self.ndim or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in self.refinement_patch_size):
                 raise ValueError('refinement_patch_size: one nonnegative integer per axis; 0 means full axis')

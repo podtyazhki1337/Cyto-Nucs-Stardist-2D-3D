@@ -972,7 +972,10 @@ def main(config_path='config_cytonucs.json'):
             ].get(
                 'nms_thresh',
                 0.3
-            )
+            ),
+
+            train_generator=
+            train_generator
         )
 
         dice_callback.trainer = trainer

@@ -138,7 +138,7 @@ class ConfigTests(unittest.TestCase):
         for path in ROOT.glob('config_cytonucs*.json'):
             raw = json.loads(path.read_text())
             self.assertEqual(raw['loss_params']['semantic_foreground_weight'],
-                             1. if path.name in ('config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json') else 0., path.name)
+                             1. if path.name in ('config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json') else 0., path.name)
         self.assertEqual(CytoNucsConfig.FIXES_SETTINGS['loss_params']['semantic_foreground_weight'], 0.)
         raw = json.loads((ROOT / 'config_cytonucs_v3_1.json').read_text())
         v3 = json.loads((ROOT / 'config_cytonucs_v3.json').read_text())

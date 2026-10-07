@@ -240,6 +240,78 @@ def calibrate_mask_thresholds(predictor, samples):
     return chosen, stats
 
 
+def source_volume(filename):
+    """Source volume of a patch file: its name without the '_zNNN_yNNNN_xNNNN_aNN' patch suffix."""
+    import re
+    return re.sub(r'_z\d+_y\d+_x\d+_a\d+$', '', Path(str(filename)).stem)
+
+
+def without_xy_face_objects(gt, pred):
+    """Labels restricted to whole objects: GT objects touching an XY face of the tile are removed, and so
+    is every predicted object whose best GT (highest IoU) is one of them. As in edge_fragment_ignored_ap,
+    such a mask is neither TP nor FP; masks without any GT overlap stay and count as FP."""
+    gt, pred = np.asarray(gt).astype(np.int64), np.asarray(pred).astype(np.int64)
+    face = np.zeros(gt.shape, bool)
+    face[..., 0, :] = face[..., -1, :] = face[..., :, 0] = face[..., :, -1] = True
+    cut = np.setdiff1d(np.unique(gt[face]), [0])
+    both = (gt > 0) & (pred > 0)
+    drop = np.zeros(0, np.int64)
+    if both.any():
+        width = int(gt.max()) + 1
+        keys, intersection = np.unique(pred[both] * width + gt[both], return_counts=True)
+        p, g = keys // width, keys % width
+        iou = intersection / (np.bincount(pred.ravel())[p] + np.bincount(gt.ravel())[g] - intersection)
+        order = np.lexsort((iou, p))                               # the last row of every mask is its best GT
+        best = np.r_[p[order][1:] != p[order][:-1], True]
+        drop = p[order][best][np.isin(g[order][best], cut)]
+    return np.where(np.isin(gt, cut), 0, gt), np.where(np.isin(pred, drop), 0, pred)
+
+
+def deployed_tile_metrics(predictor, samples, taus):
+    """AP and JTPR of what inference outputs (the predictor's gates and mask thresholds) on full tiles.
+
+    'ap_<head>' counts every object; 'ap_<head>_whole' leaves out the objects cut by an XY face of the
+    tile (without_xy_face_objects). 'by_volume' repeats the numbers per source volume of the tiles.
+    samples: dicts with normalized 'image', the two masks, 'assignments' and 'filename'.
+    """
+    from types import SimpleNamespace
+    from stardist.matching import matching
+    from cytonucs_inference import compute_jtpr
+    from cytonucs_runtime import accuracy_profile
+    runner = SimpleNamespace(model=predictor.model)
+
+    def empty():
+        return dict(counts={(head, part): np.zeros((3, len(taus)), np.int64)
+                            for head in ('nucleus', 'cytoplasm') for part in ('', '_whole')}, joint=[0, 0], volumes=0)
+
+    def summary(scope):
+        result = dict(volumes=scope['volumes'], jtpr=scope['joint'][0] / scope['joint'][1] if scope['joint'][1] else 0.0)
+        for (head, part), c in scope['counts'].items():
+            accuracy = accuracy_profile(*c)
+            result[f'ap_{head}{part}'] = float(accuracy.mean())
+            result[f'ap50_{head}{part}'] = float(accuracy[0])
+        return result
+
+    total, by_volume = empty(), {}
+    for sample in samples:
+        scopes = (total, by_volume.setdefault(source_volume(sample.get('filename', 'volume')), empty()))
+        nuclei, cells, _ = DiceCallback._predict_full_volume(runner, predictor, np.asarray(sample['image'], np.float32))
+        gt = dict(nucleus=np.asarray(sample['nucleus_mask']), cytoplasm=np.asarray(sample['cytoplasm_mask']))
+        _, joint = compute_jtpr(nuclei, cells, gt['nucleus'], gt['cytoplasm'], iou_thresh=0.5,
+                                assignments_pred=getattr(predictor, '_prompt_assignments', None),
+                                assignments_gt=sample.get('assignments'))
+        for scope in scopes:
+            scope['volumes'] += 1
+            scope['joint'][0] += int(joint['joint_tp']); scope['joint'][1] += int(joint['total_pairs'])
+        for head, pred in (('nucleus', nuclei), ('cytoplasm', cells)):
+            for part, (g, p) in (('', (gt[head], pred)), ('_whole', without_xy_face_objects(gt[head], pred))):
+                result = matching(g, p, thresh=taus, criterion='iou')
+                for k, r in enumerate(result if isinstance(result, (list, tuple)) else [result]):
+                    for scope in scopes:
+                        scope['counts'][head, part][:, k] += (int(r.tp), int(r.fp), int(r.fn))
+    return dict(summary(total), by_volume={name: summary(scope) for name, scope in sorted(by_volume.items())})
+
+
 class CytoNucsTrainer:
     """
     Custom trainer for CytoNucs StarDist model.
@@ -788,7 +860,8 @@ class DiceCallback:
             experiment=None,
             prob_thresh_nucleus=None,
             prob_thresh_cytoplasm=None,
-            nms_thresh=None
+            nms_thresh=None,
+            train_generator=None
     ):
         """
         Full-volume quality validation.
@@ -811,6 +884,8 @@ class DiceCallback:
 
         self.model = model
         self.val_generator = val_generator
+        # Source of the training volumes for evaluation.fullval_train_volumes (train-side AP).
+        self.train_generator = train_generator
 
         self.eval_every = int(
             eval_every
@@ -877,6 +952,52 @@ class DiceCallback:
             ).sum()
             / denom
         )
+
+    def _train_volumes(self):
+        """Fixed training volumes for the train-side metric: originals only (not the offline-augmented
+        '_aNN' copies), taken in turn from every source volume, the tiles with most objects first and
+        without spatial overlap inside a source volume while such tiles remain."""
+        import re
+        count = int(getattr(self.model.config, 'fullval_train_volumes', 0))
+        pool = getattr(self.train_generator, 'data_pool', None) if count else None
+        if not pool:
+            return []
+        key = tuple(sorted(s['filename'] for s in pool))
+        if getattr(self, '_train_volume_cache', (None, None, None))[:2] == (key, count):
+            return self._train_volume_cache[2]
+        pool = sorted(pool, key=lambda s: s['filename'])
+        originals = [s for s in pool if Path(s['filename']).stem.endswith('_a00')] or pool
+
+        def objects(sample):
+            return sum(int(np.count_nonzero(np.unique(sample[m]))) for m in ('nucleus_mask', 'cytoplasm_mask') if m in sample)
+
+        def box(sample):
+            found = re.search(r'_z(\d+)_y(\d+)_x(\d+)_a\d+$', Path(sample['filename']).stem)
+            shape = np.shape(sample['nucleus_mask']) if 'nucleus_mask' in sample else ()
+            if found is None or len(shape) != 3:
+                return None
+            start = np.array([int(v) for v in found.groups()])
+            return start, start + np.array(shape)
+
+        groups = {}
+        for sample in originals:
+            groups.setdefault(source_volume(sample['filename']), []).append(sample)
+        queues = [sorted(group, key=lambda s: (-objects(s), s['filename'])) for group in groups.values()]
+        queues.sort(key=lambda q: (-sum(objects(s) for s in q), q[0]['filename']))     # richest source volume first
+        taken = [[] for _ in queues]
+        picks = []
+        while len(picks) < count and any(queues):
+            for queue, boxes in zip(queues, taken):
+                if not queue or len(picks) >= count:
+                    continue
+                apart = lambda s: box(s) is None or all(np.any(box(s)[0] >= hi) or np.any(box(s)[1] <= lo) for lo, hi in boxes)
+                index = next((i for i, s in enumerate(queue) if apart(s)), 0)
+                sample = queue.pop(index)
+                if box(sample) is not None:
+                    boxes.append(box(sample))
+                picks.append(sample)
+        self._train_volume_cache = (key, count, picks)
+        return picks
 
     def _predict_full_volume(
             self,
@@ -1137,6 +1258,8 @@ class DiceCallback:
 
         cnt = {h: {k: np.zeros(len(taus), np.int64) for k in ('tp', 'fp', 'fn')}
                for h in ('nucleus', 'cytoplasm')}
+        # The same counts, written masks and pairs per source volume (reported next to the totals).
+        volume_stats = {}
 
         semantic_nucleus = []
         semantic_cytoplasm = []
@@ -1184,6 +1307,10 @@ class DiceCallback:
             nucleus_gt = np.asarray(sample['nucleus_mask'])
             cytoplasm_gt = np.asarray(sample['cytoplasm_mask'])
             filename = sample.get('filename', f'val_{i:03d}')
+            per_volume = volume_stats.setdefault(source_volume(filename), dict(
+                volumes=0, joint=[0, 0], rows={h: [] for h in cnt},
+                cnt={h: {k: np.zeros(len(taus), np.int64) for k in ('tp', 'fp', 'fn')} for h in cnt}))
+            per_volume['volumes'] += 1
 
             from cytonucs_refinement_audit import RefinementStageAudit
             audits = ({'nucleus': RefinementStageAudit(nucleus_gt),
@@ -1219,6 +1346,8 @@ class DiceCallback:
                     cnt[head]['tp'][k] += int(r.tp)
                     cnt[head]['fp'][k] += int(r.fp)
                     cnt[head]['fn'][k] += int(r.fn)
+                    for key, value in (('tp', r.tp), ('fp', r.fp), ('fn', r.fn)):
+                        per_volume['cnt'][head][key][k] += int(value)
 
             jtpr, jtpr_details = compute_jtpr(
                 nucleus_pred=nucleus_pred,
@@ -1231,6 +1360,7 @@ class DiceCallback:
             joint_pairs = jtpr_details.pop('joint_pairs')
             jtpr_values.append(float(jtpr))
             joint_tp_total += int(jtpr_details['joint_tp'])
+            per_volume['joint'][0] += int(jtpr_details['joint_tp']); per_volume['joint'][1] += int(jtpr_details['total_pairs'])
             total_pairs_total += int(jtpr_details['total_pairs'])
             for key in pair_failures:
                 pair_failures[key] += int(jtpr_details[key])
@@ -1267,6 +1397,7 @@ class DiceCallback:
                                                              edge_gt.get(str(gt_id))))
                             boundary_rows[head].append((d['quality'], iou, d.get('connected_voxels', d['area']),
                                                         d.get('boundary')))
+                            per_volume['rows'][head].append((d['quality'], iou, d.get('connected_voxels', d['area']), None))
             with diagnostic_path.open('a', encoding='utf-8') as diagnostic_file:
                 json.dump(dict(epoch=epoch_num, filename=filename,
                     refinement=getattr(self.model, 'last_refinement_diagnostics', None),
@@ -1307,6 +1438,41 @@ class DiceCallback:
             quality_gates, gate_stats = calibrate_quality_gates(
                 written_quality, {h: cnt[h] for h in written_quality}, taus, total_pairs_total, jtpr_weight)
         padded = dict(interior_jtpr=interior_jtpr, interior_total_pairs=interior['interior_total_pairs'])
+        if len(volume_stats) > 1:
+            from cytonucs_runtime import accuracy_profile, boundary_error_ap
+            by_volume = {}
+            for name, s in sorted(volume_stats.items()):
+                row = dict(volumes=s['volumes'], jtpr=s['joint'][0] / s['joint'][1] if s['joint'][1] else 0.0)
+                for head in cnt:
+                    c = s['cnt'][head]
+                    row['ap_' + head] = float(accuracy_profile(c['tp'], c['fp'], c['fn']).mean())
+                    if head in gate_stats:      # AP after this validation's gates, as for the totals
+                        row['ap_' + head + '_quality_gated'] = boundary_error_ap(
+                            s['rows'][head], c, quality_gates[head], gate_stats[head]['min_area'], taus)['ap']
+                by_volume[name] = row
+                gated = [row.get(f'ap_{h}_quality_gated', row[f'ap_{h}']) for h in ('nucleus', 'cytoplasm')]
+                print(f"  By source volume | {name}: {s['volumes']} tile(s), AP {'after gates ' if gate_stats else ''}"
+                      f"nucleus {gated[0]:.4f} cytoplasm {gated[1]:.4f}, JTPR {row['jtpr']:.4f}")
+            padded['by_volume'] = by_volume
+        train_samples = self._train_volumes()
+        if train_samples:
+            # The same deployed pipeline on volumes the network trains on: how well it fits them.
+            train_predictor = CytoNucsPredictor(model=self.model, config=config,
+                                                prob_thresh_nucleus=prob_thresh_nucleus,
+                                                prob_thresh_cytoplasm=prob_thresh_cytoplasm, nms_thresh=nms_thresh)
+            if config.mask_quality_min == 'auto':
+                train_predictor.quality_gates = quality_gates or None
+            train_metrics = deployed_tile_metrics(train_predictor, train_samples, taus)
+            padded.update({'train_' + key: value for key, value in train_metrics.items()})
+            if len(train_metrics['by_volume']) > 1:
+                for name, row in train_metrics['by_volume'].items():
+                    print(f"  Train volumes by source | {name}: {row['volumes']} tile(s), AP nucleus {row['ap_nucleus']:.4f} "
+                          f"cytoplasm {row['ap_cytoplasm']:.4f}, whole objects {row['ap_nucleus_whole']:.4f} / "
+                          f"{row['ap_cytoplasm_whole']:.4f}, JTPR {row['jtpr']:.4f}")
+            print(f"  TRAIN VOLUMES ({train_metrics['volumes']}, after gates) | "
+                  f"AP nucleus {train_metrics['ap_nucleus']:.4f} (whole objects {train_metrics['ap_nucleus_whole']:.4f}) | "
+                  f"AP cytoplasm {train_metrics['ap_cytoplasm']:.4f} (whole objects {train_metrics['ap_cytoplasm_whole']:.4f}) | "
+                  f"JTPR {train_metrics['jtpr']:.4f}")
         for head in gate_stats:
             padded[head + '_quality_gate'] = quality_gates[head]
             padded[head + '_area_gate'] = gate_stats[head]['min_area']
@@ -1330,6 +1496,17 @@ class DiceCallback:
                 print(f"  Without patch-edge fragments {head} (reporting only): {edge['ignored_gt']} GT and "
                       f"{edge['ignored_masks']} masks ignored; AP after gates {edge['ap']:.4f}, "
                       f"recall@0.5 {edge['recall50']:.4f}")
+                # Whole objects only: every GT cut by an XY face of its tile is an ignore region, whatever
+                # its size (the counterpart of fullval_train_ap_<head>_whole on the validation volumes).
+                cut = lambda info: bool(info and info[0])
+                whole = edge_fragment_ignored_ap(
+                    [(q, iou, area, cut(info)) for q, iou, area, info in edge_rows[head]['masks']],
+                    [cut(info) for info in edge_rows[head]['gt']], quality_gates[head], min_area, taus)
+                padded['ap_' + head + '_quality_gated_whole'] = whole['ap']
+                padded[head + '_recall50_quality_gated_whole'] = whole['recall50']
+                print(f"  Whole objects {head} (reporting only): {whole['ignored_gt']} cut GT and "
+                      f"{whole['ignored_masks']} masks ignored; AP after gates {whole['ap']:.4f}, "
+                      f"recall@0.5 {whole['recall50']:.4f}")
             # Written every validation (None when nothing is matched): history keys stay aligned.
             from cytonucs_runtime import boundary_error_ap
             split = boundary_error_ap(boundary_rows[head], cnt[head], quality_gates[head],

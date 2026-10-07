@@ -120,6 +120,7 @@ class ConfigContractTests(unittest.TestCase):
                 elif key=='unet_pool_schedule': value=[[1,2,2],[2,2,2],[2,2,2],[1,2,2]]
                 elif key=='unet_kernel_schedule': value=[[1,3,3]]*5
                 elif key=='refinement_patch_size': value=[0,448,448]
+                elif key=='dist_target_stride': value=[1,2,2]
                 elif isinstance(default,bool): value=not default
                 elif key=='tiling_fixed_axes': value=[0]
                 elif key in ('mask_thresh_nucleus','mask_thresh_cytoplasm'): value=.63
@@ -130,6 +131,7 @@ class ConfigContractTests(unittest.TestCase):
                 else: value=.17
                 requested[section][key]=value
         requested['training']['gradient_clip_norm']=7.
+        requested['loss_params']['w_center_separation']=0.   # required by dist_target_stride
         cfg=self.load(requested)
         for section,settings in CytoNucsConfig.FIXES_SETTINGS.items():
             for key in settings: self.assertEqual(getattr(cfg,key),requested[section][key],key)

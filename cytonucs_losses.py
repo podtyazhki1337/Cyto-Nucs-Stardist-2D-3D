@@ -559,6 +559,10 @@ class CytoNucsLoss:
         dist_scale = tf.cast(max(dist_scale, 1.0), tf.float32)
 
         dist_mask = tf.cast(prob_true, tf.float32)
+        stride = getattr(self.config, 'dist_target_stride', None)
+        if stride is not None:
+            dist_pred = self._subsample(dist_pred, tuple(int(s) for s in stride))
+            dist_mask = self._subsample(dist_mask, tuple(int(s) for s in stride))
 
         dist_diff = tf.cast(dist_true, tf.float32) - tf.cast(dist_pred, tf.float32)
 
@@ -1129,10 +1133,14 @@ def compute_stardist_gt(instances, config, grid, rays=None, aniso=None, normaliz
 
     lbl = fill_label_holes(np.asarray(instances).astype(np.int32))
 
+    # Ray targets dominate the CPU cost of a batch; dist_target_stride computes them on every
+    # stride-th node of the head grid (the loss reads the prediction at the same nodes).
+    stride = getattr(config, 'dist_target_stride', None) or (1,) * ndim
+    dist_grid = tuple(g * int(s) for g, s in zip(grid, stride))
     if ndim == 3:
-        dist = star_dist3D(lbl, rays, mode='cpp', grid=grid)
+        dist = star_dist3D(lbl, rays, mode='cpp', grid=dist_grid)
     else:
-        dist = star_dist(lbl, config.n_rays, mode='cpp', grid=grid)
+        dist = star_dist(lbl, config.n_rays, mode='cpp', grid=dist_grid)
     dist = np.clip(dist, 1e-3, max_clip).astype(np.float16)
 
     ss = tuple(slice(None, None, g) for g in grid)
