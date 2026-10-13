@@ -27,13 +27,13 @@ class CytoNucsConfig:
         'model': dict(unet_pool_schedule=None, unet_kernel_schedule=None,
                       refinement_depth=0, refinement_gradient_scale=0.0, mask_quality_head=False,
                       mask_quality_pooling='global', refinement_pool='isotropic',
-                      refinement_full_resolution=False),
+                      refinement_full_resolution=False, unet_norm_groups=0),
         'training': dict(seed=42, image_batch_size=1, prompts_per_crop=None, nucleus_prob_grid_normalize=False,
                          log_every_steps=20, prefetch_workers=3, prefetch_depth=3,
                          predicted_prompt_fraction=0.0, predicted_prompt_start_epoch=10,
                          detector_prompt_slots=0, cell_predicted_nucleus_fraction=0.0,
                          predicted_prompt_sample_peaks=False, reset_best_on_resume=False,
-                         dist_target_stride=None),
+                         dist_target_stride=None, tile_sampling_by_objects=0.0, train_region_crops=False),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25,
@@ -297,7 +297,7 @@ class CytoNucsConfig:
         return float(self.mask_thresh if value is None else value)
 
     def _validate_runtime_settings(self):
-        for key in ('detector_prompt_slots', 'cell_roi_expansion_steps', 'fullval_train_volumes'):
+        for key in ('detector_prompt_slots', 'cell_roi_expansion_steps', 'fullval_train_volumes', 'unet_norm_groups'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f'{key} must be a nonnegative integer')
@@ -331,7 +331,7 @@ class CytoNucsConfig:
         for key in ('predicted_prompt_sample_peaks', 'reset_best_on_resume',
                     'mask_quality_use_scores', 'prompt_inside_target', 'mask_ce_class_balance', 'refinement_stage_audit', 'nucleus_prob_grid_normalize',
                     'residual_proposals', 'object_losses_include_crop_cut', 'refinement_roi_snap',
-                    'object_losses_min_area_from_gate', 'refinement_full_resolution'):
+                    'object_losses_min_area_from_gate', 'refinement_full_resolution', 'train_region_crops'):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(f'{key} must be boolean')
         # Residual prompts are added after the first object assembly into free voxels only.
@@ -369,6 +369,8 @@ class CytoNucsConfig:
             raise ValueError('proposal_mode must be stardist or peaks')
         if self.proposal_mode == 'peaks' and self.refinement_mode != 'mask':
             raise ValueError('peak proposals require refinement_mode=mask')
+        if self.unet_norm_groups and int(getattr(self, 'unet_n_filter_base', 32)) % self.unet_norm_groups:
+            raise ValueError('unet_n_filter_base must be divisible by unet_norm_groups')
         stride = self.dist_target_stride
         if stride is not None:
             if (not isinstance(stride, (list, tuple)) or len(stride) != self.ndim or
@@ -401,7 +403,8 @@ class CytoNucsConfig:
                     'pair_min_mask_iou', 'cyto_center_prompt_prob', 'negative_prompt_prob',
                     'mask_ce_empty_weight', 'mask_thresh_nucleus', 'mask_thresh_cytoplasm',
                     'refinement_gradient_scale', 'repeat_cell_prompt_prob', 'neighbor_cell_prompt_prob', 'cell_z_pair_prob', 'nucleus_z_pair_prob', 'mask_containment_threshold', 'predicted_prompt_fraction',
-                    'mask_overlap_nucleus', 'mask_overlap_cytoplasm', 'mask_min_remaining_fraction'):
+                    'mask_overlap_nucleus', 'mask_overlap_cytoplasm', 'mask_min_remaining_fraction',
+                    'tile_sampling_by_objects'):
             value = getattr(self, key)
             if key.startswith('mask_thresh_') and (value is None or value == 'auto'):
                 continue

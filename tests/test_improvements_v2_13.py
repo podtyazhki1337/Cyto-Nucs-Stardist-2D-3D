@@ -121,7 +121,7 @@ class DeclaredDefaultsTests(unittest.TestCase):
             raw = json.loads(path.read_text())
             self.assertEqual((raw['inference']['nms_candidate_spacing'], raw['inference']['nms_border_exclude_xy']),
                              (0.12, 2), path.name)
-            self.assertEqual(raw['model']['refinement_pool'], 'auto' if path.name in ('config_cytonucs_v2_13.json', 'config_cytonucs_v2_14.json', 'config_cytonucs_v2_15.json', 'config_cytonucs_v2_16.json', 'config_cytonucs_v2_17.json', 'config_cytonucs_v3.json', 'config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json') else 'isotropic')
+            self.assertEqual(raw['model']['refinement_pool'], 'auto' if path.name in ('config_cytonucs_v2_13.json', 'config_cytonucs_v2_14.json', 'config_cytonucs_v2_15.json', 'config_cytonucs_v2_16.json', 'config_cytonucs_v2_17.json', 'config_cytonucs_v3.json', 'config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json', 'config_cytonucs_v3_4.json', 'config_cytonucs_v4.json') else 'isotropic')
 
 
 if __name__ == '__main__':

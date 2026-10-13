@@ -105,7 +105,8 @@
     "mask_quality_head": true,
     "mask_quality_pooling": "mask",
     "refinement_pool": "isotropic",
-    "refinement_full_resolution": false
+    "refinement_full_resolution": false,
+    "unet_norm_groups": 0
   },
   "training": {
     "train_patch_size": [
@@ -137,7 +138,9 @@
     "nucleus_prob_grid_normalize": false,
     "detector_prompt_slots": 0,
     "cell_predicted_nucleus_fraction": 0.0,
-    "dist_target_stride": null
+    "dist_target_stride": null,
+    "tile_sampling_by_objects": 0.0,
+    "train_region_crops": false
   },
   "inference": {
     "checkpoint_path": "models/cytonucs_emese_HK_3_training_v2_4/weights_best.weights.h5",

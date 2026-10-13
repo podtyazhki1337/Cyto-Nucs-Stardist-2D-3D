@@ -78,6 +78,28 @@ def partial_labels(crop, reference):
     return {k for k, n in label_counts(crop).items() if k and n < reference.get(k, n)}
 
 
+def window_sum_table(region):
+    """Summed-area table of a boolean YX region, one row and column of zeros in front."""
+    return np.pad(np.cumsum(np.cumsum(region, 0, dtype=np.int64), 1), ((1, 0), (1, 0)))
+
+
+def window_inside(table, start, size):
+    """Whether the YX window lies entirely inside the region of window_sum_table."""
+    (y, x), (h, w) = start, size
+    if y < 0 or x < 0 or y + h >= table.shape[0] or x + w >= table.shape[1]:
+        return False
+    return int(table[y + h, x + w] - table[y, x + w] - table[y + h, x] + table[y, x]) == h * w
+
+
+def allowed_crop_starts(region, size):
+    """allowed[y, x]: the size window starting at (y, x) lies entirely inside the boolean YX region."""
+    h, w = size
+    if h > region.shape[0] or w > region.shape[1]:
+        return np.zeros((0, 0), bool)
+    t = window_sum_table(region)
+    return t[h:, w:] - t[:-h, w:] - t[h:, :-w] + t[:-h, :-w] == h * w
+
+
 class CytoNucsDataGenerator(Sequence):
     """
     Data generator for CytoNucs StarDist training.
@@ -205,6 +227,10 @@ class CytoNucsDataGenerator(Sequence):
         # Initial pool
         self.repool(seed=0)
 
+        self.region_pool = None
+        if subset == 'train' and getattr(config, 'train_region_crops', False):
+            self._load_regions()
+
         self.indices = np.arange(len(self.data_pool))
         self.on_epoch_end()
 
@@ -279,12 +305,117 @@ class CytoNucsDataGenerator(Sequence):
                 'cytoplasm_mask': cytoplasm_mask,
                 'fg_coords': fg_coords,
                 'assignments': assignments,
-                'filename': self.image_files[idx].name
+                'filename': self.image_files[idx].name,
+                'object_count': int(np.count_nonzero(np.unique(nucleus_mask))) +
+                                int(np.count_nonzero(np.unique(cytoplasm_mask)))
             })
 
         print(f'  Loaded {len(self.data_pool)} samples into pool '
               f'(нормализовано и проиндексировано один раз)')
         self._pool_seed = seed
+        counts = np.array([s['object_count'] for s in self.data_pool], np.float64)
+        self._tile_weights = counts / counts.sum() if counts.sum() > 0 else None
+
+    def _pick_tile(self, rng):
+        """Pool tile of one training crop: uniform, or with probability
+        training.tile_sampling_by_objects in proportion to the objects it holds.
+
+        A crop covers most of a tile, so the tile decides what a step sees. With uniform tiles
+        the few dense ones, which hold most objects, get as many steps as nearly empty ones.
+        """
+        share = float(getattr(self.config, 'tile_sampling_by_objects', 0.0))
+        weights = getattr(self, '_tile_weights', None)
+        if share > 0 and weights is not None and rng.random() < share:
+            return int(rng.choice(len(self.data_pool), p=weights))
+        return int(rng.choice(len(self.data_pool)))
+
+    def _load_regions(self):
+        """Whole source volumes for training crops at any position inside the train blocks
+        (dataset_prep/add_train_regions.py). The tile pool stays: geometry and the train-side
+        metric read it. Images are kept as stored and normalised per crop."""
+        from scipy.ndimage import distance_transform_edt, find_objects
+        from cytonucs_runtime import read_model_image
+        root = self.dataset_dir.parent / 'train_regions'
+        index = root / 'regions.json'
+        if not index.is_file():
+            raise FileNotFoundError(f'training.train_region_crops needs {index}: '
+                                    'run dataset_prep/add_train_regions.py on the dataset')
+        nd = int(self.config.ndim)
+        patch = tuple(int(v) for v in self.config.train_patch_size)
+        self.region_pool = []
+        for name, entry in json.loads(index.read_text()).items():
+            image = read_model_image(root / 'images' / name, nd, self.config.n_channel_in)
+            if nd == 3 and image.ndim == 4 and image.shape[-1] != self.config.n_channel_in and image.shape[1] == self.config.n_channel_in:
+                image = np.moveaxis(image, 1, -1)
+            # Label IDs of the source volume are kept (assignments refer to them), in the tiles' dtype.
+            nucleus, cytoplasm = (
+                m.astype(np.uint16) if 0 <= m.min() and m.max() <= np.iinfo(np.uint16).max else m
+                for m in (np.asarray(imageio.volread(root / sub / name)) for sub in ('nucleus_masks', 'cytoplasm_masks')))
+            pairs = json.loads((root / 'assignments' / (Path(name).stem + '.json')).read_text())
+            region = np.zeros(nucleus.shape[-2:], bool)
+            for y0, y1, x0, x1 in entry['train_blocks']:
+                region[y0:y1, x0:x1] = True
+            allowed = allowed_crop_starts(region, patch[-2:])
+            if not allowed.any():
+                raise ValueError(f'{name}: no {patch[-2:]} crop fits into the train blocks')
+            # Bounding-box centres of the cells (nuclei where a volume has no cell) inside the train blocks.
+            labels = cytoplasm if cytoplasm.max() > 0 else nucleus
+            anchors = [([(sl.start + sl.stop) // 2 for sl in box], label)
+                       for label, box in enumerate(find_objects(labels), 1) if box is not None]
+            anchors = [(c, label) for c, label in anchors if region[c[-2], c[-1]]]
+            self.region_pool.append(dict(
+                image=image, nucleus_mask=nucleus, cytoplasm_mask=cytoplasm, filename=name,
+                assignments={int(k): int(v) for k, v in pairs.items()},
+                blocks=[tuple(b) for b in entry['train_blocks']], table=window_sum_table(region),
+                starts=np.flatnonzero(allowed), starts_shape=allowed.shape,
+                nearest=distance_transform_edt(~allowed, return_distances=False, return_indices=True).astype(np.int32),
+                anchors=np.array([c for c, _ in anchors], np.int64).reshape(-1, nd),
+                anchor_labels=np.array([label for _, label in anchors], np.int64), percentiles={},
+                # Counted here once: the first batches come from several prefetch threads.
+                _label_counts=dict(nucleus_mask=label_counts(nucleus), cytoplasm_mask=label_counts(cytoplasm))))
+            print(f'  Train region {name}: {len(entry["train_blocks"])} block(s), {len(anchors)} anchor object(s), '
+                  f'{int(allowed.sum())} crop positions in XY')
+        counts = np.array([len(s['anchors']) for s in self.region_pool], np.float64)
+        self._region_weights = counts / counts.sum() if counts.sum() > 0 else None
+
+    def _region_crop(self, sample, patch, rng):
+        """Start of one patch-sized training crop inside the train blocks, and its anchor cell.
+
+        With probability fg_crop_prob the crop is centred on a random object, shifted by up to
+        1/16 of the patch (the refinement ROI at inference is centred on its prompt up to the
+        snapping step); else it is any allowed position. A start outside the train blocks moves
+        to the nearest allowed one.
+        """
+        nd = len(patch)
+        spatial = sample['nucleus_mask'].shape
+        free = [max(spatial[a] - patch[a], 0) for a in range(nd)]
+        if len(sample['anchors']) and rng.random() < getattr(self.config, 'fg_crop_prob', 0.9):
+            k = int(rng.integers(len(sample['anchors'])))
+            center = sample['anchors'][k] + [int(rng.integers(-(p // 16), p // 16 + 1)) for p in patch]
+            starts = [int(np.clip(center[a] - patch[a] // 2, 0, free[a])) for a in range(nd)]
+            starts[-2:] = [int(v) for v in sample['nearest'][:, starts[-2], starts[-1]]]
+            return starts, int(sample['anchor_labels'][k])
+        starts = [int(rng.integers(0, free[a] + 1)) for a in range(nd - 2)]
+        y, x = np.unravel_index(int(sample['starts'][int(rng.integers(len(sample['starts'])))]), sample['starts_shape'])
+        return starts + [int(y), int(x)], 0
+
+    def _region_normalize(self, sample, crop, starts, patch):
+        """Percentile normalisation of a region crop with the statistics of the tile around it:
+        the train block that holds the crop centre, over the Z range of the crop. Train and
+        validation tiles are normalised per tile (one block, one Z slab) in the same way."""
+        from csbdeep.utils import normalize_mi_ma
+        nd = len(patch)
+        cy, cx = starts[-2] + patch[-2] // 2, starts[-1] + patch[-1] // 2
+        block = next(i for i, (y0, y1, x0, x1) in enumerate(sample['blocks']) if y0 <= cy < y1 and x0 <= cx < x1)
+        key = (block,) + tuple(starts[:-2])
+        if key not in sample['percentiles']:
+            y0, y1, x0, x1 = sample['blocks'][block]
+            context = sample['image'][tuple(slice(s, s + p) for s, p in zip(starts[:-2], patch[:-2])) +
+                                      (slice(y0, y1), slice(x0, x1))]
+            sample['percentiles'][key] = np.percentile(context.astype(np.float32), (1, 99.8),
+                                                       axis=tuple(range(nd)), keepdims=True)
+        mi, ma = sample['percentiles'][key]
+        return np.ascontiguousarray(normalize_mi_ma(crop.astype(np.float32), mi, ma), dtype=np.float32)
 
     def get_cell_properties(self, prop='cells_median_extent_p'):
         """
@@ -343,8 +474,13 @@ class CytoNucsDataGenerator(Sequence):
         # локальный rng: __getitem__ вызывается из НЕСКОЛЬКИХ потоков
         # префетчера, глобальный np.random между ними шарится
         pick = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch if is_train else 0, int(idx)]))
-        if is_train:
-            crop_indices = [int(pick.choice(len(self.data_pool))) for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
+        regions = getattr(self, 'region_pool', None) if is_train else None
+        if regions:
+            crop_indices = [int(pick.choice(len(regions), p=self._region_weights))
+                            for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
+        elif is_train:
+            crop_indices = [CytoNucsDataGenerator._pick_tile(self, pick)
+                            for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
         else:
             crop_indices = [int(self.indices[int(idx) % max(1, len(self.indices))])]
 
@@ -359,7 +495,7 @@ class CytoNucsDataGenerator(Sequence):
             # кропе с другим промптом, и val_loss мерит дисперсию выборки.
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch if is_train else 0, int(idx), int(_ci), 1]))
 
-            sample = self.data_pool[i]
+            sample = regions[i] if regions else self.data_pool[i]
             img_full = sample['image']
             nuc_full = sample['nucleus_mask']
             cyto_full = sample['cytoplasm_mask']
@@ -384,26 +520,42 @@ class CytoNucsDataGenerator(Sequence):
                     need[a] = int(np.ceil(patch[a] / f)) + 2
             need = [min(need[a], spatial[a]) for a in range(nd)]
 
-            # центр кропа: с вероятностью p_fg на случайном объекте
-            p_fg = getattr(self.config, 'fg_crop_prob', 0.9)
-            center = None
-            fg = sample['fg_coords']
-            if rng.random() < p_fg and len(fg) > 0:
-                center = fg[int(rng.integers(len(fg)))][:nd]
+            anchor = 0
+            if regions:
+                starts, anchor = self._region_crop(sample, patch, rng)
+                if f != 1.0:
+                    # The larger crop of a zoom-out keeps its centre; where it would leave the
+                    # train blocks or the volume, this crop is taken without zoom.
+                    grown = [starts[a] - (need[a] - patch[a]) // 2 for a in range(nd)]
+                    if (all(0 <= g and g + n <= s for g, n, s in zip(grown, need, spatial))
+                            and window_inside(sample['table'], grown[-2:], need[-2:])):
+                        starts = grown
+                    else:
+                        f, need = 1.0, [min(patch[a], spatial[a]) for a in range(nd)]
+            else:
+                # центр кропа: с вероятностью p_fg на случайном объекте
+                p_fg = getattr(self.config, 'fg_crop_prob', 0.9)
+                center = None
+                fg = sample['fg_coords']
+                if rng.random() < p_fg and len(fg) > 0:
+                    center = fg[int(rng.integers(len(fg)))][:nd]
 
-            starts = []
-            for a in range(nd):
-                sh, p = spatial[a], need[a]
-                if sh <= p:
-                    starts.append(0)
-                elif center is not None:
-                    # center — валидный ЦЕНТР патча (канон), не воксель объекта
-                    starts.append(max(0, min(int(center[a]) - p // 2, sh - p)))
-                else:
-                    starts.append(int(rng.integers(0, sh - p + 1)))
+                starts = []
+                for a in range(nd):
+                    sh, p = spatial[a], need[a]
+                    if sh <= p:
+                        starts.append(0)
+                    elif center is not None:
+                        # center — валидный ЦЕНТР патча (канон), не воксель объекта
+                        starts.append(max(0, min(int(center[a]) - p // 2, sh - p)))
+                    else:
+                        starts.append(int(rng.integers(0, sh - p + 1)))
             sl = tuple(slice(s, s + n) for s, n in zip(starts, need))
 
-            img = np.ascontiguousarray(img_full[sl])
+            if regions:
+                img = self._region_normalize(sample, img_full[sl], starts, need)
+            else:
+                img = np.ascontiguousarray(img_full[sl])
             nucleus_mask = np.ascontiguousarray(nuc_full[sl])
             cytoplasm_mask = np.ascontiguousarray(cyto_full[sl])
             # Objects cut by this crop: fewer voxels than in the source volume. A crop
@@ -506,6 +658,10 @@ class CytoNucsDataGenerator(Sequence):
             cyto_ids = list(cyto_ids[cyto_ids > 0])
             if len(cyto_ids) > 1:
                 rng.shuffle(cyto_ids)
+            if anchor in cyto_ids:
+                # The crop is centred on this cell: it is the first prompt, its neighbours follow.
+                cyto_ids.remove(anchor)
+                cyto_ids.insert(0, anchor)
             nuc_present = {int(v) for v in np.unique(nucleus_mask) if v > 0}
 
             # Compute only when enabled; preserve the old RNG sequence at zero.

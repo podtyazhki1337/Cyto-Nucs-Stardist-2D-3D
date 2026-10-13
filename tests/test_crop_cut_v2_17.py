@@ -132,7 +132,7 @@ class ConfigTests(unittest.TestCase):
     def test_json_contract_and_validation(self):
         for path in ROOT.glob('config_cytonucs*.json'):
             raw = json.loads(path.read_text())
-            self.assertIs(raw['loss_params']['object_losses_include_crop_cut'], path.name in ('config_cytonucs_v2_17.json', 'config_cytonucs_v3.json', 'config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json'),
+            self.assertIs(raw['loss_params']['object_losses_include_crop_cut'], path.name in ('config_cytonucs_v2_17.json', 'config_cytonucs_v3.json', 'config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json', 'config_cytonucs_v3_4.json', 'config_cytonucs_v4.json'),
                           path.name)
         raw = json.loads((ROOT / 'config_cytonucs_v2_17.json').read_text())
         with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:

@@ -105,7 +105,8 @@
     "mask_quality_head": true,
     "mask_quality_pooling": "mask",
     "refinement_pool": "auto",
-    "refinement_full_resolution": true
+    "refinement_full_resolution": true,
+    "unet_norm_groups": 0
   },
   "training": {
     "train_patch_size": [
@@ -141,7 +142,9 @@
       1,
       2,
       2
-    ]
+    ],
+    "tile_sampling_by_objects": 0.0,
+    "train_region_crops": false
   },
   "inference": {
     "checkpoint_path": "models/cytonucs_emese_HK_3_training_v3_3/weights_best.weights.h5",

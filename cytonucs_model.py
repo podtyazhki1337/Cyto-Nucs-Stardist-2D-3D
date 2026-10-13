@@ -87,7 +87,8 @@ class CytoNucsStarDistModel:
         self.keras_model = self._build_model()
 
     def _build_block(self, x, n_filters, ConvLayer, prefix):
-        """UNet conv block: 2x Conv3x3 ReLU.
+        """UNet conv block: 2x Conv3x3 ReLU; with model.unet_norm_groups each convolution is
+        followed by GroupNorm before its activation (a batch is one or a few crops).
         Инициализатор — self._kinit, обоснование в _build_model."""
         _k = getattr(self, '_kinit', 'he_normal')
         import re
@@ -95,12 +96,17 @@ class CytoNucsStarDistModel:
         schedule = self.config.unet_kernel_schedule
         kernel = tuple(schedule[int(level.group(1))]) if schedule is not None and level else 3
         activation = getattr(self.config, 'unet_activation', 'relu')
-        x = ConvLayer(n_filters, kernel, padding='same', activation=activation,
-                      kernel_initializer=_k,
-                      name=f'{prefix}_c1')(x)
-        x = ConvLayer(n_filters, kernel, padding='same', activation=activation,
-                      kernel_initializer=_k,
-                      name=f'{prefix}_c2')(x)
+        groups = int(getattr(self.config, 'unet_norm_groups', 0) or 0)
+        for j in (1, 2):
+            if groups:
+                x = ConvLayer(n_filters, kernel, padding='same', activation=None,
+                              kernel_initializer=_k, name=f'{prefix}_c{j}')(x)
+                x = layers.GroupNormalization(groups=groups, name=f'{prefix}_n{j}')(x)
+                x = layers.Activation(activation, name=f'{prefix}_a{j}')(x)
+            else:
+                x = ConvLayer(n_filters, kernel, padding='same', activation=activation,
+                              kernel_initializer=_k,
+                              name=f'{prefix}_c{j}')(x)
         return x
 
     def _build_model(self):
@@ -774,6 +780,8 @@ class CytoNucsStarDistModel:
         result['refinement_full_resolution'] = bool(self.config.refinement_full_resolution)
         if self.config.refinement_full_resolution:
             result['fine_wiring'] = self.fine_wiring
+        if getattr(self.config, 'unet_norm_groups', 0):
+            result['unet_norm_groups'] = int(self.config.unet_norm_groups)
         return json.loads(json.dumps(result))
 
     # Order of the added heads in every checkpoint saved so far (v3.1 semantic, v3.2 fine).

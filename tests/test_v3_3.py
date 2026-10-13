@@ -259,11 +259,14 @@ class ConfigTests(unittest.TestCase):
             return quiet(CytoNucsConfig.from_json, path)
 
     def test_json_contract(self):
+        later = {name: dict(dist_target_stride=[1, 2, 2], fullval_train_volumes=3)
+                 for name in ('config_cytonucs_v3_4.json', 'config_cytonucs_v4.json')}
         for path in ROOT.glob('config_cytonucs*.json'):
             raw = json.loads(path.read_text())
             for section, settings in NEW.items():
                 for key, (legacy, new) in settings.items():
-                    self.assertEqual(raw[section][key], new if path.name == PRESET else legacy, f'{path.name} {key}')
+                    expected = later[path.name][key] if path.name in later else new if path.name == PRESET else legacy
+                    self.assertEqual(raw[section][key], expected, f'{path.name} {key}')
         for section, settings in NEW.items():
             for key, (legacy, _) in settings.items():
                 self.assertEqual(CytoNucsConfig.FIXES_SETTINGS[section][key], legacy)
