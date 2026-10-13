@@ -28,15 +28,23 @@ def align_training_history(history, completed_epochs):
     return result
 
 
-def deployed_metric(jtpr, total_pairs, ap_gated, pairs_lost, jtpr_weight):
+def checkpoint_jtpr_weight(config):
+    """Weight of JTPR in the checkpoint metric: loss_params.checkpoint_w_jtpr; 0 for a run with
+    one object level (model.levels), which has no nucleus-cell pairs."""
+    levels = getattr(config, 'levels', ('nucleus', 'cytoplasm'))
+    return float(getattr(config, 'checkpoint_w_jtpr', 0.7)) if len(levels) == 2 else 0.0
+
+
+def deployed_metric(jtpr, total_pairs, ap_gated, pairs_lost, jtpr_weight, levels=2):
     """Checkpoint metric of what inference outputs: after the calibrated quality/size gates.
 
     ap_gated: {head: AP after that head's gate}; pairs_lost: joint pairs whose nucleus or
     cell mask the gates remove (a pair removed in both heads counts twice, so this is a
-    lower bound on the gated JTPR).
+    lower bound on the gated JTPR). levels: object levels of the run; the AP term is their
+    mean (the level a run does not have contributes 0).
     """
     lost = sum(pairs_lost.values()) / max(int(total_pairs), 1)
-    return jtpr_weight * (jtpr - lost) + (1.0 - jtpr_weight) * 0.5 * sum(ap_gated.values())
+    return jtpr_weight * (jtpr - lost) + (1.0 - jtpr_weight) * sum(ap_gated.values()) / levels
 
 
 def history_selection_metrics(history, jtpr_weight=0.7):

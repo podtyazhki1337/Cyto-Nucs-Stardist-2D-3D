@@ -180,22 +180,26 @@ class CytoNucsDataGenerator(Sequence):
             return sorted(set(files))
 
         self.image_files = find_all_images(self.dataset_dir / 'images')
-        self.nucleus_files = find_all_images(self.dataset_dir / 'nucleus_masks')
-        self.cytoplasm_files = find_all_images(self.dataset_dir / 'cytoplasm_masks')
         if not self.image_files:
             raise ValueError(f'No images found in {self.dataset_dir / "images"}')
+        # A level the run does not have (model.levels) needs no mask folder: its masks are empty.
+        self.levels = tuple(getattr(config, 'levels', ('nucleus', 'cytoplasm')))
+        self.nucleus_files, self.cytoplasm_files = (
+            find_all_images(self.dataset_dir / (name + '_masks')) if name in self.levels
+            else [None] * len(self.image_files) for name in ('nucleus', 'cytoplasm'))
 
         assert len(self.image_files) == len(self.nucleus_files) == len(self.cytoplasm_files), \
             "Mismatch in number of images, nucleus masks, and cytoplasm masks"
 
         # Check that filenames match
         for img_f, nuc_f, cyto_f in zip(self.image_files, self.nucleus_files, self.cytoplasm_files):
-            assert img_f.name == nuc_f.name == cyto_f.name, \
-                f"Filename mismatch: {img_f.name}, {nuc_f.name}, {cyto_f.name}"
+            assert all(f is None or f.name == img_f.name for f in (nuc_f, cyto_f)), \
+                f"Filename mismatch: {img_f.name}, {nuc_f and nuc_f.name}, {cyto_f and cyto_f.name}"
 
         # Load assignments if available
         self.assignments_dir = self.dataset_dir / 'assignments'
         self.has_assignments = self.assignments_dir.exists()
+        self.paired = len(self.levels) == 2                     # nucleus-cell pairs exist only with both levels
 
         # Load metadata if available
         self.meta = None
@@ -254,8 +258,9 @@ class CytoNucsDataGenerator(Sequence):
             # 3D RGB-стек сохранён как (Z, C, H, W) -> канал в конец (Z, H, W, C)
             if nd == 3 and img.ndim == 4 and img.shape[-1] != self.config.n_channel_in and img.shape[1] == self.config.n_channel_in:
                 img = np.moveaxis(img, 1, -1)
-            nucleus_mask = np.asarray(imageio.volread(self.nucleus_files[idx]))
-            cytoplasm_mask = np.asarray(imageio.volread(self.cytoplasm_files[idx]))
+            nucleus_mask, cytoplasm_mask = (
+                np.zeros(img.shape[:nd], np.uint16) if f is None else np.asarray(imageio.volread(f))
+                for f in (self.nucleus_files[idx], self.cytoplasm_files[idx]))
 
             # ПЕРЦЕНТИЛЬНАЯ НОРМАЛИЗАЦИЯ — ОДИН РАЗ НА ТОМ.
             # Раньше normalize(1, 99.8) звался в __getitem__ по ПОЛНОМУ тому на
@@ -284,7 +289,9 @@ class CytoNucsDataGenerator(Sequence):
                                  axis=1).astype(np.int32)
             if len(fg_coords) == 0:  # фолбэк как в каноне
                 fg_coords = np.argwhere(seed_mask > 0).astype(np.int32)
-            if self.has_assignments:
+            if not getattr(self, 'paired', True):
+                assignments = {}
+            elif self.has_assignments:
                 assignment_file = (self.assignments_dir /
                                    (Path(self.image_files[idx].name).stem + '.json'))
                 if assignment_file.exists():
@@ -350,8 +357,9 @@ class CytoNucsDataGenerator(Sequence):
             # Label IDs of the source volume are kept (assignments refer to them), in the tiles' dtype.
             nucleus, cytoplasm = (
                 m.astype(np.uint16) if 0 <= m.min() and m.max() <= np.iinfo(np.uint16).max else m
-                for m in (np.asarray(imageio.volread(root / sub / name)) for sub in ('nucleus_masks', 'cytoplasm_masks')))
-            pairs = json.loads((root / 'assignments' / (Path(name).stem + '.json')).read_text())
+                for m in (np.asarray(imageio.volread(root / (level + '_masks') / name)) if level in self.levels
+                          else np.zeros(image.shape[:nd], np.uint16) for level in ('nucleus', 'cytoplasm')))
+            pairs = json.loads((root / 'assignments' / (Path(name).stem + '.json')).read_text()) if self.paired else {}
             region = np.zeros(nucleus.shape[-2:], bool)
             for y0, y1, x0, x1 in entry['train_blocks']:
                 region[y0:y1, x0:x1] = True

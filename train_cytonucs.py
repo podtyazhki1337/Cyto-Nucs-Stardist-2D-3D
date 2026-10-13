@@ -979,11 +979,11 @@ def main(config_path='config_cytonucs.json'):
         )
 
         dice_callback.trainer = trainer
-        from cytonucs_runtime import restored_best_metric
+        from cytonucs_runtime import restored_best_metric, checkpoint_jtpr_weight
         dice_callback.best_metric = (float('-inf') if resume_path and model_config.reset_best_on_resume
                                      else restored_best_metric(trainer.history, float(trainer.state_best_full.numpy()),
                                          int(trainer.state_selection_start.numpy()),
-                                         float(getattr(model_config, 'checkpoint_w_jtpr', 0.7))))
+                                         checkpoint_jtpr_weight(model_config)))
         trainer.state_best_full.assign(dice_callback.best_metric)
         callbacks.append(dice_callback)
 

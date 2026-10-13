@@ -22,12 +22,16 @@ class CytoNucsConfig:
 
     # Public fixes_v1 settings: canonical JSON section and effective default.
     # Keep config_cytonucs.json and the loader regression test in sync.
+    # Object levels the network can hold, inner first. model.levels picks which of them a run has.
+    LEVEL_NAMES = ('nucleus', 'cytoplasm')
+
     FIXES_SETTINGS = {
         'evaluation': dict(refinement_stage_audit=False, fullval_train_volumes=0),
         'model': dict(unet_pool_schedule=None, unet_kernel_schedule=None,
                       refinement_depth=0, refinement_gradient_scale=0.0, mask_quality_head=False,
                       mask_quality_pooling='global', refinement_pool='isotropic',
-                      refinement_full_resolution=False, unet_norm_groups=0),
+                      refinement_full_resolution=False, unet_norm_groups=0,
+                      levels=['nucleus', 'cytoplasm']),
         'training': dict(seed=42, image_batch_size=1, prompts_per_crop=None, nucleus_prob_grid_normalize=False,
                          log_every_steps=20, prefetch_workers=3, prefetch_depth=3,
                          predicted_prompt_fraction=0.0, predicted_prompt_start_epoch=10,
@@ -296,7 +300,16 @@ class CytoNucsConfig:
             value = (calibrated or {}).get(head)
         return float(self.mask_thresh if value is None else value)
 
+    def has_level(self, name):
+        """Whether the run segments this object level (model.levels)."""
+        return name in self.levels
+
     def _validate_runtime_settings(self):
+        levels = self.levels
+        if (not isinstance(levels, (list, tuple)) or not levels or
+                list(levels) != [name for name in self.LEVEL_NAMES if name in levels]):
+            raise ValueError(f'levels must be a non-empty list out of {list(self.LEVEL_NAMES)}, inner level first')
+        self.levels = list(levels)
         for key in ('detector_prompt_slots', 'cell_roi_expansion_steps', 'fullval_train_volumes', 'unet_norm_groups'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -559,6 +572,12 @@ class CytoNucsConfig:
         base_grid = tuple(int(v) for v in self.grid)
         nd = self.ndim
         measured_ext = {}
+        # A level the run does not have (model.levels) has no objects: it takes the geometry of
+        # the level the run has, so grids, rays and scales stay defined and equal.
+        if not self.has_level('nucleus'):
+            nucleus_labels = cytoplasm_labels
+        if not self.has_level('cytoplasm'):
+            cytoplasm_labels = nucleus_labels
 
         def _measure(lbls):
             """Медианный размер объекта по каждой оси НЕЗАВИСИМО."""

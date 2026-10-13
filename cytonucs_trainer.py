@@ -229,8 +229,8 @@ def calibrate_mask_thresholds(predictor, samples):
             print(f"  [mask calibration {index + 1}/{len(samples)}] {sample.get('filename', index)}")
     finally:
         predictor.calibrating = saved
-    chosen, stats = select_mask_thresholds(base, evaluated, total_pairs,
-                                           float(getattr(config, 'checkpoint_w_jtpr', 0.7)))
+    from cytonucs_runtime import checkpoint_jtpr_weight
+    chosen, stats = select_mask_thresholds(base, evaluated, total_pairs, checkpoint_jtpr_weight(config))
     for head in heads:
         print(f"  Mask threshold {head}: {config.mask_thresh:.3f} -> {chosen[head]:.3f}; "
               f"AP {stats[head]['ap_default']:.4f} -> {stats[head]['ap']:.4f}, "
@@ -1431,7 +1431,8 @@ class DiceCallback:
             history.setdefault('fullval_' + key, []).append(value)
         interior_jtpr = (interior['interior_joint_tp'] / interior['interior_total_pairs']
                          if interior['interior_total_pairs'] else None)
-        jtpr_weight = float(getattr(config, 'checkpoint_w_jtpr', 0.7))
+        from cytonucs_runtime import checkpoint_jtpr_weight
+        jtpr_weight = checkpoint_jtpr_weight(config)
         quality_gates, gate_stats = {}, {}
         if config.refinement_stage_audit and written_quality:
             from cytonucs_runtime import calibrate_quality_gates
@@ -1572,10 +1573,13 @@ class DiceCallback:
         # AP/accuracy учитывает:
         # TP, FP и FN.
         # ============================================================
-        _w_jtpr = float(getattr(self.model.config, 'checkpoint_w_jtpr', 0.7))
+        from cytonucs_runtime import checkpoint_jtpr_weight
+        _w_jtpr = checkpoint_jtpr_weight(self.model.config)
+        # Mean AP over the levels the run has; a level it does not have scores 0 and is not counted.
+        _n_levels = len(getattr(self.model.config, 'levels', ('nucleus', 'cytoplasm')))
         current_metric = float(
             _w_jtpr * jtpr_global
-            + (1.0 - _w_jtpr) * 0.5 * (ap_nucleus + ap_cytoplasm)
+            + (1.0 - _w_jtpr) * (ap_nucleus + ap_cytoplasm) / _n_levels
         )
         # Full validation runs without the gates so they can be calibrated, but inference
         # applies them (mask_quality_min='auto'): select checkpoints by the gated result.
@@ -1586,7 +1590,7 @@ class DiceCallback:
                 jtpr_global, total_pairs_total,
                 {h: gate_stats[h]['ap'] if h in gate_stats else ap
                  for h, ap in (('nucleus', ap_nucleus), ('cytoplasm', ap_cytoplasm))},
-                {h: gate_stats[h]['pairs_lost'] for h in gate_stats}, _w_jtpr))
+                {h: gate_stats[h]['pairs_lost'] for h in gate_stats}, _w_jtpr, _n_levels))
         print(
             "\n  FULL-VOLUME METRICS"
         )

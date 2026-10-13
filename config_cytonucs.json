@@ -59,7 +59,11 @@
     "mask_quality_pooling": "global",
     "refinement_pool": "isotropic",
     "refinement_full_resolution": false,
-    "unet_norm_groups": 0
+    "unet_norm_groups": 0,
+    "levels": [
+      "nucleus",
+      "cytoplasm"
+    ]
   },
   "training": {
     "train_patch_size": [

@@ -123,6 +123,7 @@ class ConfigContractTests(unittest.TestCase):
                 elif key=='dist_target_stride': value=[1,2,2]
                 elif isinstance(default,bool): value=not default
                 elif key=='tiling_fixed_axes': value=[0]
+                elif key=='levels': value=['nucleus']
                 elif key in ('mask_thresh_nucleus','mask_thresh_cytoplasm'): value=.63
                 elif key=='prompts_per_crop': value=3
                 elif key.startswith('proposal_peak_window_'): value=[3,3,3]
