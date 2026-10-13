@@ -148,7 +148,8 @@
       2
     ],
     "tile_sampling_by_objects": 0.0,
-    "train_region_crops": true
+    "train_region_crops": true,
+    "partial_annotation": false
   },
   "inference": {
     "checkpoint_path": "models/cytonucs_emese_HK_3_training_v4/weights_best.weights.h5",

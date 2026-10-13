@@ -121,7 +121,8 @@ class CytoNucsStarDistModel:
             PoolLayer = layers.MaxPooling2D
             UpSampleLayer = layers.UpSampling2D
 
-        levels = tuple(getattr(cfg, 'levels', ('nucleus', 'cytoplasm')))
+        # Roles the run has a level for (model.levels): 'nucleus' = inner, 'cytoplasm' = outer.
+        levels = tuple(getattr(cfg, 'level_roles', None) or ('nucleus', 'cytoplasm'))
         unet_n_depth = getattr(cfg, 'unet_n_depth', 4)
         unet_n_filter_base = getattr(cfg, 'unet_n_filter_base', 32)
         net_conv_after_unet = getattr(cfg, 'net_conv_after_unet', 128)
@@ -852,8 +853,9 @@ class CytoNucsStarDistModel:
             result['fine_wiring'] = self.fine_wiring
         if getattr(self.config, 'unet_norm_groups', 0):
             result['unet_norm_groups'] = int(self.config.unet_norm_groups)
-        if list(getattr(self.config, 'levels', ('nucleus', 'cytoplasm'))) != ['nucleus', 'cytoplasm']:
-            result['levels'] = list(self.config.levels)
+        roles = [role for role in ('nucleus', 'cytoplasm') if role in (getattr(self.config, 'level_roles', None) or ('nucleus', 'cytoplasm'))]
+        if roles != ['nucleus', 'cytoplasm']:
+            result['roles'] = roles                              # one level: the other role has no layers
         return json.loads(json.dumps(result))
 
     # Order of the added heads in every checkpoint saved so far (v3.1 semantic, v3.2 fine).

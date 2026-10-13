@@ -22,8 +22,10 @@ class CytoNucsConfig:
 
     # Public fixes_v1 settings: canonical JSON section and effective default.
     # Keep config_cytonucs.json and the loader regression test in sync.
-    # Object levels the network can hold, inner first. model.levels picks which of them a run has.
-    LEVEL_NAMES = ('nucleus', 'cytoplasm')
+    # The network has two roles for nested objects: the inner one ('nucleus') and the outer one
+    # ('cytoplasm'). model.levels names the object levels of a run, inner first; each takes a role
+    # (level_roles) and its masks are read from '<level>_masks'.
+    ROLES = ('nucleus', 'cytoplasm')
 
     FIXES_SETTINGS = {
         'evaluation': dict(refinement_stage_audit=False, fullval_train_volumes=0),
@@ -37,7 +39,8 @@ class CytoNucsConfig:
                          predicted_prompt_fraction=0.0, predicted_prompt_start_epoch=10,
                          detector_prompt_slots=0, cell_predicted_nucleus_fraction=0.0,
                          predicted_prompt_sample_peaks=False, reset_best_on_resume=False,
-                         dist_target_stride=None, tile_sampling_by_objects=0.0, train_region_crops=False),
+                         dist_target_stride=None, tile_sampling_by_objects=0.0, train_region_crops=False,
+                         partial_annotation=False),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25,
@@ -300,16 +303,25 @@ class CytoNucsConfig:
             value = (calibrated or {}).get(head)
         return float(self.mask_thresh if value is None else value)
 
-    def has_level(self, name):
-        """Whether the run segments this object level (model.levels)."""
-        return name in self.levels
+    def has_level(self, role):
+        """Whether the run has an object level in this role ('nucleus' = inner, 'cytoplasm' = outer)."""
+        return role in self.level_roles
 
     def _validate_runtime_settings(self):
+        import re
         levels = self.levels
-        if (not isinstance(levels, (list, tuple)) or not levels or
-                list(levels) != [name for name in self.LEVEL_NAMES if name in levels]):
-            raise ValueError(f'levels must be a non-empty list out of {list(self.LEVEL_NAMES)}, inner level first')
+        if (not isinstance(levels, (list, tuple)) or not levels or len(set(levels)) != len(levels) or
+                any(not isinstance(name, str) or not re.fullmatch(r'[a-z][a-z0-9_]*', name) for name in levels)):
+            raise ValueError('levels must be a non-empty list of distinct names (lower-case letters, digits, _), inner level first')
+        if len(levels) > 2:
+            raise ValueError(f'levels {list(levels)}: more than two nested levels are not implemented yet')
+        if set(levels) == set(self.ROLES) and list(levels) != list(self.ROLES):
+            raise ValueError('levels are listed inner first: ["nucleus", "cytoplasm"]')
         self.levels = list(levels)
+        # Two levels: inner and outer role. One level: the outer role if it is called 'cytoplasm',
+        # else the inner one (a plain object level).
+        self.level_roles = (dict(zip(self.ROLES, levels)) if len(levels) == 2 else
+                            {'cytoplasm' if levels[0] == 'cytoplasm' else 'nucleus': levels[0]})
         for key in ('detector_prompt_slots', 'cell_roi_expansion_steps', 'fullval_train_volumes', 'unet_norm_groups'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -344,7 +356,8 @@ class CytoNucsConfig:
         for key in ('predicted_prompt_sample_peaks', 'reset_best_on_resume',
                     'mask_quality_use_scores', 'prompt_inside_target', 'mask_ce_class_balance', 'refinement_stage_audit', 'nucleus_prob_grid_normalize',
                     'residual_proposals', 'object_losses_include_crop_cut', 'refinement_roi_snap',
-                    'object_losses_min_area_from_gate', 'refinement_full_resolution', 'train_region_crops'):
+                    'object_losses_min_area_from_gate', 'refinement_full_resolution', 'train_region_crops',
+                    'partial_annotation'):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(f'{key} must be boolean')
         # Residual prompts are added after the first object assembly into free voxels only.

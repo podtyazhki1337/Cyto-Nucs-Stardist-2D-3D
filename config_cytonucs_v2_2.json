@@ -144,7 +144,8 @@
     "cell_predicted_nucleus_fraction": 0.0,
     "dist_target_stride": null,
     "tile_sampling_by_objects": 0.0,
-    "train_region_crops": false
+    "train_region_crops": false,
+    "partial_annotation": false
   },
   "inference": {
     "checkpoint_path": "models/cytonucs_emese_HK_3_architecture_v2_1/weights_epoch_080.weights.h5",

@@ -965,7 +965,11 @@ class DiceCallback:
         key = tuple(sorted(s['filename'] for s in pool))
         if getattr(self, '_train_volume_cache', (None, None, None))[:2] == (key, count):
             return self._train_volume_cache[2]
-        pool = sorted(pool, key=lambda s: s['filename'])
+        # With training.partial_annotation only tiles that have every level of the run can be scored.
+        levels = len(getattr(self.model.config, 'levels', ('nucleus', 'cytoplasm')))
+        pool = sorted((s for s in pool if len(s.get('annotated', ('nucleus', 'cytoplasm'))) >= levels), key=lambda s: s['filename'])
+        if not pool:
+            return []
         originals = [s for s in pool if Path(s['filename']).stem.endswith('_a00')] or pool
 
         def objects(sample):

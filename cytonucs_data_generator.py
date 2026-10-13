@@ -183,10 +183,30 @@ class CytoNucsDataGenerator(Sequence):
         if not self.image_files:
             raise ValueError(f'No images found in {self.dataset_dir / "images"}')
         # A level the run does not have (model.levels) needs no mask folder: its masks are empty.
-        self.levels = tuple(getattr(config, 'levels', ('nucleus', 'cytoplasm')))
-        self.nucleus_files, self.cytoplasm_files = (
-            find_all_images(self.dataset_dir / (name + '_masks')) if name in self.levels
-            else [None] * len(self.image_files) for name in ('nucleus', 'cytoplasm'))
+        # Role -> level name of the run; the masks of a role are read from '<level>_masks'.
+        self.role_levels = dict(getattr(config, 'level_roles', None) or {'nucleus': 'nucleus', 'cytoplasm': 'cytoplasm'})
+        self.levels = tuple(role for role in ('nucleus', 'cytoplasm') if role in self.role_levels)   # roles present
+        # training.partial_annotation: a training file may lack the masks of some levels of the
+        # run (not annotated there). Validation and test files must have them all.
+        self.partial = bool(getattr(config, 'partial_annotation', False)) and subset == 'train'
+
+        def mask_files(name):
+            if name not in self.levels:
+                return [None] * len(self.image_files)
+            found = find_all_images(self.dataset_dir / (self.role_levels[name] + '_masks'))
+            if not self.partial:
+                return found
+            by_name = {f.name: f for f in found}
+            unknown = sorted(set(by_name) - {f.name for f in self.image_files})
+            if unknown:
+                raise ValueError(f'{self.role_levels[name]}_masks holds files without an image: {unknown[:5]}')
+            return [by_name.get(f.name) for f in self.image_files]
+
+        self.nucleus_files, self.cytoplasm_files = mask_files('nucleus'), mask_files('cytoplasm')
+        if self.partial:
+            bare = [f.name for f, n, c in zip(self.image_files, self.nucleus_files, self.cytoplasm_files) if n is None and c is None]
+            if bare:
+                raise ValueError(f'Images without masks of any level: {bare[:5]}')
 
         assert len(self.image_files) == len(self.nucleus_files) == len(self.cytoplasm_files), \
             "Mismatch in number of images, nucleus masks, and cytoplasm masks"
@@ -289,7 +309,10 @@ class CytoNucsDataGenerator(Sequence):
                                  axis=1).astype(np.int32)
             if len(fg_coords) == 0:  # фолбэк как в каноне
                 fg_coords = np.argwhere(seed_mask > 0).astype(np.int32)
-            if not getattr(self, 'paired', True):
+            # Levels of the run annotated in this file (all of them unless training.partial_annotation).
+            annotated = tuple(name for name, f in (('nucleus', self.nucleus_files[idx]), ('cytoplasm', self.cytoplasm_files[idx]))
+                              if f is not None)
+            if not getattr(self, 'paired', True) or len(annotated) < 2:
                 assignments = {}
             elif self.has_assignments:
                 assignment_file = (self.assignments_dir /
@@ -313,6 +336,7 @@ class CytoNucsDataGenerator(Sequence):
                 'fg_coords': fg_coords,
                 'assignments': assignments,
                 'filename': self.image_files[idx].name,
+                'annotated': annotated,
                 'object_count': int(np.count_nonzero(np.unique(nucleus_mask))) +
                                 int(np.count_nonzero(np.unique(cytoplasm_mask)))
             })
@@ -322,6 +346,14 @@ class CytoNucsDataGenerator(Sequence):
         self._pool_seed = seed
         counts = np.array([s['object_count'] for s in self.data_pool], np.float64)
         self._tile_weights = counts / counts.sum() if counts.sum() > 0 else None
+        # Partial annotation: tiles grouped by their annotated levels; a batch stays inside one group.
+        self._annotation_groups = None
+        if getattr(self, 'partial', False):
+            self._annotation_groups = {}
+            for index, sample in enumerate(self.data_pool):
+                self._annotation_groups.setdefault(sample['annotated'], []).append(index)
+            print('  Annotated levels of the training files: ' +
+                  ', '.join(f"{'+'.join(k)}: {len(v)}" for k, v in sorted(self._annotation_groups.items())))
 
     def _pick_tile(self, rng):
         """Pool tile of one training crop: uniform, or with probability
@@ -354,12 +386,20 @@ class CytoNucsDataGenerator(Sequence):
             image = read_model_image(root / 'images' / name, nd, self.config.n_channel_in)
             if nd == 3 and image.ndim == 4 and image.shape[-1] != self.config.n_channel_in and image.shape[1] == self.config.n_channel_in:
                 image = np.moveaxis(image, 1, -1)
+            # Levels of the run annotated in this volume: all of them, or with
+            # training.partial_annotation those whose mask file exists.
+            folder = lambda level: root / (self.role_levels[level] + '_masks') / name
+            annotated = tuple(level for level in ('nucleus', 'cytoplasm') if level in self.levels
+                              and (not self.partial or folder(level).is_file()))
+            if not annotated:
+                raise ValueError(f'{name}: no masks of any level in {root}')
             # Label IDs of the source volume are kept (assignments refer to them), in the tiles' dtype.
             nucleus, cytoplasm = (
                 m.astype(np.uint16) if 0 <= m.min() and m.max() <= np.iinfo(np.uint16).max else m
-                for m in (np.asarray(imageio.volread(root / (level + '_masks') / name)) if level in self.levels
+                for m in (np.asarray(imageio.volread(folder(level))) if level in annotated
                           else np.zeros(image.shape[:nd], np.uint16) for level in ('nucleus', 'cytoplasm')))
-            pairs = json.loads((root / 'assignments' / (Path(name).stem + '.json')).read_text()) if self.paired else {}
+            pairs = (json.loads((root / 'assignments' / (Path(name).stem + '.json')).read_text())
+                     if self.paired and len(annotated) == 2 else {})
             region = np.zeros(nucleus.shape[-2:], bool)
             for y0, y1, x0, x1 in entry['train_blocks']:
                 region[y0:y1, x0:x1] = True
@@ -372,7 +412,7 @@ class CytoNucsDataGenerator(Sequence):
                        for label, box in enumerate(find_objects(labels), 1) if box is not None]
             anchors = [(c, label) for c, label in anchors if region[c[-2], c[-1]]]
             self.region_pool.append(dict(
-                image=image, nucleus_mask=nucleus, cytoplasm_mask=cytoplasm, filename=name,
+                image=image, nucleus_mask=nucleus, cytoplasm_mask=cytoplasm, filename=name, annotated=annotated,
                 assignments={int(k): int(v) for k, v in pairs.items()},
                 blocks=[tuple(b) for b in entry['train_blocks']], table=window_sum_table(region),
                 starts=np.flatnonzero(allowed), starts_shape=allowed.shape,
@@ -486,9 +526,17 @@ class CytoNucsDataGenerator(Sequence):
         if regions:
             crop_indices = [int(pick.choice(len(regions), p=self._region_weights))
                             for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
+            if getattr(self, 'partial', False):                 # one batch, one set of annotated levels
+                same = [i for i, r in enumerate(regions) if r['annotated'] == regions[crop_indices[0]]['annotated']]
+                crop_indices = [i if i in same else int(pick.choice(same)) for i in crop_indices]
         elif is_train:
             crop_indices = [CytoNucsDataGenerator._pick_tile(self, pick)
                             for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
+            groups = getattr(self, '_annotation_groups', None)
+            if groups:
+                # One batch, one set of annotated levels: the loss of a level is switched per batch.
+                same = groups[self.data_pool[crop_indices[0]]['annotated']]
+                crop_indices = [i if i in same else int(pick.choice(same)) for i in crop_indices]
         else:
             crop_indices = [int(self.indices[int(idx) % max(1, len(self.indices))])]
 
@@ -797,6 +845,11 @@ class CytoNucsDataGenerator(Sequence):
             y_batch.setdefault('cytoplasm_prob', []).append(_pc)
             y_batch.setdefault('cytoplasm_dist', []).append(_dc)
 
+        if is_train and getattr(self, 'partial', False):
+            # 1 where the level's loss applies to this batch: annotated here, or not a level of the run.
+            annotated = sample.get('annotated', self.levels)
+            y_batch['levels_present'] = np.array([float(name not in self.levels or name in annotated)
+                                                  for name in ('nucleus', 'cytoplasm')], np.float32)
         X_batch = np.stack(X_batch)
         for _k in ('nucleus_instances', 'cytoplasm_instances',
                    'nucleus_prob', 'nucleus_dist', 'cytoplasm_prob', 'cytoplasm_dist',

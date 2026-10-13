@@ -1,5 +1,6 @@
 """model.levels: which object levels a run has. One level trains without the other level's
-masks, decoder and mask branch; both levels (the default) are unchanged."""
+masks, decoder and mask branch; both levels (the default) are unchanged.
+training.partial_annotation: training files may lack the masks of some levels of the run."""
 import contextlib
 import io
 import json
@@ -69,9 +70,20 @@ class ConfigTests(unittest.TestCase):
             cfg = quiet(config, levels=levels)
             self.assertEqual(cfg.levels, levels)
             self.assertEqual([cfg.has_level(name) for name in BOTH], [name in levels for name in BOTH])
-        for bad in ([], ['cytoplasm', 'nucleus'], ['nucleolus'], ['nucleus', 'nucleus'], 'nucleus', None, ['nucleus', 'cytoplasm', 'cell']):
+        for bad in ([], ['cytoplasm', 'nucleus'], ['Nucleus'], ['my level'], ['nucleus', 'nucleus'], 'nucleus', None, [1]):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 quiet(config, levels=bad)
+        with self.assertRaisesRegex(ValueError, 'not implemented'):
+            quiet(config, levels=['nucleolus', 'nucleus', 'cytoplasm'])
+
+    def test_level_names_take_the_inner_and_outer_roles(self):
+        self.assertEqual(quiet(config).level_roles, dict(nucleus='nucleus', cytoplasm='cytoplasm'))
+        self.assertEqual(quiet(config, levels=['nucleolus', 'nucleus']).level_roles, dict(nucleus='nucleolus', cytoplasm='nucleus'))
+        self.assertEqual(quiet(config, levels=['cytoplasm']).level_roles, dict(cytoplasm='cytoplasm'))
+        self.assertEqual(quiet(config, levels=['cells']).level_roles, dict(nucleus='cells'))   # one plain level: inner role
+        for levels, roles in ((['nucleolus', 'nucleus'], [True, True]), (['cells'], [True, False]), (['cytoplasm'], [False, True])):
+            cfg = quiet(config, levels=levels)
+            self.assertEqual([cfg.has_level(role) for role in BOTH], roles)
 
     def test_presets_keep_both_levels_and_json_reaches_the_config(self):
         for path in ROOT.glob('config_cytonucs*.json'):
@@ -81,7 +93,7 @@ class ConfigTests(unittest.TestCase):
             raw['output']['basedir'] = str(Path(tmp) / 'models'); raw['model']['levels'] = ['cytoplasm']
             path = Path(tmp) / 'config.json'; path.write_text(json.dumps(raw))
             self.assertEqual(quiet(CytoNucsConfig.from_json, path).levels, ['cytoplasm'])
-            raw['model']['levels'] = ['cells']; path.write_text(json.dumps(raw))
+            raw['model']['levels'] = ['Cells']; path.write_text(json.dumps(raw))
             with self.assertRaises(ValueError):
                 quiet(CytoNucsConfig.from_json, path)
 
@@ -132,6 +144,27 @@ class GeneratorTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     quiet(CytoNucsDataGenerator, Path(tmp) / 'train', quiet(config), cfg.rays, subset='train')
 
+    def test_masks_are_read_from_the_folders_of_the_level_names(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:
+            root = Path(tmp) / 'train'
+            for folder in ('images', 'nucleolus_masks', 'nucleus_masks', 'cells_masks'):
+                (root / folder).mkdir(parents=True)
+            image, masks = tile(3)
+            tifffile.imwrite(root / 'images' / 't0.tif', image, photometric='minisblack')
+            # Stored under other names: the small objects as 'nucleolus', the large ones as 'nucleus' and 'cells'.
+            tifffile.imwrite(root / 'nucleolus_masks' / 't0.tif', masks['nucleus'], photometric='minisblack')
+            for name in ('nucleus_masks', 'cells_masks'):
+                tifffile.imwrite(root / name / 't0.tif', masks['cytoplasm'], photometric='minisblack')
+            cfg = quiet(config, levels=['nucleolus', 'nucleus'])
+            pair = quiet(CytoNucsDataGenerator, root, cfg, cfg.rays, subset='train')
+            np.testing.assert_array_equal(pair.data_pool[0]['nucleus_mask'], masks['nucleus'])       # inner role
+            np.testing.assert_array_equal(pair.data_pool[0]['cytoplasm_mask'], masks['cytoplasm'])   # outer role
+            self.assertEqual(len(pair.data_pool[0]['assignments']), 4)
+            cfg = quiet(config, levels=['cells'])
+            single = quiet(CytoNucsDataGenerator, root, cfg, cfg.rays, subset='train')
+            np.testing.assert_array_equal(single.data_pool[0]['nucleus_mask'], masks['cytoplasm'])
+            self.assertEqual(int(single.data_pool[0]['cytoplasm_mask'].max()), 0)
+
 
 class ModelTests(unittest.TestCase):
     @classmethod
@@ -160,9 +193,13 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(float(tf.reduce_max(out[absent + '_quality'])), 0.)
             self.assertLess(float(tf.reduce_max(tf.sigmoid(out[absent + '_semantic_logit']))), 1e-6)
             self.assertGreater(float(tf.reduce_max(out[level + '_prob'])), .01)
-            self.assertEqual(model.architecture_signature()['levels'], [level])
+            self.assertEqual(model.architecture_signature()['roles'], [level])
             self.assertEqual(sorted(model.fine_head_models), [level])
-        self.assertNotIn('levels', both.architecture_signature())
+        self.assertNotIn('roles', both.architecture_signature())
+        # Other names for the same two roles are the same network.
+        named = quiet(build_cytonucs_model, quiet(config, levels=['nucleolus', 'nucleus'], **FEATURES))
+        self.assertEqual(named.architecture_signature(), both.architecture_signature())
+        self.assertEqual(named.keras_model.count_params(), both.keras_model.count_params())
 
     def test_runtime_models_keep_their_interface(self):
         x = tf.constant(np.random.default_rng(1).normal(size=(1, 8, 32, 32, 1)).astype(np.float32))
@@ -244,6 +281,165 @@ class TrainingTests(unittest.TestCase):
             effective = json.loads((root / 'models/cells/effective_config.json').read_text())
             self.assertIn('cytoplasm', json.dumps(effective))
             self.assertTrue((root / 'models/cells/weights_epoch_002.weights.h5').exists())
+
+
+def mixed_dataset(root, splits=(('train', (BOTH, BOTH, ['cytoplasm'], ['cytoplasm'], ['nucleus'], ['nucleus'])),)):
+    """Tiles whose mask folders differ per file: both levels, cells only, nuclei only."""
+    for split, files in splits:
+        for folder in ('images', 'nucleus_masks', 'cytoplasm_masks'):
+            (root / split / folder).mkdir(parents=True)
+        for i, levels in enumerate(files):
+            image, masks = tile(100 * len(split) + i)
+            tifffile.imwrite(root / split / 'images' / f't{i}.tif', image, photometric='minisblack')
+            for level in levels:
+                tifffile.imwrite(root / split / (level + '_masks') / f't{i}.tif', masks[level], photometric='minisblack')
+
+
+class PartialAnnotationTests(unittest.TestCase):
+    def test_setting_contract(self):
+        self.assertIs(CytoNucsConfig.FIXES_SETTINGS['training']['partial_annotation'], False)
+        for path in ROOT.glob('config_cytonucs*.json'):
+            self.assertIs(json.loads(path.read_text())['training']['partial_annotation'], False, path.name)
+        self.assertIs(quiet(config, partial_annotation=True).partial_annotation, True)
+        for bad in (1, 'yes', None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                quiet(config, partial_annotation=bad)
+
+    def test_batches_stay_inside_one_set_of_annotated_levels(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:
+            mixed_dataset(Path(tmp))
+            cfg = quiet(config, partial_annotation=True, image_batch_size=2)
+            generator = quiet(CytoNucsDataGenerator, Path(tmp) / 'train', cfg, cfg.rays, subset='train')
+            self.assertEqual({k: len(v) for k, v in generator._annotation_groups.items()},
+                             {('nucleus', 'cytoplasm'): 2, ('cytoplasm',): 2, ('nucleus',): 2})
+            seen = set()
+            for index in range(40):
+                _, y = generator[index]
+                present = tuple(y['levels_present'].tolist())
+                seen.add(present)
+                for flag, level in zip(present, BOTH):
+                    per_crop = [int(y[level + '_instances'][b].max()) > 0 for b in range(2)]
+                    self.assertEqual(per_crop, [bool(flag)] * 2, (index, level))    # every tile here has 4 objects
+            self.assertEqual(seen, {(1., 1.), (0., 1.), (1., 0.)})
+            # Without the setting a missing mask is an error; validation is always strict.
+            with self.assertRaises(AssertionError):
+                quiet(CytoNucsDataGenerator, Path(tmp) / 'train', quiet(config), cfg.rays, subset='train')
+            with self.assertRaises(AssertionError):
+                quiet(CytoNucsDataGenerator, Path(tmp) / 'train', cfg, cfg.rays, subset='val', shuffle=False)
+            # The default writes no flag: batches are what they were.
+            dataset(Path(tmp) / 'full', BOTH)
+            full = quiet(CytoNucsDataGenerator, Path(tmp) / 'full' / 'train', quiet(config), cfg.rays, subset='train')
+            self.assertNotIn('levels_present', full[0][1])
+            self.assertIsNone(full._annotation_groups)
+
+    def test_files_must_have_an_image_and_some_mask(self):
+        cfg = quiet(config, partial_annotation=True)
+        with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:
+            mixed_dataset(Path(tmp))
+            _, masks = tile(0)
+            tifffile.imwrite(Path(tmp) / 'train' / 'nucleus_masks' / 'stray.tif', masks['nucleus'], photometric='minisblack')
+            with self.assertRaisesRegex(ValueError, 'without an image'):
+                quiet(CytoNucsDataGenerator, Path(tmp) / 'train', cfg, cfg.rays, subset='train')
+        with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:
+            mixed_dataset(Path(tmp), (('train', (BOTH, [])),))
+            with self.assertRaisesRegex(ValueError, 'without masks'):
+                quiet(CytoNucsDataGenerator, Path(tmp) / 'train', cfg, cfg.rays, subset='train')
+
+    def test_unannotated_level_does_not_train_and_default_is_exact(self):
+        settings = dict(FEATURES, lambda_wbr=0., lambda_containment=0.)       # no terms tying nuclei to cells
+        with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:
+            mixed_dataset(Path(tmp))
+            cfg = quiet(config, partial_annotation=True, **settings)
+            generator = quiet(CytoNucsDataGenerator, Path(tmp) / 'train', cfg, cfg.rays, subset='train')
+            model = quiet(build_cytonucs_model, cfg, basedir=tmp, name='partial')
+            loss = CytoNucsLoss(cfg)
+            batches = {}
+            for index in range(40):
+                x, y = tensors(generator[index])
+                batches.setdefault(tuple(y['levels_present'].numpy().tolist()), (x, y))
+            self.assertEqual(len(batches), 3)
+
+            def gradients(x, y):
+                with tf.GradientTape() as tape:
+                    value = loss(y, model.keras_model(x, training=True))
+                grads = tape.gradient(value, model.keras_model.trainable_variables)
+                size = {}
+                for g, v in zip(grads, model.keras_model.trainable_variables):
+                    layer = v.path.split('/')[0]
+                    # The nuclear context layers feed the cell decoder from detached nuclear features:
+                    # they belong to the cell path.
+                    owner = 'shared' if 'ctx' in layer or 'context' in layer else \
+                        next((h for h in BOTH if layer.startswith((TAG[h] + '_', h + '_'))), 'shared')
+                    size[owner] = size.get(owner, 0.) + (0. if g is None else float(tf.reduce_sum(tf.abs(g))))
+                return float(value), size
+
+            for present, (x, y) in batches.items():
+                value, size = gradients(x, y)
+                self.assertTrue(np.isfinite(value))
+                for flag, level in zip(present, BOTH):
+                    if flag:
+                        self.assertGreater(size[level], 0., (present, level))
+                    else:
+                        self.assertEqual(size[level], 0., (present, level))
+            # Flags of a fully annotated batch change nothing: the same number as without them.
+            x, y = batches[(1., 1.)]
+            bare = {k: v for k, v in y.items() if k != 'levels_present'}
+            prediction = model.keras_model(x, training=False)
+            self.assertEqual(float(loss(y, prediction)), float(loss(bare, prediction)))
+            # An unannotated level leaves the loss when its flag is 0, whatever the network says there.
+            x, y = batches[(0., 1.)]
+            prediction = dict(model.keras_model(x, training=False))
+            base = float(loss(y, prediction))
+            prediction['nucleus_prob_logit'] = prediction['nucleus_prob_logit'] + 3.
+            prediction['nucleus_prob'] = tf.sigmoid(prediction['nucleus_prob_logit'])
+            self.assertAlmostEqual(float(loss(y, prediction)), base, places=6)
+            on = dict(y, levels_present=tf.constant([1., 1.]))
+            self.assertGreater(abs(float(loss(on, prediction)) - float(loss(on, dict(model.keras_model(x, training=False))))), 1e-3)
+
+    def test_train_side_metric_uses_fully_annotated_tiles(self):
+        from types import SimpleNamespace
+        from cytonucs_trainer import DiceCallback
+        _, masks = tile(0)
+        pool = [dict(filename=f't{i}_z000_y0000_x{64 * i:04d}_a00.tif', nucleus_mask=masks['nucleus'], cytoplasm_mask=masks['cytoplasm'],
+                     annotated=levels) for i, levels in enumerate((('cytoplasm',), ('nucleus', 'cytoplasm'), ('nucleus',), ('nucleus', 'cytoplasm')))]
+        callback = SimpleNamespace(model=SimpleNamespace(config=quiet(config, fullval_train_volumes=4)),
+                                   train_generator=SimpleNamespace(data_pool=pool))
+        picked = DiceCallback._train_volumes(callback)
+        self.assertEqual(sorted(s['filename'][:2] for s in picked), ['t1', 't3'])
+
+    def test_training_run_on_mixed_files(self):
+        import train_cytonucs
+        raw = json.loads((ROOT / 'config_cytonucs_v4.json').read_text())
+        with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:
+            root = Path(tmp)
+            mixed_dataset(root / 'data', (('train', (BOTH, BOTH, ['cytoplasm'], ['cytoplasm'], ['nucleus'], ['nucleus'])),
+                                          ('val', (BOTH, BOTH)), ('test', (BOTH, BOTH))))
+            raw['experiment']['name'] = 'mixed'
+            raw['data']['dataset_dir'] = str(root / 'data') + '/'
+            raw['model'].update(n_rays=12, n_channel_in=1, use_gpu=False, unet_n_depth=2, unet_n_filter_base=4,
+                                net_conv_after_unet=8, mask_refinement_filters=8, unet_norm_groups=2,
+                                unet_pool_schedule=[[1, 2, 2], [2, 2, 2]],
+                                unet_kernel_schedule=[[1, 3, 3], [3, 3, 3], [3, 3, 3]], anisotropy=[3, 1, 1])
+            raw['training'].update(train_patch_size=[8, 32, 32], train_epochs=2, steps_per_epoch=4, train_region_crops=False,
+                                   partial_annotation=True, lr_warmup_epochs=0, predicted_prompt_start_epoch=1,
+                                   prefetch_workers=1, prefetch_depth=1)
+            raw['inference'].update(refinement_patch_size=[0, 32, 32],
+                                    checkpoint_path=str(root / 'models/mixed/weights_best.weights.h5'))
+            raw['evaluation'].update(eval_dice_every=1, min_eval_epoch=1, save_every_n_epochs=1, fullval_train_volumes=2,
+                                     save_predictions=False)
+            raw['gpu_config']['visible_devices'] = '-1'
+            raw['output']['basedir'] = str(root / 'models')
+            (root / 'config.json').write_text(json.dumps(raw))
+            cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                quiet(train_cytonucs.main, str(root / 'config.json'))
+            finally:
+                os.chdir(cwd)
+            history = json.loads((root / 'models/mixed/history.json').read_text())
+            self.assertEqual(history['fullval_epoch'], [1, 2])
+            self.assertTrue(all(np.isfinite(v) for v in history['train_loss']))
+            self.assertEqual(history['fullval_train_volumes'], [2, 2])           # the two fully annotated tiles
 
 
 if __name__ == '__main__':
