@@ -588,6 +588,37 @@ def run_threshold_optimization(config_dict, config_path):
     return best
 
 
+class WarmupExponentialDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, initial_lr, warmup_steps, decay_steps, decay_rate,
+                 min_lr=1e-6, step_offset=0, staircase=False):
+        super().__init__()
+        self.initial_lr = tf.cast(initial_lr, tf.float32)
+        self.warmup_steps = tf.cast(warmup_steps, tf.float32)
+        self.decay_steps = tf.cast(decay_steps, tf.float32)
+        self.decay_rate = tf.cast(decay_rate, tf.float32)
+        self.min_lr = tf.cast(min_lr, tf.float32)
+        # Оптимизатор создаётся ПОСЛЕ load_weights и стартует с iterations=0.
+        # Без смещения resume с эпохи 500 повторно прогревается и
+        # возвращает lr к initial_lr — модель выбивается из минимума.
+        self.step_offset = tf.cast(step_offset, tf.float32)
+        self.staircase = bool(staircase)
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32) + self.step_offset
+        warmup_lr = self.min_lr + (self.initial_lr - self.min_lr) * (step / self.warmup_steps)
+        decay_step = step - self.warmup_steps
+        power = decay_step / self.decay_steps
+        if self.staircase:
+            power = tf.floor(power)
+        decay_lr = self.initial_lr * tf.pow(self.decay_rate, power)
+        return tf.where(step < self.warmup_steps, warmup_lr, tf.maximum(decay_lr, self.min_lr))
+
+    def get_config(self):
+        return {"initial_lr": float(self.initial_lr), "warmup_steps": float(self.warmup_steps),
+                "decay_steps": float(self.decay_steps), "decay_rate": float(self.decay_rate),
+                "min_lr": float(self.min_lr), "step_offset": float(self.step_offset), "staircase": self.staircase}
+
+
 def main(config_path='config_cytonucs.json'):
     """
     Main training function.
@@ -628,6 +659,9 @@ def main(config_path='config_cytonucs.json'):
     tf.keras.utils.set_random_seed(seed)
     # ========== MODE SELECTION ==========
     mode = config_dict.get('mode', 'train')  # По умолчанию training
+    if mode != 'train' and len(config_dict.get('model', {}).get('levels', [])) > 2:
+        raise NotImplementedError("Three or more levels: only mode 'train' is implemented; "
+                                  'predict with cytonucs_hierarchy.predict_hierarchy')
 
     if mode == 'inference':
         print("\n🔍 MODE: INFERENCE ONLY")
@@ -673,6 +707,10 @@ def main(config_path='config_cytonucs.json'):
 
     # ========== Create Model Configuration ==========
     model_config = CytoNucsConfig.from_json(config_path)
+    if model_config.n_pair_channels:
+        # Three or more nested levels: adjacent pairs through the one pair network.
+        from cytonucs_hierarchy import train_hierarchy
+        return train_hierarchy(config_dict, model_config, experiment)
 
     print("\nModel Configuration:")
     print(model_config)
@@ -834,36 +872,6 @@ def main(config_path='config_cytonucs.json'):
     initial_lr = config_dict['training']['initial_learning_rate']
     warmup_epochs = 10
     steps_per_epoch = model_config.train_steps_per_epoch
-
-    class WarmupExponentialDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
-        def __init__(self, initial_lr, warmup_steps, decay_steps, decay_rate,
-                     min_lr=1e-6, step_offset=0, staircase=False):
-            super().__init__()
-            self.initial_lr = tf.cast(initial_lr, tf.float32)
-            self.warmup_steps = tf.cast(warmup_steps, tf.float32)
-            self.decay_steps = tf.cast(decay_steps, tf.float32)
-            self.decay_rate = tf.cast(decay_rate, tf.float32)
-            self.min_lr = tf.cast(min_lr, tf.float32)
-            # Оптимизатор создаётся ПОСЛЕ load_weights и стартует с iterations=0.
-            # Без смещения resume с эпохи 500 повторно прогревается и
-            # возвращает lr к initial_lr — модель выбивается из минимума.
-            self.step_offset = tf.cast(step_offset, tf.float32)
-            self.staircase = bool(staircase)
-
-        def __call__(self, step):
-            step = tf.cast(step, tf.float32) + self.step_offset
-            warmup_lr = self.min_lr + (self.initial_lr - self.min_lr) * (step / self.warmup_steps)
-            decay_step = step - self.warmup_steps
-            power = decay_step / self.decay_steps
-            if self.staircase:
-                power = tf.floor(power)
-            decay_lr = self.initial_lr * tf.pow(self.decay_rate, power)
-            return tf.where(step < self.warmup_steps, warmup_lr, tf.maximum(decay_lr, self.min_lr))
-
-        def get_config(self):
-            return {"initial_lr": float(self.initial_lr), "warmup_steps": float(self.warmup_steps),
-                    "decay_steps": float(self.decay_steps), "decay_rate": float(self.decay_rate),
-                    "min_lr": float(self.min_lr), "step_offset": float(self.step_offset), "staircase": self.staircase}
 
     initial_lr = config_dict['training']['initial_learning_rate']
     steps_per_epoch = model_config.train_steps_per_epoch

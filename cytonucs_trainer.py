@@ -645,6 +645,18 @@ class CytoNucsTrainer:
 
         return loss, self.loss_fn.last_components
 
+    def _pair(self, y_batch):
+        """Trainer of the batch's pair in a hierarchy of three or more levels (cytonucs_hierarchy:
+        one trainer per adjacent pair over the same network and optimizer); otherwise self."""
+        index = y_batch.pop('pair_index', None) if isinstance(y_batch, dict) else None
+        trainers = getattr(self, 'pair_trainers', None)
+        if index is None or not trainers:
+            return self
+        trainer = trainers[int(index)]
+        if trainer is not self:
+            trainer.current_epoch_var.assign(self.current_epoch_var)
+        return trainer
+
     # Основной цикл тренировки
 
 
@@ -700,6 +712,7 @@ class CytoNucsTrainer:
 
                         # Конвертируем x в tensor
                         x_batch = tf.convert_to_tensor(x_batch, dtype=tf.float32)
+                        stepper = CytoNucsTrainer._pair(self, y_batch)
 
                         # Конвертируем y_batch ЦЕЛИКОМ (включая instance masks)
                         y_batch_tf = {}
@@ -716,7 +729,7 @@ class CytoNucsTrainer:
 
 
                         # Train step
-                        loss, p_n, d_n, b_n, r_n, c_n, components = self.train_step(x_batch, y_batch_tf)
+                        loss, p_n, d_n, b_n, r_n, c_n, components = stepper.train_step(x_batch, y_batch_tf)
                         self.current_step += 1
                         accumulate_components(component_sums, components)
                         if self.current_step % max(1, int(getattr(self.config, 'log_every_steps', 20))) == 0:
@@ -751,6 +764,7 @@ class CytoNucsTrainer:
                         x_batch, y_batch = val_generator[step]
 
                         x_batch = tf.convert_to_tensor(x_batch, dtype=tf.float32)
+                        stepper = CytoNucsTrainer._pair(self, y_batch)
 
                         y_batch_tf = {}
                         for k, v in y_batch.items():
@@ -764,7 +778,7 @@ class CytoNucsTrainer:
                             else:
                                 y_batch_tf[k] = v
 
-                        _, components = self.val_step(x_batch, y_batch_tf)
+                        _, components = stepper.val_step(x_batch, y_batch_tf)
                         accumulate_components(val_sums, components)
 
                     for key, value in component_means(val_sums).items():

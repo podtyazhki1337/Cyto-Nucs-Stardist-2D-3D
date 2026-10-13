@@ -24,7 +24,9 @@ class CytoNucsConfig:
     # Keep config_cytonucs.json and the loader regression test in sync.
     # The network has two roles for nested objects: the inner one ('nucleus') and the outer one
     # ('cytoplasm'). model.levels names the object levels of a run, inner first; each takes a role
-    # (level_roles) and its masks are read from '<level>_masks'.
+    # (level_roles) and its masks are read from '<level>_masks'. Three or more levels are a chain
+    # of adjacent pairs (level_pairs) served by the same network: the input carries one constant
+    # channel per pair after the image channels, and pair_view(i) is the config of pair i.
     ROLES = ('nucleus', 'cytoplasm')
 
     FIXES_SETTINGS = {
@@ -303,6 +305,63 @@ class CytoNucsConfig:
             value = (calibrated or {}).get(head)
         return float(self.mask_thresh if value is None else value)
 
+    def pair_view(self, index):
+        """Config of adjacent pair `index` of a hierarchy of three or more levels: the same settings
+        with the pair's levels in the inner and outer role and their measured geometry. With one
+        or two levels there is nothing to choose: the config itself."""
+        if not self.n_pair_channels:
+            return self
+        import copy
+        view = copy.copy(self)
+        view.pair_index = int(index)
+        view.levels = list(self.level_pairs[index])
+        view.level_roles = dict(zip(self.ROLES, view.levels))
+        for role, level in view.level_roles.items():
+            geometry = self.level_geometry.get(level)
+            if geometry:
+                setattr(view, 'rays_anisotropy_' + role, tuple(geometry['rays_anisotropy']))
+                setattr(view, 'median_max_dist_' + role, float(geometry['median_max_dist']))
+        view._build_rays()
+        return view
+
+    def set_hierarchy_geometry(self, level_labels):
+        """Geometry of every level of a hierarchy of three or more levels from its training masks.
+
+        level_labels: level -> list of label arrays. Each level is measured as in
+        set_anisotropy_from_labels (ray anisotropy, object scale) and kept in level_geometry;
+        pair_view() puts it into the roles. The network itself is built once: the scales it
+        bakes in (geometry prior, full-resolution window) are per role the largest among the
+        levels that take the role."""
+        for index, (inner, outer) in enumerate(self.level_pairs):
+            view = self.pair_view(index)
+            view.geometry_path = None                           # written once below, for all levels
+            view.set_anisotropy_from_labels(level_labels.get(inner), level_labels.get(outer), update_grid=False)
+            for role, level in view.level_roles.items():
+                scale = getattr(view, 'median_max_dist_' + role)
+                if scale is not None:
+                    self.level_geometry[level] = dict(
+                        rays_anisotropy=[float(v) for v in getattr(view, 'rays_anisotropy_' + role)],
+                        median_max_dist=float(scale))
+        missing = [level for level in self.levels if level not in self.level_geometry]
+        if missing:
+            raise ValueError(f'No objects of level(s) {missing} in the training masks')
+        for role, members in zip(self.ROLES, (self.levels[:-1], self.levels[1:])):
+            setattr(self, 'median_max_dist_' + role, max(self.level_geometry[m]['median_max_dist'] for m in members))
+        first = self.pair_view(0)
+        self.rays_anisotropy_nucleus, self.rays_anisotropy_cytoplasm = first.rays_anisotropy_nucleus, first.rays_anisotropy_cytoplasm
+        self._build_rays()
+        path = getattr(self, 'geometry_path', None)
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(json.dumps(dict(
+                n_rays=int(self.n_rays), levels=self.level_geometry,
+                rays_anisotropy_nucleus=list(self.rays_anisotropy_nucleus),
+                rays_anisotropy_cytoplasm=list(self.rays_anisotropy_cytoplasm),
+                nucleus_grid=list(self.nucleus_grid), cytoplasm_grid=list(self.cytoplasm_grid),
+                median_max_dist_nucleus=float(self.median_max_dist_nucleus),
+                median_max_dist_cytoplasm=float(self.median_max_dist_cytoplasm)), indent=2))
+        return self.level_geometry
+
     def has_level(self, role):
         """Whether the run has an object level in this role ('nucleus' = inner, 'cytoplasm' = outer)."""
         return role in self.level_roles
@@ -313,15 +372,23 @@ class CytoNucsConfig:
         if (not isinstance(levels, (list, tuple)) or not levels or len(set(levels)) != len(levels) or
                 any(not isinstance(name, str) or not re.fullmatch(r'[a-z][a-z0-9_]*', name) for name in levels)):
             raise ValueError('levels must be a non-empty list of distinct names (lower-case letters, digits, _), inner level first')
-        if len(levels) > 2:
-            raise ValueError(f'levels {list(levels)}: more than two nested levels are not implemented yet')
-        if set(levels) == set(self.ROLES) and list(levels) != list(self.ROLES):
-            raise ValueError('levels are listed inner first: ["nucleus", "cytoplasm"]')
+        if set(self.ROLES) <= set(levels) and levels.index('nucleus') > levels.index('cytoplasm'):
+            raise ValueError('levels are listed inner first: "nucleus" before "cytoplasm"')
         self.levels = list(levels)
         # Two levels: inner and outer role. One level: the outer role if it is called 'cytoplasm',
-        # else the inner one (a plain object level).
-        self.level_roles = (dict(zip(self.ROLES, levels)) if len(levels) == 2 else
+        # else the inner one (a plain object level). Three or more: the roles of the first pair here,
+        # of pair i in pair_view(i).
+        self.level_roles = (dict(zip(self.ROLES, levels[:2])) if len(levels) >= 2 else
                             {'cytoplasm' if levels[0] == 'cytoplasm' else 'nucleus': levels[0]})
+        self.level_pairs = [(levels[i], levels[i + 1]) for i in range(len(levels) - 1)]
+        self.pair_index = None
+        self.n_image_channels = int(self.n_channel_in)
+        self.n_pair_channels = len(self.level_pairs) if len(levels) >= 3 else 0
+        self.level_geometry = dict(getattr(self, 'level_geometry', None) or {})
+        if self.n_pair_channels:
+            if tuple(self.nucleus_grid) != tuple(self.cytoplasm_grid):
+                raise ValueError('three or more levels share one network: nucleus_grid and cytoplasm_grid must be equal')
+            self.n_channel_in = self.n_image_channels + self.n_pair_channels      # the pair code is read as image channels
         for key in ('detector_prompt_slots', 'cell_roi_expansion_steps', 'fullval_train_volumes', 'unet_norm_groups'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -786,6 +853,8 @@ class CytoNucsConfig:
                       'median_max_dist_nucleus', 'median_max_dist_cytoplasm'):
                 if geo.get(k) is not None:
                     params[k] = geo[k]
+            if geo.get('levels'):
+                params['level_geometry'] = geo['levels']        # hierarchy of three or more levels
             print(f"✅ Геометрия обучения подхвачена из {geo_load_path}")
         elif checkpoint:
             raise FileNotFoundError(f'{geo_load_path} missing: cannot interpret checkpoint rays safely')

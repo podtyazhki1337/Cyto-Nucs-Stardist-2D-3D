@@ -205,7 +205,14 @@ class CytoNucsDataGenerator(Sequence):
         self.nucleus_files, self.cytoplasm_files = mask_files('nucleus'), mask_files('cytoplasm')
         if self.partial:
             bare = [f.name for f, n, c in zip(self.image_files, self.nucleus_files, self.cytoplasm_files) if n is None and c is None]
-            if bare:
+            if bare and getattr(config, 'pair_index', None) is not None:
+                # One pair of a hierarchy: files that annotate neither of its levels belong to other pairs.
+                keep = [i for i, (n, c) in enumerate(zip(self.nucleus_files, self.cytoplasm_files)) if n is not None or c is not None]
+                self.image_files, self.nucleus_files, self.cytoplasm_files = (
+                    [files[i] for i in keep] for files in (self.image_files, self.nucleus_files, self.cytoplasm_files))
+                if not self.image_files:
+                    raise ValueError(f'No training file annotates {list(self.role_levels.values())}')
+            elif bare:
                 raise ValueError(f'Images without masks of any level: {bare[:5]}')
 
         assert len(self.image_files) == len(self.nucleus_files) == len(self.cytoplasm_files), \
@@ -216,8 +223,12 @@ class CytoNucsDataGenerator(Sequence):
             assert all(f is None or f.name == img_f.name for f in (nuc_f, cyto_f)), \
                 f"Filename mismatch: {img_f.name}, {nuc_f and nuc_f.name}, {cyto_f and cyto_f.name}"
 
-        # Load assignments if available
-        self.assignments_dir = self.dataset_dir / 'assignments'
+        # Load assignments if available: 'assignments' holds the nucleus -> cytoplasm pairs; the
+        # pairs of other levels are read from 'assignments_<inner>_<outer>' or found by overlap.
+        self.assignments_name = ('assignments' if self.role_levels == {'nucleus': 'nucleus', 'cytoplasm': 'cytoplasm'} or
+                                 len(self.role_levels) < 2 else
+                                 'assignments_' + self.role_levels['nucleus'] + '_' + self.role_levels['cytoplasm'])
+        self.assignments_dir = self.dataset_dir / self.assignments_name
         self.has_assignments = self.assignments_dir.exists()
         self.paired = len(self.levels) == 2                     # nucleus-cell pairs exist only with both levels
 
@@ -274,9 +285,11 @@ class CytoNucsDataGenerator(Sequence):
         self.data_pool = []
         for idx in pool_ids:
             from cytonucs_runtime import read_model_image
-            img = read_model_image(self.image_files[idx], nd, self.config.n_channel_in)
+            # Channels of the image files; a hierarchy adds its pair code in __getitem__.
+            channels = int(getattr(self.config, 'n_image_channels', self.config.n_channel_in))
+            img = read_model_image(self.image_files[idx], nd, channels)
             # 3D RGB-стек сохранён как (Z, C, H, W) -> канал в конец (Z, H, W, C)
-            if nd == 3 and img.ndim == 4 and img.shape[-1] != self.config.n_channel_in and img.shape[1] == self.config.n_channel_in:
+            if nd == 3 and img.ndim == 4 and img.shape[-1] != channels and img.shape[1] == channels:
                 img = np.moveaxis(img, 1, -1)
             nucleus_mask, cytoplasm_mask = (
                 np.zeros(img.shape[:nd], np.uint16) if f is None else np.asarray(imageio.volread(f))
@@ -383,8 +396,9 @@ class CytoNucsDataGenerator(Sequence):
         patch = tuple(int(v) for v in self.config.train_patch_size)
         self.region_pool = []
         for name, entry in json.loads(index.read_text()).items():
-            image = read_model_image(root / 'images' / name, nd, self.config.n_channel_in)
-            if nd == 3 and image.ndim == 4 and image.shape[-1] != self.config.n_channel_in and image.shape[1] == self.config.n_channel_in:
+            channels = int(getattr(self.config, 'n_image_channels', self.config.n_channel_in))
+            image = read_model_image(root / 'images' / name, nd, channels)
+            if nd == 3 and image.ndim == 4 and image.shape[-1] != channels and image.shape[1] == channels:
                 image = np.moveaxis(image, 1, -1)
             # Levels of the run annotated in this volume: all of them, or with
             # training.partial_annotation those whose mask file exists.
@@ -398,8 +412,11 @@ class CytoNucsDataGenerator(Sequence):
                 m.astype(np.uint16) if 0 <= m.min() and m.max() <= np.iinfo(np.uint16).max else m
                 for m in (np.asarray(imageio.volread(folder(level))) if level in annotated
                           else np.zeros(image.shape[:nd], np.uint16) for level in ('nucleus', 'cytoplasm')))
-            pairs = (json.loads((root / 'assignments' / (Path(name).stem + '.json')).read_text())
-                     if self.paired and len(annotated) == 2 else {})
+            pairs = {}
+            if self.paired and len(annotated) == 2:
+                stored = root / self.assignments_name / (Path(name).stem + '.json')
+                pairs = (json.loads(stored.read_text()) if stored.is_file() else compute_nucleus_cell_assignments(
+                    nucleus, cytoplasm, max_distance=getattr(self.config, 'max_assignment_distance', 100.0))[0])
             region = np.zeros(nucleus.shape[-2:], bool)
             for y0, y1, x0, x1 in entry['train_blocks']:
                 region[y0:y1, x0:x1] = True
@@ -683,6 +700,13 @@ class CytoNucsDataGenerator(Sequence):
                                            aniso=self._cyto_aniso)
 
             img_ch_base = img[..., np.newaxis] if img.ndim == nd else img
+            pair_channels = int(getattr(self.config, 'n_pair_channels', 0) or 0)
+            if pair_channels:
+                # Hierarchy of three or more levels: one constant channel per adjacent pair says
+                # which pair the two roles hold. Added after augmentation, right behind the image.
+                code = np.zeros(img_ch_base.shape[:nd] + (pair_channels,), np.float32)
+                code[..., int(self.config.pair_index)] = 1.
+                img_ch_base = np.concatenate([img_ch_base, code], axis=-1)
 
             def _prompt_at(shape, c, extent, rng_=rng, augment=True, owner=None):
                 # PROMPT AUGMENTATION. На обучении промпт строится по ТОЧНОМУ

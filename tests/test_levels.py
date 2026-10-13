@@ -73,8 +73,7 @@ class ConfigTests(unittest.TestCase):
         for bad in ([], ['cytoplasm', 'nucleus'], ['Nucleus'], ['my level'], ['nucleus', 'nucleus'], 'nucleus', None, [1]):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 quiet(config, levels=bad)
-        with self.assertRaisesRegex(ValueError, 'not implemented'):
-            quiet(config, levels=['nucleolus', 'nucleus', 'cytoplasm'])
+        # Three or more levels: tests/test_hierarchy.py.
 
     def test_level_names_take_the_inner_and_outer_roles(self):
         self.assertEqual(quiet(config).level_roles, dict(nucleus='nucleus', cytoplasm='cytoplasm'))
