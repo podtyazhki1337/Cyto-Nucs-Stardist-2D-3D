@@ -309,7 +309,7 @@ class ConfigTests(unittest.TestCase):
         for path in ROOT.glob('config_cytonucs*.json'):
             raw = json.loads(path.read_text())
             for section, key, legacy, new in self.KEYS:
-                self.assertEqual(raw[section][key], new if path.name == PRESET else legacy, f'{path.name} {key}')
+                self.assertEqual(raw[section][key], new if path.name in (PRESET, 'config_cytonucs_v5.json') else legacy, f'{path.name} {key}')
         raw = json.loads((ROOT / PRESET).read_text())
         cfg = self.load(raw)
         for section, key, legacy, new in self.KEYS:

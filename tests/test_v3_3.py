@@ -260,7 +260,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_json_contract(self):
         later = {name: dict(dist_target_stride=[1, 2, 2], fullval_train_volumes=3)
-                 for name in ('config_cytonucs_v3_4.json', 'config_cytonucs_v4.json')}
+                 for name in ('config_cytonucs_v3_4.json', 'config_cytonucs_v4.json', 'config_cytonucs_v5.json')}
         for path in ROOT.glob('config_cytonucs*.json'):
             raw = json.loads(path.read_text())
             for section, settings in NEW.items():
