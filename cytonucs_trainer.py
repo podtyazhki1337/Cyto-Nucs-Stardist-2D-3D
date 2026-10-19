@@ -3,6 +3,7 @@ CytoNucs StarDist Training Loop
 
 Implements custom training with all loss components.
 """
+import time
 import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.optimizers.schedules import ExponentialDecay
@@ -373,12 +374,31 @@ class CytoNucsTrainer:
         self.state_best_val = tf.Variable(float('inf'), dtype=tf.float32, trainable=False)
         self.state_best_full = tf.Variable(float('-inf'), dtype=tf.float32, trainable=False)
         self.state_selection_start = tf.Variable(0, dtype=tf.int64, trainable=False)
+        # training.ema_decay: exponential moving average of the weights. Validation, full validation,
+        # checkpoints and the model after training use the averaged weights (swap_ema); the optimizer
+        # keeps stepping the raw ones. Not saved separately: a resume continues from the saved
+        # (averaged) weights.
+        self.ema_decay = float(getattr(config, 'ema_decay', 0.0) or 0.0)
+        if self.ema_decay and int(getattr(config, 'n_pair_channels', 0) or 0):
+            raise NotImplementedError('training.ema_decay with three or more levels is not implemented')
+        self.ema_variables = ([tf.Variable(v, trainable=False, name='ema_' + v.name.replace(':', '_'))
+                               for v in self.model.keras_model.trainable_variables] if self.ema_decay else [])
+        self.ema_swapped = False
         # Stable slot order for both fresh training and optimizer restoration.
         self.optimizer.build(self.model.optimizer_variables())
         self.checkpoint = tf.train.Checkpoint(model=self.model.keras_model, optimizer=self.optimizer,
                                              epoch=self.state_epoch, best_val=self.state_best_val,
                                              best_full=self.state_best_full,
                                              selection_start=self.state_selection_start)
+
+    def swap_ema(self):
+        """Exchange the raw and the averaged weights (no-op without training.ema_decay)."""
+        for average, variable in zip(self.ema_variables, self.model.keras_model.trainable_variables):
+            raw = tf.identity(variable)
+            variable.assign(average)
+            average.assign(raw)
+        if self.ema_variables:
+            self.ema_swapped = not self.ema_swapped
 
     def save_checkpoint(self, path):
         self.model.save_weights(path)
@@ -512,6 +532,12 @@ class CytoNucsTrainer:
             all_grads, _ = tf.clip_by_global_norm(all_grads, clip_norm)
 
         self.optimizer.apply_gradients(zip(all_grads, all_vars))
+        if self.ema_variables:
+            # Bias-corrected warm-up: early steps average over fewer steps than 1 / (1 - decay).
+            step = tf.cast(self.optimizer.iterations, tf.float32)
+            decay = tf.minimum(tf.constant(self.ema_decay, tf.float32), (1. + step) / (10. + step))
+            for average, variable in zip(self.ema_variables, self.model.keras_model.trainable_variables):
+                average.assign(decay * average + (1. - decay) * variable)
         self.train_loss_metric.update_state(loss)
         return loss, prob_norm, dist_norm, bb_norm, rf_norm, cd_norm, self.loss_fn.last_components
 
@@ -548,9 +574,13 @@ class CytoNucsTrainer:
             # retain their GT prompt, not become background negatives.
             nonempty = tf.reduce_any(target > .5,axis=list(range(1,nd+1)))
             background = targets['nucleus_instances'][sl] == 0
+            if 'nucleus_known' in targets:                      # training.unknown_label
+                background &= targets['nucleus_known'][sl] > .5
             if head == 'cytoplasm':
                 # An unassigned real nucleus is not a reliable cell negative.
                 background &= targets['cytoplasm_instances'][sl] == 0
+                if 'cytoplasm_known' in targets:
+                    background &= targets['cytoplasm_known'][sl] > .5
             valid_points = tf.where(tf.reshape(nonempty,[-1]+[1]*nd), target_grid, background)
             probability = pred[source+'_prob'][...,0]
             scores = tf.where(valid_points, probability, -tf.ones_like(probability))
@@ -686,6 +716,7 @@ class CytoNucsTrainer:
             print(f"Config: {self.config}")
 
             best_val_loss = float(self.state_best_val.numpy())
+            gpu_memory_stats = bool(tf.config.list_logical_devices('GPU'))
             for epoch in range(start_epoch, epochs):
                 print(f"\n{'=' * 50}")
                 print(f"Epoch {epoch + 1}/{epochs}")
@@ -693,6 +724,9 @@ class CytoNucsTrainer:
 
                 self.current_epoch_var.assign(epoch + 1)
                 self.state_epoch.assign(epoch + 1)
+                epoch_started = time.time()
+                if gpu_memory_stats:
+                    tf.config.experimental.reset_memory_stats('GPU:0')
                 epoch_checkpoint_paths = []
                 train_generator.set_epoch(epoch)
                 prefetch = _Prefetcher(train_generator,
@@ -745,8 +779,18 @@ class CytoNucsTrainer:
                     prefetch.stop()
                 for key, value in component_means(component_sums).items():
                     self.history.setdefault('train_' + key, [None] * epoch).append(value)
+                # Validation, checkpoints and callbacks of this epoch see the averaged weights.
+                if getattr(self, 'ema_variables', None):
+                    self.swap_ema()
                 train_loss = self.train_loss_metric.result().numpy()
                 self.history['train_loss'].append(float(train_loss))
+                # Resources of the training part of the epoch (validation is timed separately below).
+                train_seconds = time.time() - epoch_started
+                self.history.setdefault('time_train_s', [None] * epoch).append(round(train_seconds, 2))
+                self.history.setdefault('steps_per_s', [None] * epoch).append(round(steps_per_epoch / max(train_seconds, 1e-6), 3))
+                if gpu_memory_stats:
+                    self.history.setdefault('gpu_peak_mem_gb', [None] * epoch).append(
+                        round(tf.config.experimental.get_memory_info('GPU:0')['peak'] / 2 ** 30, 3))
                 self.history['lr'].append(float(self.optimizer.learning_rate.numpy()))
 
                 print(f"Train Loss: {train_loss:.4f}")
@@ -843,9 +887,15 @@ class CytoNucsTrainer:
                     train_generator.on_epoch_end()
                 if val_generator is not None and hasattr(val_generator, 'on_epoch_end'):
                     val_generator.on_epoch_end()
+                self.history.setdefault('time_epoch_s', [None] * epoch).append(round(time.time() - epoch_started, 2))
+                keras_model = getattr(self.model, 'keras_model', None)
+                if keras_model is not None:
+                    self.history['trainable_parameters'] = int(sum(int(np.prod(v.shape)) for v in keras_model.trainable_variables))
                 # Save history
                 with open(self.checkpoint_dir / 'history.json', 'w') as f:
                     json.dump(self.history, f, indent=2)
+                if epoch + 1 < epochs and getattr(self, 'ema_variables', None):
+                    self.swap_ema()                     # back to the raw weights for training
             print(f"\n{'=' * 50}")
             print("Training complete!")
             print(f"Best val loss: {best_val_loss:.4f}")
@@ -979,9 +1029,11 @@ class DiceCallback:
         key = tuple(sorted(s['filename'] for s in pool))
         if getattr(self, '_train_volume_cache', (None, None, None))[:2] == (key, count):
             return self._train_volume_cache[2]
-        # With training.partial_annotation only tiles that have every level of the run can be scored.
+        # With training.partial_annotation only tiles that have every level of the run can be scored,
+        # with training.unknown_label only tiles without unknown voxels.
         levels = len(getattr(self.model.config, 'levels', ('nucleus', 'cytoplasm')))
-        pool = sorted((s for s in pool if len(s.get('annotated', ('nucleus', 'cytoplasm'))) >= levels), key=lambda s: s['filename'])
+        pool = sorted((s for s in pool if len(s.get('annotated', ('nucleus', 'cytoplasm'))) >= levels and
+                       s.get('nucleus_unknown') is None and s.get('cytoplasm_unknown') is None), key=lambda s: s['filename'])
         if not pool:
             return []
         originals = [s for s in pool if Path(s['filename']).stem.endswith('_a00')] or pool
@@ -1915,6 +1967,12 @@ class DiceCallback:
                     'cytoplasm_mask') is not None else None,
 
             }
+        # Only the image channels are drawn: a hierarchy of three or more levels appends its pair code.
+        channels = int(getattr(self.model.config, 'n_image_channels', 0) or 0)
+        if channels and img.ndim == 3 and img.shape[-1] > channels:
+            img = img[..., :channels]
+        if img.ndim == 3 and img.shape[-1] == 1:
+            img = img[..., 0]
         # Конвертируем и нормализуем
         if img.ndim == 3 and img.shape[-1] in [3, 4]:
             import cv2

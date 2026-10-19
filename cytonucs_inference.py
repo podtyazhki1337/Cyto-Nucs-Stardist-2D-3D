@@ -1590,6 +1590,18 @@ class CytoNucsPredictor:
             _fwd_cache.move_to_end(key)
             return fn(tf.convert_to_tensor(x, tf.float32))
 
+        def _flip_averaged(y_pred, tile):
+            """inference.tta_flips: probability maps averaged over the tile flipped in Y, in X and in both
+            (the distance maps stay those of the unflipped tile: flipping does not map the rays onto rays)."""
+            maps = {k: np.array(y_pred[k], np.float32) for k in ('nucleus_prob', 'cytoplasm_prob')}
+            for axes in ((nd - 2,), (nd - 1,), (nd - 2, nd - 1)):
+                flipped = _forward(np.ascontiguousarray(np.flip(tile, axis=axes))[np.newaxis, ...])
+                for k in maps:
+                    maps[k] += np.flip(np.asarray(flipped[k], np.float32), axis=tuple(a + 1 for a in axes))
+            out = dict(y_pred)
+            out.update({k: v / 4. for k, v in maps.items()})
+            return out
+
         _bs_full = tuple(block_sizes) + (1,)
         _nt_full = tuple(n_tiles_eff) + (1,)
         _ov_full = tuple(n_block_overlaps) + (0,)
@@ -1627,6 +1639,8 @@ class CytoNucsPredictor:
                         n_block_overlaps=_ov_full):
 
                     y_pred = _forward(tile[np.newaxis, ...])
+                    if getattr(self.config, 'tta_flips', False):
+                        y_pred = _flip_averaged(y_pred, tile)
 
                     def _arr(key):
                         a = np.asarray(y_pred[key])[0]

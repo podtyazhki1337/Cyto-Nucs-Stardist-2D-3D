@@ -588,6 +588,60 @@ def run_threshold_optimization(config_dict, config_path):
     return best
 
 
+class MixedTrainGenerator:
+    """Training batches from the main generator and, with probability training.extra_train_share, from
+    generators over extra datasets (training.extra_train_dirs, e.g. synthetic data). Every batch comes
+    from one source. Geometry, the train-side metric and the rest read the main generator."""
+
+    def __init__(self, main, extras, share, seed=0):
+        self.main, self.extras, self.share, self.seed = main, list(extras), float(share), int(seed)
+        self.epoch = 0
+
+    def __len__(self):
+        return len(self.main)
+
+    def __getitem__(self, idx):
+        rng = np.random.default_rng([self.seed, self.epoch, int(idx), 7])
+        if self.extras and rng.random() < self.share:
+            return self.extras[int(rng.integers(len(self.extras)))][idx]
+        return self.main[idx]
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+        for generator in [self.main] + self.extras:
+            generator.set_epoch(epoch)
+
+    def on_epoch_end(self):
+        for generator in [self.main] + self.extras:
+            generator.on_epoch_end()
+
+    def __getattr__(self, name):
+        if name == 'main':
+            raise AttributeError(name)
+        return getattr(self.main, name)
+
+
+def make_optimizer(schedule, weight_decay=0.0):
+    """Adam, or AdamW with decoupled weight decay (training.weight_decay) on kernels only."""
+    if weight_decay:
+        optimizer = tf.keras.optimizers.AdamW(learning_rate=schedule, weight_decay=weight_decay)
+        optimizer.exclude_from_weight_decay(var_names=['bias', 'gamma', 'beta'])
+        return optimizer
+    return tf.keras.optimizers.Adam(learning_rate=schedule)
+
+
+def geometry_labels(train_generator):
+    """Label images the object geometry is measured on: the training tiles; a level without any object
+    there (sparse annotation can leave none) is measured on the whole training volumes of train_regions."""
+    labels = {key: [s[key] for s in train_generator.data_pool] for key in ('nucleus_mask', 'cytoplasm_mask')}
+    regions = getattr(train_generator, 'region_pool', None) or []
+    for key, found in labels.items():
+        if regions and not any(np.any(m) for m in found):
+            labels[key] = [r[key] for r in regions]
+            print(f'No {key} object in the training tiles: geometry measured on the train_regions volumes')
+    return labels['nucleus_mask'], labels['cytoplasm_mask']
+
+
 class WarmupExponentialDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, initial_lr, warmup_steps, decay_steps, decay_rate,
                  min_lr=1e-6, step_offset=0, staircase=False):
@@ -771,13 +825,28 @@ def main(config_path='config_cytonucs.json'):
 
     print(f"Training samples: {len(train_generator.image_files)}")
     print(f"Validation samples: {len(val_generator.image_files)}")
+    # training.extra_train_dirs: more training data in tile layout (e.g. synthetic), mixed into the batches.
+    extra_generators = []
+    if model_config.extra_train_share and model_config.extra_train_dirs:
+        region_crops = model_config.train_region_crops
+        model_config.train_region_crops = False                    # extra datasets are read as tiles
+        try:
+            extra_generators = [CytoNucsDataGenerator(dataset_dir=Path(folder) / 'train', config=model_config,
+                                                      rays=model_config.rays, augmenter=augmenter, shuffle=True,
+                                                      subset='train', repool_freq=config_dict['data'].get('repool_freq', 10))
+                                for folder in model_config.extra_train_dirs]
+        finally:
+            model_config.train_region_crops = region_crops
+        print(f"Extra training data, share {model_config.extra_train_share}: "
+              + ', '.join(f'{folder} ({len(g.image_files)} files)' for folder, g in zip(model_config.extra_train_dirs, extra_generators)))
 
     # ========== КАНОНИЧЕСКИЙ ЗАМЕР АНИЗОТРОПИИ ==========
     # StarDist 3D выводит anisotropy из МЕДИАННЫХ BBOX ОБЪЕКТОВ, а не из шага
     # между срезами (examples/3D/2_training.ipynb). От неё зависят и лучи, и
     # grid. Делается ПОСЛЕ создания генераторов, потому что нужны загруженные
     # маски, и ДО build_cytonucs_model, потому что модель читает гриды.
-    resume_geometry = config_dict['training'].get('resume_from_checkpoint')
+    # training.init_weights (fine-tuning from another run) keeps that run's geometry like a resume does.
+    resume_geometry = config_dict['training'].get('resume_from_checkpoint') or config_dict['training'].get('init_weights')
     if resume_geometry:
         # Ray channel identities must stay identical to the saved weights.
         source_geometry = Path(resume_geometry).parent / 'geometry.json'
@@ -787,11 +856,8 @@ def main(config_path='config_cytonucs.json'):
             destination_geometry.write_bytes(source_geometry.read_bytes())
         print('Resume: preserving checkpoint ray geometry and grids')
     else:
-        model_config.set_anisotropy_from_labels(
-            [s['nucleus_mask'] for s in train_generator.data_pool],
-            [s['cytoplasm_mask'] for s in train_generator.data_pool],
-            update_grid=True)
-    for _gen in (train_generator, val_generator):
+        model_config.set_anisotropy_from_labels(*geometry_labels(train_generator), update_grid=True)
+    for _gen in [train_generator, val_generator] + extra_generators:
         _gen._nuc_grid = tuple(int(g) for g in model_config.nucleus_grid)
         _gen._cyto_grid = tuple(int(g) for g in model_config.cytoplasm_grid)
         _gen._nuc_rays = model_config.rays_nucleus
@@ -801,6 +867,9 @@ def main(config_path='config_cytonucs.json'):
     print(f"  ✓ Гриды генераторов обновлены: nucleus={train_generator._nuc_grid}, "
           f"cytoplasm={train_generator._cyto_grid}")
     print(f"Steps per epoch: {model_config.train_steps_per_epoch} (from config)")
+    if extra_generators:
+        train_generator = MixedTrainGenerator(train_generator, extra_generators, model_config.extra_train_share,
+                                              seed=int(model_config.seed))
 
     # ========== Build Model ==========
     print("\nBuilding model...")
@@ -847,6 +916,15 @@ def main(config_path='config_cytonucs.json'):
                 print(f"   Loaded history: {len(loaded_history.get('train_loss', []))} epochs")
         else:
             raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+    init_weights = config_dict['training'].get('init_weights')
+    if init_weights and not config_dict['training'].get('resume_from_checkpoint'):
+        if not Path(init_weights).exists():
+            raise FileNotFoundError(f'init_weights not found: {init_weights}')
+        model.load_weights(init_weights)
+        # Gates and mask thresholds belong to the other run's data: full validation calibrates new ones.
+        model.loaded_quality_gates = None
+        model.loaded_mask_thresholds = None
+        print(f'Initial weights (fine-tuning from epoch 0 with a new optimizer): {init_weights}')
     # ========== КОНЕЦ БЛОКА ==========
     print("\nModel Summary:")
     model.summary()
@@ -897,7 +975,7 @@ def main(config_path='config_cytonucs.json'):
         config=model_config,
         loss_fn=loss_fn,
         gradient_clip_norm=gradient_clip_norm,
-        optimizer=Adam(learning_rate=schedule)
+        optimizer=make_optimizer(schedule, float(config_dict['training'].get('weight_decay', 0.0) or 0.0))
     )
     # Restore history if resuming
     resume_path = config_dict['training'].get('resume_from_checkpoint')

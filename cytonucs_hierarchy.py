@@ -251,6 +251,22 @@ def predict_hierarchy(model, config, image, calibration=None, normalize=True, th
         image = image[..., None]
     if normalize:
         image = percentile_normalize(image, 1, 99.8, axis=tuple(range(nd)))
+    if not config.n_pair_channels:
+        # One or two levels: the two-level pipeline itself, with the quality gates and mask thresholds
+        # loaded with the weights and the child -> parent pairs it chose, as the full validation of
+        # training scores them.
+        predictor = CytoNucsPredictor(model=model, config=config, **(thresholds or {}))
+        inner, outer, _ = DiceCallback._predict_full_volume(SimpleNamespace(model=model), predictor, image)
+        by_role = dict(nucleus=np.asarray(inner), cytoplasm=np.asarray(outer))
+        levels = {level: by_role[role] for role, level in config.level_roles.items()}
+        parents = {}
+        if len(config.levels) == 2:
+            from cytonucs_losses import compute_nucleus_cell_assignments
+            chosen = getattr(predictor, '_prompt_assignments', None)
+            if chosen is None:                                   # as compute_jtpr does without predicted pairs
+                chosen = compute_nucleus_cell_assignments(levels[config.levels[0]], levels[config.levels[1]])[0]
+            parents[config.levels[0]] = {int(k): int(v) for k, v in chosen.items()}
+        return dict(levels=levels, parents=parents)
     levels = {}
     outer = None
     for index in range(len(config.level_pairs)):
