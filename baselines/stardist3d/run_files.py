@@ -3,7 +3,7 @@ object level, trained like the CytoNucs run it is compared with and scored like 
 
   - data: <data>/{train,val,test}/images/<name> and <data>/<split>/<level>_masks/<name>; every volume normalised by
     its percentiles 1 / 99.8 (per channel for 2D colour images), as the CytoNucs generator does;
-  - the train volumes are cached once as float16 / uint16 .npy files (--cache) and memory-mapped, so a large
+  - the train volumes are cached once as float16 / smallest-unsigned .npy files (--cache) and memory-mapped, so a large
     dataset (342 KiTS23 CT volumes) is not held in RAM. StarDist's own sampler keeps every valid patch centre of
     every volume in memory (hundreds of MB per CT volume), so it is replaced by one with the same distribution:
     a centre drawn uniformly among the valid centres, with probability train_foreground_only (0.9) among those
@@ -110,11 +110,15 @@ def read_image(path):
 
 
 def read_labels(split, level, name):
+    """Labels in the smallest unsigned type that holds them (uint8 for a few objects per volume: half the memory
+    of the memory-mapped training data)."""
     y = tifffile.imread(DATA / split / f'{level}_masks' / name)
-    return fill_label_holes(np.where(y == UNKNOWN, 0, y).astype(np.uint16))
+    y = fill_label_holes(np.where(y == UNKNOWN, 0, y).astype(np.uint16))
+    return y.astype(np.uint8) if y.max() < 256 else y
 
 
 IMAGE_CACHE = 'image_n2'          # n2: cytonucs_runtime.normalize_percentiles (caches of the plain csbdeep one are not reused)
+LABEL_CACHE = 'min'               # labels in the smallest unsigned type (uint16 caches of earlier runs are not reused)
 
 
 def finite_float16(x, name):
@@ -133,13 +137,13 @@ def cached(split, level):
     for name in (n for n in names(split) if (DATA / split / f'{level}_masks' / n).is_file()):
         stem = Path(name).stem
         for path, make in ((folder / f'{stem}.{IMAGE_CACHE}.npy', lambda: finite_float16(read_image(DATA / split / 'images' / name), name)),
-                           (folder / f'{stem}.{level}.npy', lambda: read_labels(split, level, name))):
+                           (folder / f'{stem}.{level}.{LABEL_CACHE}.npy', lambda: read_labels(split, level, name))):
             if not path.is_file():
                 partial = folder / f'.{stem}.{os.getpid()}.npy'
                 np.save(partial, make())
                 os.replace(partial, path)
         xs.append(np.load(folder / f'{stem}.{IMAGE_CACHE}.npy', mmap_mode='r'))
-        ys.append(np.load(folder / f'{stem}.{level}.npy', mmap_mode='r'))
+        ys.append(np.load(folder / f'{stem}.{level}.{LABEL_CACHE}.npy', mmap_mode='r'))
     return xs, ys
 
 

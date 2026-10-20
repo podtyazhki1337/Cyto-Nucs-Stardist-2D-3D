@@ -1,6 +1,7 @@
 """GPU job queue of the paper runs with memory budgets: several jobs share a GPU when their declared memory fits.
 
-Every job script declares the GPU memory it needs in a line '# gpu_gb: N' (jobs without it take a whole GPU).
+Every job script declares the GPU memory it needs in a line '# gpu_gb: N' (jobs without it take a whole GPU) and
+the host memory in '# ram_gb: N' (default 12 GB: resident memory plus memory-mapped training data it reads).
 Slots (queue_slot.sh) ask this module for work; every GPU has a heavy and a light slot:
   - a job starts on a GPU when the memory reserved there plus its need stays within the budget (23 GB of 24);
   - heavy jobs (above 10 GB) run in the heavy slot, one at a time per GPU, in name order, the first that fits;
@@ -8,6 +9,9 @@ Slots (queue_slot.sh) ask this module for work; every GPU has a heavy and a ligh
     the heavy slot while heavy jobs wait), and in the heavy slot when no heavy job can start;
   - a heavy job that has waited more than 24 h and fits nowhere makes one GPU empty for it ('drain'): nothing new
     starts there until it does, so the jobs sharing the GPUs cannot starve it;
+  - host memory: a job starts only while the host memory reserved by all queue jobs plus its need stays within
+    70 GB (of 93; the rest is the system's and interactive work's); a job that has waited more than 24 h for host
+    memory is the only one that may start until it does;
   - a reservation names the slot's process; reservations of dead processes are dropped, so a killed slot frees its
     memory; reservations of jobs started outside the slots can be added with 'reserve'.
 State: <queue>/state.json, guarded by an exclusive lock on <queue>/.lock.
@@ -16,7 +20,8 @@ Commands (used by queue_slot.sh):
   python paper_queue.py --queue DIR pick GPU PID KIND -> the job taken by a heavy / light slot (moved jobs/ ->
                                                         running/), or nothing
   python paper_queue.py --queue DIR release GPU PID   -> drops the reservation of that slot
-  python paper_queue.py --queue DIR reserve GPU PID GB NAME   -> reservation for a job started elsewhere
+  python paper_queue.py --queue DIR reserve GPU PID GB NAME [RAM_GB]  -> reservation for a job started elsewhere
+  python paper_queue.py --queue DIR setram PID RAM_GB  -> host memory of the reservations of that process
   python paper_queue.py --queue DIR retire PID ...    -> these slots finish their job and take no new one
   python paper_queue.py --queue DIR status            -> reservations, drains and waiting jobs with their needs
   python paper_queue.py --queue DIR left              -> number of jobs not yet started
@@ -34,12 +39,20 @@ BUDGET_GB = 23.0
 WHOLE_GPU_GB = 23.0
 LIGHT_MAX_GB = 10.0
 DRAIN_AFTER_H = 24.0
+RAM_BUDGET_GB = 70.0
+DEFAULT_RAM_GB = 12.0
 
 
 def need_gb(script):
     """Declared GPU memory of a job script ('# gpu_gb: N'); without it the whole GPU."""
     found = re.search(r'^#\s*gpu_gb:\s*([0-9.]+)', Path(script).read_text(), flags=re.M)
     return float(found.group(1)) if found else WHOLE_GPU_GB
+
+
+def ram_gb(script):
+    """Declared host memory of a job script ('# ram_gb: N'), DEFAULT_RAM_GB without it."""
+    found = re.search(r'^#\s*ram_gb:\s*([0-9.]+)', Path(script).read_text(), flags=re.M)
+    return float(found.group(1)) if found else DEFAULT_RAM_GB
 
 
 def alive(pid):
@@ -51,7 +64,7 @@ def alive(pid):
 
 
 def choose(jobs, needs, reservations, drains, gpu, kind, waited=None, budget=BUDGET_GB, light_max=LIGHT_MAX_GB,
-           drain_after_h=DRAIN_AFTER_H):
+           drain_after_h=DRAIN_AFTER_H, ram_needs=None, ram_budget=RAM_BUDGET_GB):
     """The job a slot of this GPU starts now (or None) and the drains after the decision.
 
     jobs: names in queue order; needs: name -> GB; reservations: list of dict(gpu, gb); drains: gpu -> the heavy
@@ -61,32 +74,44 @@ def choose(jobs, needs, reservations, drains, gpu, kind, waited=None, budget=BUD
         to start, a light job that fits;
       - light slot: a light job that fits, next to the jobs already on the GPU; it leaves an empty GPU, or a
         heavy job that fits while the heavy slot is idle, to the heavy slot, and starts nothing on a GPU that
-        empties for a heavy job. Reservations made by a slot name it (slot: heavy / light)."""
+        empties for a heavy job. Reservations made by a slot name it (slot: heavy / light).
+    ram_needs: name -> host GB (DEFAULT_RAM_GB if missing); every job needs that much of the host memory left by
+    all reservations (their 'ram', DEFAULT_RAM_GB if missing). A job that has waited longer than drain_after_h and
+    does not fit the host memory is the only one that may start."""
     waited = waited or {}
+    ram_needs = ram_needs or {}
     drains = {g: j for g, j in drains.items() if j in jobs}
     on_gpu = [r for r in reservations if r['gpu'] == gpu]
     free = budget - sum(r['gb'] for r in on_gpu)
+    ram_free = ram_budget - sum(r.get('ram', DEFAULT_RAM_GB) for r in reservations)
+    starved = [j for j in jobs if waited.get(j, 0.0) > drain_after_h and ram_needs.get(j, DEFAULT_RAM_GB) > ram_free]
+
+    def startable(job):
+        return ram_needs.get(job, DEFAULT_RAM_GB) <= ram_free and (not starved or job == starved[0])
     heavy_waiting = [j for j in jobs if needs[j] > light_max]
     if gpu in drains:                                       # this GPU empties for one heavy job
         job = drains[gpu]
-        if kind == 'heavy' and needs[job] <= free:
+        if kind == 'heavy' and needs[job] <= free and startable(job):
             drains.pop(gpu)
             return job, drains
         return None, drains
     if kind == 'heavy' and not any(r['gb'] > light_max for r in on_gpu):
         for job in heavy_waiting:
             if needs[job] <= free:
-                return job, {g: j for g, j in drains.items() if j != job}
+                if startable(job):
+                    return job, {g: j for g, j in drains.items() if j != job}
+                continue                                    # fits this GPU, waits for host memory
             if waited.get(job, 0.0) > drain_after_h and job not in drains.values():
                 drains[gpu] = job
                 return None, drains
     if kind == 'light' and heavy_waiting:
         if not on_gpu:
             return None, drains                             # an empty GPU is for the heavy slot
-        if not any(r.get('slot') == 'heavy' for r in on_gpu) and any(needs[j] <= free for j in heavy_waiting):
+        if not any(r.get('slot') == 'heavy' for r in on_gpu) and any(needs[j] <= free and startable(j)
+                                                                     for j in heavy_waiting):
             return None, drains                             # the idle heavy slot takes the heavy job that fits
     for job in jobs:
-        if needs[job] <= light_max and needs[job] <= free:
+        if needs[job] <= light_max and needs[job] <= free and startable(job):
             return job, drains
     return None, drains
 
@@ -121,16 +146,19 @@ class Queue:
                 return None
             jobs = self.waiting()
             needs = {job: need_gb(self.jobs_dir / job) for job in jobs}
+            ram_needs = {job: ram_gb(self.jobs_dir / job) for job in jobs}
             now = time.time()
             state.setdefault('seen', {})
             state['seen'] = {job: state['seen'].get(job, now) for job in jobs}       # first time seen waiting
             waited = {job: (now - t) / 3600 for job, t in state['seen'].items()}
-            job, state['drains'] = choose(jobs, needs, state['reservations'], state['drains'], str(gpu), kind, waited)
+            job, state['drains'] = choose(jobs, needs, state['reservations'], state['drains'], str(gpu), kind, waited,
+                                          ram_needs=ram_needs)
             if job is None:
                 return None
             self.running_dir.mkdir(exist_ok=True)
             os.replace(self.jobs_dir / job, self.running_dir / job)
-            state['reservations'].append(dict(gpu=str(gpu), pid=int(pid), gb=needs[job], job=job, slot=kind))
+            state['reservations'].append(dict(gpu=str(gpu), pid=int(pid), gb=needs[job], ram=ram_needs[job], job=job,
+                                              slot=kind))
             return job
 
     def release(self, gpu, pid):
@@ -142,22 +170,33 @@ class Queue:
         with self.locked() as state:
             state['retired'] = sorted(set(state['retired']) | {int(pid) for pid in pids if alive(pid)})
 
-    def reserve(self, gpu, pid, gb, name):
+    def reserve(self, gpu, pid, gb, name, ram=DEFAULT_RAM_GB):
         with self.locked() as state:
-            state['reservations'].append(dict(gpu=str(gpu), pid=int(pid), gb=float(gb), job=name))
+            state['reservations'].append(dict(gpu=str(gpu), pid=int(pid), gb=float(gb), ram=float(ram), job=name))
+
+    def setram(self, pid, ram):
+        """Host memory of the reservations of a process (jobs that started before they declared it)."""
+        with self.locked() as state:
+            for r in state['reservations']:
+                if r['pid'] == int(pid):
+                    r['ram'] = float(ram)
 
     def status(self):
         with self.locked() as state:
-            lines = [f"GPU {r['gpu']}: {r['gb']:g} GB {r['job']} (pid {r['pid']})" for r in sorted(state['reservations'], key=lambda r: r['gpu'])]
+            ram = sum(r.get('ram', DEFAULT_RAM_GB) for r in state['reservations'])
+            lines = [f"GPU {r['gpu']}: {r['gb']:g} GB, RAM {r.get('ram', DEFAULT_RAM_GB):g} GB {r['job']} (pid {r['pid']})"
+                     for r in sorted(state['reservations'], key=lambda r: r['gpu'])]
+            lines += [f'host memory reserved: {ram:g} of {RAM_BUDGET_GB:g} GB']
             lines += [f'GPU {gpu} holds for {job}' for gpu, job in sorted(state['drains'].items())]
-            lines += [f'waiting: {job} ({need_gb(self.jobs_dir / job):g} GB)' for job in self.waiting()]
+            lines += [f'waiting: {job} ({need_gb(self.jobs_dir / job):g} GB, RAM {ram_gb(self.jobs_dir / job):g} GB)'
+                      for job in self.waiting()]
             return '\n'.join(lines)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--queue', default='/storage02/miroslavm/cytonucs_paper_runs/queue')
-    parser.add_argument('command', choices=('pick', 'release', 'reserve', 'retire', 'status', 'left'))
+    parser.add_argument('command', choices=('pick', 'release', 'reserve', 'setram', 'retire', 'status', 'left'))
     parser.add_argument('values', nargs='*')
     args = parser.parse_args()
     queue = Queue(args.queue)
@@ -169,7 +208,9 @@ def main():
     elif args.command == 'retire':
         queue.retire(*args.values)
     elif args.command == 'reserve':
-        queue.reserve(*args.values[:4])
+        queue.reserve(*args.values[:5])
+    elif args.command == 'setram':
+        queue.setram(*args.values[:2])
     elif args.command == 'status':
         print(queue.status())
     else:
