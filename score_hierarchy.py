@@ -50,9 +50,10 @@ def paper_metrics(gt_inner, gt_outer, pred_inner, pred_outer, truth):
     """Metrics of the HydraStarDist paper (De et al. 2025, arXiv 2504.12078) for one image, at every tau of
     PAPER_TAUS: IoUR (sum of the IoU of the matched objects / ground-truth objects, their Eq. 8) and AP
     (TP / (TP + FP + FN), Eq. 9) of both levels, and the joint TP rate: ground-truth child -> parent pairs (truth)
-    whose child and parent are both matched, over all ground-truth children (jtpr_inner, Eq. 12) or parents
-    (jtpr_outer, Eq. 13); unlike our JTPR it does not ask the matched predictions to be linked. None where the
-    image has no ground-truth objects of that level (AP: no objects at all)."""
+    whose child and parent are both matched, over all ground-truth children (jtpr_inner, Eq. 12), and the parents
+    matched together with at least one matched child over all ground-truth parents (jtpr_outer: Eq. 13 when every
+    parent holds one child, at most 1 when it holds several); unlike our JTPR neither asks the matched predictions
+    to be linked. None where the image has no ground-truth objects of that level (AP: no objects at all)."""
     from stardist.matching import matching
     out, matched = {}, {}
     for name, gt, pred in (('inner', gt_inner, pred_inner), ('outer', gt_outer, pred_outer)):
@@ -62,10 +63,10 @@ def paper_metrics(gt_inner, gt_outer, pred_inner, pred_outer, truth):
         out['iour_' + name] = [float(r.mean_true_score) if n_true else None for r in results]
         out['ap_' + name] = [float(r.accuracy) if r.tp + r.fp + r.fn else None for r in results]
         matched[name] = [{r.matched_pairs[i][0] for i in r.matched_tps} for r in results]
-    joint = [sum(1 for child, parent in truth.items() if child in inner and parent in outer)
+    joint = [[(child, parent) for child, parent in truth.items() if child in inner and parent in outer]
              for inner, outer in zip(matched['inner'], matched['outer'])]
-    out['jtpr_inner'] = [j / out['n_inner'] if out['n_inner'] else None for j in joint]
-    out['jtpr_outer'] = [j / out['n_outer'] if out['n_outer'] else None for j in joint]
+    out['jtpr_inner'] = [len(j) / out['n_inner'] if out['n_inner'] else None for j in joint]
+    out['jtpr_outer'] = [len({parent for _, parent in j}) / out['n_outer'] if out['n_outer'] else None for j in joint]
     return out
 
 

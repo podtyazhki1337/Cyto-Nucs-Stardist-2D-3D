@@ -6,7 +6,7 @@ Slots (queue_slot.sh) ask this module for work; every GPU has a heavy and a ligh
   - heavy jobs (above 10 GB) run in the heavy slot, one at a time per GPU, in name order, the first that fits;
   - light jobs (up to 10 GB) run in the light slot next to the jobs already on the GPU (an empty GPU is left to
     the heavy slot while heavy jobs wait), and in the heavy slot when no heavy job can start;
-  - a heavy job that has waited more than 6 h and fits nowhere makes one GPU empty for it ('drain'): nothing new
+  - a heavy job that has waited more than 24 h and fits nowhere makes one GPU empty for it ('drain'): nothing new
     starts there until it does, so the jobs sharing the GPUs cannot starve it;
   - a reservation names the slot's process; reservations of dead processes are dropped, so a killed slot frees its
     memory; reservations of jobs started outside the slots can be added with 'reserve'.
@@ -17,6 +17,7 @@ Commands (used by queue_slot.sh):
                                                         running/), or nothing
   python paper_queue.py --queue DIR release GPU PID   -> drops the reservation of that slot
   python paper_queue.py --queue DIR reserve GPU PID GB NAME   -> reservation for a job started elsewhere
+  python paper_queue.py --queue DIR retire PID ...    -> these slots finish their job and take no new one
   python paper_queue.py --queue DIR status            -> reservations, drains and waiting jobs with their needs
   python paper_queue.py --queue DIR left              -> number of jobs not yet started
 """
@@ -32,7 +33,7 @@ from pathlib import Path
 BUDGET_GB = 23.0
 WHOLE_GPU_GB = 23.0
 LIGHT_MAX_GB = 10.0
-DRAIN_AFTER_H = 6.0
+DRAIN_AFTER_H = 24.0
 
 
 def need_gb(script):
@@ -103,7 +104,9 @@ class Queue:
             state = json.loads(self.state_path.read_text()) if self.state_path.is_file() else {}
             state.setdefault('reservations', [])
             state.setdefault('drains', {})
+            state.setdefault('retired', [])
             state['reservations'] = [r for r in state['reservations'] if alive(r['pid'])]
+            state['retired'] = [pid for pid in state['retired'] if alive(pid)]
             yield state
             tmp = self.state_path.with_suffix('.tmp')
             tmp.write_text(json.dumps(state, indent=1))
@@ -114,6 +117,8 @@ class Queue:
 
     def pick(self, gpu, pid, kind):
         with self.locked() as state:
+            if int(pid) in state['retired']:
+                return None
             jobs = self.waiting()
             needs = {job: need_gb(self.jobs_dir / job) for job in jobs}
             now = time.time()
@@ -132,6 +137,11 @@ class Queue:
         with self.locked() as state:
             state['reservations'] = [r for r in state['reservations'] if not (r['gpu'] == str(gpu) and r['pid'] == int(pid))]
 
+    def retire(self, *pids):
+        """Slots that finish their current job and take no new one (replaced by other slots)."""
+        with self.locked() as state:
+            state['retired'] = sorted(set(state['retired']) | {int(pid) for pid in pids if alive(pid)})
+
     def reserve(self, gpu, pid, gb, name):
         with self.locked() as state:
             state['reservations'].append(dict(gpu=str(gpu), pid=int(pid), gb=float(gb), job=name))
@@ -147,7 +157,7 @@ class Queue:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--queue', default='/storage02/miroslavm/cytonucs_paper_runs/queue')
-    parser.add_argument('command', choices=('pick', 'release', 'reserve', 'status', 'left'))
+    parser.add_argument('command', choices=('pick', 'release', 'reserve', 'retire', 'status', 'left'))
     parser.add_argument('values', nargs='*')
     args = parser.parse_args()
     queue = Queue(args.queue)
@@ -156,6 +166,8 @@ def main():
         print(job or '')
     elif args.command == 'release':
         queue.release(*args.values[:2])
+    elif args.command == 'retire':
+        queue.retire(*args.values)
     elif args.command == 'reserve':
         queue.reserve(*args.values[:4])
     elif args.command == 'status':

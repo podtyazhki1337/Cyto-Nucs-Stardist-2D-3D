@@ -45,7 +45,7 @@ class ChooseTests(unittest.TestCase):
         self.assertEqual(choose(JOBS, NEEDS, [held('2', 22)], {}, '2', 'heavy'), (None, {}))
 
     def test_a_long_waiting_heavy_job_makes_one_gpu_empty_for_it(self):
-        waited = {'01_big.sh': 7.0}
+        waited = {'01_big.sh': 25.0}                                              # past DRAIN_AFTER_H (24 h)
         job, drains = choose(JOBS, NEEDS, [held('0', 6)], {}, '0', 'heavy', waited)
         self.assertEqual((job, drains), (None, {'0': '01_big.sh'}))
         self.assertEqual(choose(JOBS, NEEDS, [held('0', 6)], drains, '0', 'light'), (None, drains))   # nothing new
@@ -78,6 +78,10 @@ class QueueTests(unittest.TestCase):
             self.assertIn('gone', [r['job'] for r in state['reservations']])
             with queue.locked() as state:                                         # dead process: dropped
                 self.assertNotIn('gone', [r['job'] for r in state['reservations']])
+            (root / 'jobs' / '03_c.sh').write_text('#!/bin/bash\n# gpu_gb: 4\necho c\n')
+            queue.retire(os.getpid())
+            self.assertIsNone(queue.pick('2', os.getpid(), 'heavy'))                  # a retired slot takes nothing
+            self.assertEqual(queue.pick('2', os.getppid(), 'heavy'), '03_c.sh')       # another slot does
 
 
 if __name__ == '__main__':

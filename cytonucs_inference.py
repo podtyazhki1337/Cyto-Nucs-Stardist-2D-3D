@@ -1337,7 +1337,7 @@ class CytoNucsPredictor:
         zero-prompt refinement не нужен, настоящий идёт в
         predict_instances_prompted() с реальным Gaussian prompt.
         """
-        from csbdeep.utils import normalize
+        from cytonucs_runtime import normalize_percentiles as normalize
         from csbdeep.internals.predict import tile_iterator
         from math import gcd
         from itertools import product
@@ -1814,7 +1814,7 @@ class CytoNucsPredictor:
         он возвращал сегментацию одного угла как результат по всему кадру. Если
         не влезает — это тайлинг, а не тихая обрезка.
         """
-        from csbdeep.utils import normalize
+        from cytonucs_runtime import normalize_percentiles as normalize
         from math import gcd
 
         self.model.last_refinement_diagnostics = {}

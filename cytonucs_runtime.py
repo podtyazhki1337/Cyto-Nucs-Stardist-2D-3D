@@ -90,6 +90,26 @@ def restored_best_metric(history, checkpoint_best, selection_start_epoch=0, jtpr
                default=float('-inf'))
 
 
+def percentile_range(x, axis=None, pmin=1.0, pmax=99.8):
+    """(low, high) percentiles of x over axis (keepdims) for the percentile normalisation. A channel whose high
+    percentile equals its low one while brighter pixels exist (nearly empty: a few hundred pixels above the
+    background, e.g. 7 HeLaCytoNuc nucleus channels) takes its maximum as high: dividing by ~0 would blow those
+    pixels up to ~1e20. Every other channel gets exactly csbdeep's percentiles."""
+    import numpy as np
+    x = np.asarray(x, np.float32)
+    low = np.percentile(x, pmin, axis=axis, keepdims=True)
+    high = np.percentile(x, pmax, axis=axis, keepdims=True)
+    top = np.max(x, axis=axis, keepdims=True)
+    return low, np.where((high - low < 1e-6) & (top > low), top, high)
+
+
+def normalize_percentiles(x, pmin=1.0, pmax=99.8, axis=None):
+    """csbdeep.utils.normalize(x, pmin, pmax, axis) with the guard of percentile_range for nearly empty channels."""
+    import numpy as np
+    low, high = percentile_range(x, axis, pmin, pmax)
+    return ((np.asarray(x, np.float32) - low) / (high - low + 1e-20)).astype(np.float32)
+
+
 def read_model_image(path, ndim, channels):
     """Read TIFF axes before falling back to unambiguous channel placement."""
     import numpy as np

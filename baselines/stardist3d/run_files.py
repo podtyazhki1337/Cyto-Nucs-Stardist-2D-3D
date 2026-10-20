@@ -60,12 +60,13 @@ parser.add_argument('--fixed-thresholds', type=float, nargs=2, metavar=('PROB', 
                     help='use these thresholds instead of optimising them on the val volumes (smoke tests)')
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+import resource                                       # every memory-mapped volume holds a file descriptor
+resource.setrlimit(resource.RLIMIT_NOFILE, (resource.getrlimit(resource.RLIMIT_NOFILE)[1],) * 2)
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
 
 import numpy as np
 import tifffile
 import tensorflow as tf
-from csbdeep.utils import normalize
 from scipy.ndimage import find_objects
 from stardist import fill_label_holes, Rays_GoldenSpiral
 from stardist.models import Config2D, Config3D, StarDist2D, StarDist3D
@@ -76,6 +77,7 @@ sys.path.insert(0, str(HERE.parents[1]))
 from cytonucs_data_generator import cytonucs_augmenter_3d, elastic_displacement, warp_yx
 sys.path.insert(0, str(HERE.parent))
 from patch_sampler import light_valid_inds
+from cytonucs_runtime import normalize_percentiles as normalize
 
 for device in tf.config.list_physical_devices('GPU'):
     if int(os.environ.get('GPU_MEMORY_LIMIT_MB', 0) or 0):          # a cap when the queue shares the GPU
@@ -112,6 +114,16 @@ def read_labels(split, level, name):
     return fill_label_holes(np.where(y == UNKNOWN, 0, y).astype(np.uint16))
 
 
+IMAGE_CACHE = 'image_n2'          # n2: cytonucs_runtime.normalize_percentiles (caches of the plain csbdeep one are not reused)
+
+
+def finite_float16(x, name):
+    x = np.asarray(x, np.float16)
+    if not np.isfinite(x).all():
+        raise ValueError(f'{name}: the normalised image does not fit float16 (inf / nan)')
+    return x
+
+
 def cached(split, level):
     """Memory-mapped (images, labels) of a split, written to CACHE on first use."""
     folder = CACHE / split
@@ -120,13 +132,13 @@ def cached(split, level):
     # Files without masks of this level (partial annotation, e.g. 'two datasets') are no training material for it.
     for name in (n for n in names(split) if (DATA / split / f'{level}_masks' / n).is_file()):
         stem = Path(name).stem
-        for path, make in ((folder / f'{stem}.image.npy', lambda: read_image(DATA / split / 'images' / name).astype(np.float16)),
+        for path, make in ((folder / f'{stem}.{IMAGE_CACHE}.npy', lambda: finite_float16(read_image(DATA / split / 'images' / name), name)),
                            (folder / f'{stem}.{level}.npy', lambda: read_labels(split, level, name))):
             if not path.is_file():
                 partial = folder / f'.{stem}.{os.getpid()}.npy'
                 np.save(partial, make())
                 os.replace(partial, path)
-        xs.append(np.load(folder / f'{stem}.image.npy', mmap_mode='r'))
+        xs.append(np.load(folder / f'{stem}.{IMAGE_CACHE}.npy', mmap_mode='r'))
         ys.append(np.load(folder / f'{stem}.{level}.npy', mmap_mode='r'))
     return xs, ys
 

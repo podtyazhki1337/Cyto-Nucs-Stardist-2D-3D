@@ -242,7 +242,7 @@ def predict_hierarchy(model, config, image, calibration=None, normalize=True, th
     dict(prob_thresh_nucleus, prob_thresh_cytoplasm, nms_thresh) for the predictors.
     Returns dict(levels={level: labels}, parents={child level: {child id: parent id}}).
     """
-    from csbdeep.utils import normalize as percentile_normalize
+    from cytonucs_runtime import normalize_percentiles as percentile_normalize
     from cytonucs_inference import CytoNucsPredictor
     from cytonucs_trainer import DiceCallback
     nd = int(config.ndim)

@@ -132,6 +132,10 @@ class PaperMetricsTests(unittest.TestCase):
         # No link between the matched predictions is asked: swapping the predicted cell ids changes nothing.
         swapped = np.where(cells == 1, 2, np.where(cells == 2, 1, 0)).astype(np.uint16)
         self.assertEqual(paper_metrics(nuclei, cells, found, swapped, {1: 1, 2: 2})['jtpr_inner'][half], 0.5)
+        # Two children in one parent: the parent counts once, so the rate over parents stays at most 1.
+        two = np.zeros((40, 80), np.uint16); two[10:20, 5:15], two[22:32, 20:30] = 1, 3
+        both = paper_metrics(two, cells, two, cells, {1: 1, 3: 1})
+        self.assertEqual((both['jtpr_inner'][half], both['jtpr_outer'][half]), (1.0, 0.5))      # 2 of 2 children, 1 of 2 cells
         # Images without ground-truth nuclei do not enter the nucleus means; the best tau is the maximum.
         empty = paper_metrics(np.zeros_like(nuclei), cells, np.zeros_like(nuclei), cells, {})
         mean = mean_paper_metrics([m, empty])
@@ -213,6 +217,25 @@ class SparseTilesTests(unittest.TestCase):
                 self.assertTrue((out / 'cytoplasm_masks' / name).exists())
             self.assertEqual(list((out / 'assignments').iterdir()), [])                 # no file has both levels
             self.assertEqual(len(list((Path(tmp) / 'out/test/cytoplasm_masks').iterdir())), 6)
+
+
+class NormalisationTests(unittest.TestCase):
+    def test_equal_to_csbdeep_except_for_nearly_empty_channels(self):
+        from csbdeep.utils import normalize
+        from cytonucs_runtime import normalize_percentiles
+        rng = np.random.default_rng(0)
+        image = rng.random((64, 80, 3)).astype(np.float32) * 200
+        np.testing.assert_allclose(normalize_percentiles(image, 1, 99.8, axis=(0, 1)),
+                                   normalize(image, 1, 99.8, axis=(0, 1)), rtol=1e-5, atol=1e-5)
+        image[..., 2] = 0
+        image[:1, :5, 2] = 255                                   # 5 bright pixels (0.1 %): the 99.8th percentile is 0
+        before = normalize(image, 1, 99.8, axis=(0, 1))
+        after = normalize_percentiles(image, 1, 99.8, axis=(0, 1))
+        self.assertGreater(before[..., 2].max(), 1e15)            # csbdeep divides by ~0
+        self.assertAlmostEqual(float(after[..., 2].max()), 1.0, places=5)
+        np.testing.assert_allclose(after[..., :2], before[..., :2], rtol=1e-5, atol=1e-5)
+        image[..., 2] = 0                                        # an empty channel stays 0
+        self.assertEqual(float(normalize_percentiles(image, 1, 99.8, axis=(0, 1))[..., 2].max()), 0.0)
 
 
 class SubsetViewTests(unittest.TestCase):

@@ -68,7 +68,7 @@ def evaluate(config_path, weights, splits=('test', 'val'), margin=192, save=None
                 gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=int(os.environ['GPU_MEMORY_LIMIT_MB']))])
         else:
             tf.config.experimental.set_memory_growth(gpu, True)
-    from csbdeep.utils import normalize
+    from cytonucs_runtime import normalize_percentiles as normalize
     from stardist.matching import matching
     from cytonucs_config import CytoNucsConfig
     from cytonucs_model import build_cytonucs_model

@@ -11,7 +11,7 @@ import tensorflow as tf
 from tensorflow.keras.utils import Sequence
 from pathlib import Path
 import imageio
-from csbdeep.utils import normalize
+from cytonucs_runtime import normalize_percentiles, percentile_range
 from skimage.transform import rescale
 import json
 import random
@@ -358,9 +358,9 @@ class CytoNucsDataGenerator(Sequence):
             # Статистика глобальная по тому и от кропа с аугментацией не
             # зависит, поэтому кэшируется без изменения результата.
             if nd == 2 and img.ndim == 3 and img.shape[-1] in (3, 4):
-                img = normalize(img.astype(np.float32), 1, 99.8, axis=(0, 1))
+                img = normalize_percentiles(img, 1, 99.8, axis=(0, 1))
             else:
-                img = normalize(img.astype(np.float32), 1, 99.8,
+                img = normalize_percentiles(img, 1, 99.8,
                                 axis=tuple(range(nd)))
             img = np.ascontiguousarray(img, dtype=np.float32)
 
@@ -553,8 +553,7 @@ class CytoNucsDataGenerator(Sequence):
             y0, y1, x0, x1 = sample['blocks'][block]
             context = sample['image'][tuple(slice(s, s + p) for s, p in zip(starts[:-2], patch[:-2])) +
                                       (slice(y0, y1), slice(x0, x1))]
-            sample['percentiles'][key] = np.percentile(context.astype(np.float32), (1, 99.8),
-                                                       axis=tuple(range(nd)), keepdims=True)
+            sample['percentiles'][key] = percentile_range(context, axis=tuple(range(nd)))
         mi, ma = sample['percentiles'][key]
         return np.ascontiguousarray(normalize_mi_ma(crop.astype(np.float32), mi, ma), dtype=np.float32)
 

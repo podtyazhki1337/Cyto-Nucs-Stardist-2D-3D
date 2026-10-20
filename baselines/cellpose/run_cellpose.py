@@ -11,7 +11,8 @@ and scored with score_predictions.py in the CytoNucs env, like every other metho
   - training: Cellpose's train_seg with its fine-tuning recipe (SGD, learning rate 0.1, weight decay 1e-4,
     crops of 224 rescaled to the model's object size), --epochs epochs of --nimg-per-epoch crops in batches of
     --batch: the default 300 x 800 crops of batch 8 is the crop budget of the CytoNucs 2D runs (300 x 100 x 8);
-    one continuous run per level that reads images and precomputed flows from disk batch by batch (the flows sit
+    images without objects stay as background examples (min_train_masks 0: removing them breaks the batch sampling
+    of Cellpose 3.0 with files); one continuous run per level that reads images and precomputed flows from disk batch by batch (the flows sit
     in <basedir>/<name>/cache during training, about 11 GB for TissueNet or HeLaCytoNuc, and are removed after);
   - thresholds (cellprob, flow) of every level chosen on the val split by the AP over IoU 0.5..0.95 of the pooled
     counts (Cellpose's metrics: TP / (TP + FP + FN), as ours); object size: the diameter of the training labels.
@@ -128,7 +129,7 @@ def main():
             path = train.train_seg(model.net, train_files=files, train_labels_files=flows, load_files=False,
                                    channels=spec['channels'], normalize=True, n_epochs=args.epochs,
                                    nimg_per_epoch=args.nimg_per_epoch, batch_size=args.batch, learning_rate=0.1,
-                                   weight_decay=1e-4, SGD=True, min_train_masks=1, save_path=str(OUT), model_name=level)
+                                   weight_decay=1e-4, SGD=True, min_train_masks=0, save_path=str(OUT), model_name=level)
             drop_cache(level)
             path = path[0] if isinstance(path, (tuple, list)) else path          # the path alone in Cellpose 3.0
             model = models.CellposeModel(gpu=gpu, pretrained_model=str(path))

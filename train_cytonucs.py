@@ -40,7 +40,7 @@ def run_inference_only(config_dict, config_path):
     """
     import imageio.v2 as imageio
     from pathlib import Path
-    from csbdeep.utils import normalize
+    from cytonucs_runtime import normalize_percentiles as normalize
     from cytonucs_inference import CytoNucsPredictor, compute_jtpr
     from cytonucs_trainer import compute_dice, DiceCallback
     from stardist.matching import matching_dataset
@@ -496,7 +496,7 @@ def run_threshold_optimization(config_dict, config_path):
     Пороги в конфиг НЕ пишет — впишешь найденное руками.
     """
     import imageio.v2 as imageio
-    from csbdeep.utils import normalize
+    from cytonucs_runtime import normalize_percentiles as normalize
 
     model_config = CytoNucsConfig.from_json(config_path)
     ndim = model_config.ndim
