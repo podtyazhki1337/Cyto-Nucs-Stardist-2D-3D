@@ -209,7 +209,8 @@
     "refinement_roi_snap": true,
     "tta_flips": false,
     "refinement_batch": 0,
-    "refinement_windows": false
+    "refinement_windows": false,
+    "max_prompts_per_head": 0
   },
   "loss_weights": {
     "lambda_prob_nucleus": 1.0,

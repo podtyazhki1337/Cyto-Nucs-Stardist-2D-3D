@@ -192,6 +192,22 @@ class BatchedRefinementTests(unittest.TestCase):
                         if not fine:
                             np.testing.assert_array_equal(a['probability_window'][1], b['probability_window'][1])
 
+    def test_prompt_cap_keeps_the_most_probable_prompts(self):
+        cfg = config(**BASE)
+        cfg.refinement_batch, cfg.max_prompts_per_head = 0, 2
+        model, sink = SimpleNamespace(), {}
+        runners = self.coarse_runners()
+        with patch.object(inference, '_refinement_runners', return_value=runners[:2]), \
+                patch.object(inference, '_cytoplasm_refinement_runner', return_value=runners[3]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                inference.predict_instances_prompted(
+                    model, cfg, np.zeros(SHAPE + (1,), np.float32), self.nuclei, np.array([.9, .2, .8, .1]),
+                    nuc_dists=np.full((len(self.nuclei), 12), 2.5), nuc_labels=point_labels(self.nuclei),
+                    verbose=False, candidate_sink=sink, mask_thresh=.45)
+        kept = sorted(tuple(int(v) for v in c['prompt_center']) for c in sink['nucleus'])
+        self.assertEqual(kept, sorted(tuple(int(v) for v in self.nuclei[i]) for i in (0, 2)))
+        self.assertEqual(model.last_refinement_diagnostics['nucleus']['prompts_capped'], 2)
+
     def test_setting_is_validated(self):
         for bad in (-1, True, 1.5):
             with self.assertRaises(ValueError):

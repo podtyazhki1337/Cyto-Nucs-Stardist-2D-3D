@@ -60,7 +60,7 @@ class CytoNucsConfig:
                           mask_assembly_cytoplasm='voxel', mask_min_remaining_fraction=0.5,
                           nms_candidate_spacing=0.12, nms_border_exclude_xy=2,
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
-                          refinement_windows=False),
+                          refinement_windows=False, max_prompts_per_head=0),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -491,6 +491,8 @@ class CytoNucsConfig:
         architecture_plan(self)
         if isinstance(self.refinement_batch, bool) or not isinstance(self.refinement_batch, (int, np.integer)) or self.refinement_batch < 0:
             raise ValueError(f'refinement_batch must be a nonnegative integer, got {self.refinement_batch!r}')
+        if isinstance(self.max_prompts_per_head, bool) or not isinstance(self.max_prompts_per_head, (int, np.integer)) or self.max_prompts_per_head < 0:
+            raise ValueError(f'max_prompts_per_head must be a nonnegative integer (0: no limit), got {self.max_prompts_per_head!r}')
         if not isinstance(self.refinement_windows, bool):
             raise ValueError(f'refinement_windows must be true or false, got {self.refinement_windows!r}')
         for key in ('image_batch_size', 'prompts_per_crop', 'log_every_steps', 'val_loss_every_n_epochs',

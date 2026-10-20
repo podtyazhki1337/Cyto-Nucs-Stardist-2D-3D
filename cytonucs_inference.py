@@ -319,7 +319,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                           nonfinite=0, quality_nonfinite=0, quality_rejected=0, accepted=0, quality=[],
                           roi_expansions=0, roi_boundary_remaining=0,
                           residual_peaks=0, residual_prompts=0, area_gate_removed=0,
-                          windowed=0, window_fallbacks=0)
+                          windowed=0, window_fallbacks=0, prompts_capped=0)
                    for h in ('nucleus', 'cytoplasm')}
     if config.mask_quality_min == 'auto':
         quality_min = {h: float((quality_gates or {}).get(h, 0.0)) for h in ('nucleus', 'cytoplasm')}
@@ -852,8 +852,18 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                 out[i][1] = cell
         return out
 
-    anchored = [('nucleus', ctr, d, score) for ctr, d, score in anchors(nuc_labels, nuc_coords, nuc_probs, nuc_dists)]
-    anchored += [('cytoplasm', ctr, d, score) for ctr, d, score in anchors(cyto_labels, cyto_coords, cyto_probs, cyto_dists)]
+    cap = int(getattr(config, 'max_prompts_per_head', 0) or 0)
+
+    def capped(head, items):
+        # At most `cap` prompts per head and image, the most probable ones (in their order): an untrained
+        # detector can propose thousands per 3D volume, each refined over its ROI.
+        if not cap or len(items) <= cap:
+            return items
+        keep = sorted(sorted(range(len(items)), key=lambda i: -float(items[i][2]))[:cap])
+        diagnostics[head]['prompts_capped'] = len(items) - cap
+        return [items[i] for i in keep]
+    anchored = [('nucleus', ctr, d, score) for ctr, d, score in capped('nucleus', anchors(nuc_labels, nuc_coords, nuc_probs, nuc_dists))]
+    anchored += [('cytoplasm', ctr, d, score) for ctr, d, score in capped('cytoplasm', anchors(cyto_labels, cyto_coords, cyto_probs, cyto_dists))]
     jobs = [job[:3] for job in anchored]
     results = [None] * len(jobs)
     if batched:
