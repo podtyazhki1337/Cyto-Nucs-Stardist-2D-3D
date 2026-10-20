@@ -307,6 +307,33 @@ class TissueNetTests(unittest.TestCase):
         with self.assertRaises(pickle.UnpicklingError):
             NumpyOnly(io.BytesIO(pickle.dumps(Path('x')))).load()
 
+    def test_val_all_adds_every_val_tile_and_keeps_the_val_tiles_identical(self):
+        from tissuenet_to_cytonucs import convert
+        rng = np.random.default_rng(0)
+        with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:
+            raw, out = Path(tmp) / 'raw', Path(tmp) / 'out'
+            raw.mkdir()
+            for split, count in (('train', 2), ('val', 6), ('test', 2)):
+                x = rng.uniform(0, 10, (count, 16, 16, 2)).astype(np.float32)
+                y = np.zeros((count, 16, 16, 2), np.int32)
+                y[:, 2:8, 2:8, 0], y[:, 3:6, 3:6, 1] = 4, 9                  # one cell with its nucleus
+                meta = np.array([['filename', 'experiment', 'pixel_size', 'screening_passed', 'time_step', 'specimen']] +
+                                [[f'{split}{i}', 'e/x', 0.5, True, 0, 'Colon'] for i in range(count)], dtype=object)
+                np.savez(raw / f'tissuenet_v1.1_{split}.npz', X=x, y=y, meta=meta)
+            quiet(convert, raw, out, val_count=2)
+            subset = sorted(p.name for p in (out / 'val' / 'images').iterdir())
+            self.assertEqual(len(subset), 2)
+            before = (out / 'test' / 'images' / 'test_00000.tif').read_bytes()
+            quiet(convert, raw, out, val_count=2, val_all=True)
+            names = sorted(p.name for p in (out / 'val_all' / 'images').iterdir())
+            self.assertEqual(len(names), 6)
+            self.assertTrue(set(subset) <= set(names))
+            info = json.loads((out / 'split_info.json').read_text())
+            self.assertEqual(info['val_all'], names)
+            self.assertEqual(len(info['val']), 2)
+            self.assertEqual((out / 'test' / 'images' / 'test_00000.tif').read_bytes(), before)    # other splits untouched
+            self.assertEqual(json.loads((out / 'val_all' / 'assignments' / 'val_00000.json').read_text()), {'1': 1})
+
 
 class KiTSTests(unittest.TestCase):
     def test_masses_are_separate_instances_inside_their_kidney(self):
