@@ -66,7 +66,7 @@ class CytoNucsConfig:
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
                              neighbor_cell_prompt_prob=0.0, cell_z_pair_prob=0.0,
                              nucleus_z_pair_prob=0.0, elastic_prob=0.0, elastic_alpha=0.0, elastic_sigma=8.0,
-                             zoom_z_range=None, flip_z_prob=0.0, saturation_prob=0.0),
+                             zoom_z_range=None, flip_z_prob=0.0, saturation_prob=0.0, prompt_uniform_prob=0.0),
         'loss_params': dict(nucleus_prob_object_weight=0.0, cytoplasm_prob_object_weight=0.0,
                             prob_object_peak_weight=0.0, mask_quality_rank_weight=0.0, object_losses_include_crop_cut=False,
                             mask_overlap_loss='dice', object_losses_min_area_from_gate=False,
@@ -74,7 +74,7 @@ class CytoNucsConfig:
                             mask_quality_target='grid', mask_quality_ignore_boundary_targets=False,
                             mask_ce_class_balance=False, cell_prompt_separation_weight=0.0,
                             cell_z_dice_weight=0.0, nucleus_z_dice_weight=0.0,
-                            semantic_foreground_weight=0.0),
+                            semantic_foreground_weight=0.0, dist_polar_iou_weight=0.0),
     }
 
     def __init__(
@@ -530,7 +530,7 @@ class CytoNucsConfig:
                     'refinement_gradient_scale', 'repeat_cell_prompt_prob', 'neighbor_cell_prompt_prob', 'cell_z_pair_prob', 'nucleus_z_pair_prob', 'mask_containment_threshold', 'predicted_prompt_fraction',
                     'mask_overlap_nucleus', 'mask_overlap_cytoplasm', 'mask_min_remaining_fraction',
                     'tile_sampling_by_objects', 'annotated_anchor_share', 'elastic_prob', 'extra_train_share',
-                    'flip_z_prob', 'saturation_prob'):
+                    'flip_z_prob', 'saturation_prob', 'prompt_uniform_prob'):
             value = getattr(self, key)
             if key.startswith('mask_thresh_') and (value is None or value == 'auto'):
                 continue
@@ -551,7 +551,7 @@ class CytoNucsConfig:
             raise ValueError(f'mask_quality_min must be a number in [0, 1] or "auto", got {self.mask_quality_min!r}')
         for key in ('nucleus_prob_object_weight', 'cytoplasm_prob_object_weight', 'prob_object_peak_weight',
                     'mask_quality_rank_weight', 'gradient_clip_norm', 'prompt_center_jitter', 'prompt_sigma_jitter', 'prompt_consistency_weight', 'mask_quality_weight', 'cell_prompt_separation_weight', 'cell_z_dice_weight', 'nucleus_z_dice_weight',
-                    'semantic_foreground_weight'):
+                    'semantic_foreground_weight', 'dist_polar_iou_weight'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
                 raise ValueError(f'{key} must be finite and nonnegative')

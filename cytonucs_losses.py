@@ -635,6 +635,19 @@ class CytoNucsLoss:
         weighted_error = dist_mask * dist_error_per_ray
         loss_distance = tf.reduce_mean(weighted_error) / (
                 tf.reduce_mean(dist_mask) + self.epsilon)
+        polar_weight = float(getattr(self.config, 'dist_polar_iou_weight', 0.0) or 0.0)
+        if polar_weight:
+            # Polar IoU (PolarMask, Xie et al. CVPR 2020): all rays of a voxel as one shape,
+            # -log(sum_k min(d, d*) / sum_k max(d, d*)), weighted like the ray error. Scaled by the
+            # median object size so a weight of 1 is comparable to the ray error in pixels.
+            true_rays = tf.cast(dist_true, tf.float32)
+            pred_rays = tf.maximum(tf.cast(dist_pred, tf.float32), 0.)
+            overlap = tf.reduce_sum(tf.minimum(true_rays, pred_rays), axis=-1)
+            union = tf.reduce_sum(tf.maximum(true_rays, pred_rays), axis=-1)
+            polar = -tf.math.log((overlap + 1.) / (union + 1.))
+            weight = tf.squeeze(dist_mask, axis=-1)
+            loss_polar = tf.reduce_sum(weight * polar) / (tf.reduce_sum(weight) + self.epsilon)
+            loss_distance = loss_distance + polar_weight * dist_scale * loss_polar
 
         bg_reg_weight = tf.cast(
             getattr(self.config, 'train_background_reg', 1e-4), tf.float32)

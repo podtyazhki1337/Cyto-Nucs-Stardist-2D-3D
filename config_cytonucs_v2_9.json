@@ -253,7 +253,8 @@
     "object_losses_include_crop_cut": false,
     "mask_overlap_loss": "dice",
     "object_losses_min_area_from_gate": false,
-    "semantic_foreground_weight": 0.0
+    "semantic_foreground_weight": 0.0,
+    "dist_polar_iou_weight": 0.0
   },
   "augmentation": {
     "enable": true,
@@ -288,7 +289,8 @@
     "elastic_sigma": 8.0,
     "zoom_z_range": null,
     "flip_z_prob": 0.0,
-    "saturation_prob": 0.0
+    "saturation_prob": 0.0,
+    "prompt_uniform_prob": 0.0
   },
   "evaluation": {
     "eval_dice_every": 5,

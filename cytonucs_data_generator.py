@@ -832,11 +832,19 @@ class CytoNucsDataGenerator(Sequence):
                 shift = float(getattr(self.config, 'prompt_center_jitter', 0.1))
                 sscale = float(getattr(self.config, 'prompt_sigma_jitter', 0.1))
                 c = np.asarray(c, np.float32)
-                if is_train and augment and shift > 0:
-                    c = c + rng_.normal(0.0, shift,
-                                        size=c.shape).astype(np.float32) * ext
-                if self.config.prompt_inside_target and owner is not None:
-                    c = project_prompt_center(c, owner, ext)
+                uniform = float(getattr(self.config, 'prompt_uniform_prob', 0.0))
+                if (is_train and augment and owner is not None and uniform > 0
+                        and rng_.random() < uniform):
+                    # Anywhere inside the object (as SAM samples its training points): detector peaks
+                    # at inference may lie off-centre, and the mask must still be the whole object.
+                    inside = np.argwhere(owner)
+                    c = inside[int(rng_.integers(len(inside)))].astype(np.float32)
+                else:
+                    if is_train and augment and shift > 0:
+                        c = c + rng_.normal(0.0, shift,
+                                            size=c.shape).astype(np.float32) * ext
+                    if self.config.prompt_inside_target and owner is not None:
+                        c = project_prompt_center(c, owner, ext)
                 sig = np.maximum(ext / 4.0, 1.0)
                 if is_train and augment and sscale > 0:
                     sig = sig * float(rng_.uniform(1.0 - sscale, 1.0 + sscale))
