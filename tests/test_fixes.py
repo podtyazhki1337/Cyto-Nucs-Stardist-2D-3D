@@ -123,6 +123,11 @@ class ConfigContractTests(unittest.TestCase):
                 elif key=='dist_target_stride': value=[1,2,2]
                 elif isinstance(default,bool): value=not default
                 elif key=='tiling_fixed_axes': value=[0]
+                elif key=='levels': value=['nucleus']
+                elif key=='unknown_label': value=65535
+                elif key=='init_weights': value=None      # a path needs its geometry.json; tested in test_regularization
+                elif key=='extra_train_dirs': value=['extra_dataset']
+                elif key=='zoom_z_range': value=[0.8,1.2]
                 elif key in ('mask_thresh_nucleus','mask_thresh_cytoplasm'): value=.63
                 elif key=='prompts_per_crop': value=3
                 elif key.startswith('proposal_peak_window_'): value=[3,3,3]

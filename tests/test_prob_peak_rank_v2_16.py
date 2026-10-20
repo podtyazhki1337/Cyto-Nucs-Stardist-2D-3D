@@ -153,7 +153,7 @@ class ConfigTests(unittest.TestCase):
         for path in ROOT.glob('config_cytonucs*.json'):
             raw = json.loads(path.read_text())
             expected = dict(cytoplasm_prob_object_weight=.25, prob_object_peak_weight=.25, mask_quality_rank_weight=.1) \
-                if path.name in ('config_cytonucs_v2_16.json', 'config_cytonucs_v2_17.json', 'config_cytonucs_v3.json', 'config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json') else dict.fromkeys(NEW, 0.)
+                if path.name in ('config_cytonucs_v2_16.json', 'config_cytonucs_v2_17.json', 'config_cytonucs_v3.json', 'config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json', 'config_cytonucs_v3_4.json', 'config_cytonucs_v4.json', 'config_cytonucs_v5.json') else dict.fromkeys(NEW, 0.)
             self.assertEqual({k: raw['loss_params'][k] for k in NEW}, expected, path.name)
         raw = json.loads((ROOT / 'config_cytonucs_v2_16.json').read_text())
         with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:

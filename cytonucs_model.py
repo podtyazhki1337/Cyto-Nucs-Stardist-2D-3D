@@ -87,7 +87,8 @@ class CytoNucsStarDistModel:
         self.keras_model = self._build_model()
 
     def _build_block(self, x, n_filters, ConvLayer, prefix):
-        """UNet conv block: 2x Conv3x3 ReLU.
+        """UNet conv block: 2x Conv3x3 ReLU; with model.unet_norm_groups each convolution is
+        followed by GroupNorm before its activation (a batch is one or a few crops).
         Инициализатор — self._kinit, обоснование в _build_model."""
         _k = getattr(self, '_kinit', 'he_normal')
         import re
@@ -95,12 +96,17 @@ class CytoNucsStarDistModel:
         schedule = self.config.unet_kernel_schedule
         kernel = tuple(schedule[int(level.group(1))]) if schedule is not None and level else 3
         activation = getattr(self.config, 'unet_activation', 'relu')
-        x = ConvLayer(n_filters, kernel, padding='same', activation=activation,
-                      kernel_initializer=_k,
-                      name=f'{prefix}_c1')(x)
-        x = ConvLayer(n_filters, kernel, padding='same', activation=activation,
-                      kernel_initializer=_k,
-                      name=f'{prefix}_c2')(x)
+        groups = int(getattr(self.config, 'unet_norm_groups', 0) or 0)
+        for j in (1, 2):
+            if groups:
+                x = ConvLayer(n_filters, kernel, padding='same', activation=None,
+                              kernel_initializer=_k, name=f'{prefix}_c{j}')(x)
+                x = layers.GroupNormalization(groups=groups, name=f'{prefix}_n{j}')(x)
+                x = layers.Activation(activation, name=f'{prefix}_a{j}')(x)
+            else:
+                x = ConvLayer(n_filters, kernel, padding='same', activation=activation,
+                              kernel_initializer=_k,
+                              name=f'{prefix}_c{j}')(x)
         return x
 
     def _build_model(self):
@@ -115,6 +121,8 @@ class CytoNucsStarDistModel:
             PoolLayer = layers.MaxPooling2D
             UpSampleLayer = layers.UpSampling2D
 
+        # Roles the run has a level for (model.levels): 'nucleus' = inner, 'cytoplasm' = outer.
+        levels = tuple(getattr(cfg, 'level_roles', None) or ('nucleus', 'cytoplasm'))
         unet_n_depth = getattr(cfg, 'unet_n_depth', 4)
         unet_n_filter_base = getattr(cfg, 'unet_n_filter_base', 32)
         net_conv_after_unet = getattr(cfg, 'net_conv_after_unet', 128)
@@ -400,6 +408,16 @@ class CytoNucsStarDistModel:
             return layers.Lambda(lambda ts: tf.concat(ts, axis=0),
                                  name=name)(tensors)
 
+        def _nothing(reference, values, name, linked=()):
+            """Output of a level the run does not have (model.levels): reference's batch and
+            spatial shape, the given value per channel, no weights. `linked` tensors add nothing
+            to the value: Keras refuses a model with an input that no output reads, and the
+            runtime models below take the features of both levels as inputs."""
+            return layers.Lambda(
+                lambda ts, _v=tuple(float(v) for v in values):
+                tf.zeros_like(ts[0][..., :1]) + tf.constant(_v, tf.float32) + sum(0. * tf.reduce_mean(t) for t in ts[1:]),
+                name=name)([reference] + list(linked))
+
         def _feature_gradient(t):
             frozen = tf.stop_gradient(t)
             if not cfg.refinement_gradient_scale:
@@ -536,6 +554,9 @@ class CytoNucsStarDistModel:
                 nucleus_context_at_cyto = UpSampleLayer(
                     unet_pools[j])(nucleus_context_at_cyto)
 
+        if 'nucleus' not in levels:
+            nucleus_context_at_cyto = None                      # no nuclear decoder to take it from
+
         # ============================================================
         # DECODER 2: CYTOPLASM
         # ============================================================
@@ -567,9 +588,12 @@ class CytoNucsStarDistModel:
         print(f"  ✓ Cytoplasm head: split prob/dist features, dist={_dist_act}")
 
         # Cell refinement uses the same configurable decoder-gradient path.
-        _ctx_for_refine = layers.Lambda(
-            lambda t: tf.stop_gradient(t), name='cyto_ctx_stop_grad_for_refine'
-        )(nucleus_context_at_cyto)
+        if nucleus_context_at_cyto is None:
+            _ctx_for_refine = _nothing(cell_encoder_features[cyto_skip], [0.], 'cyto_ctx_none')
+        else:
+            _ctx_for_refine = layers.Lambda(
+                lambda t: tf.stop_gradient(t), name='cyto_ctx_stop_grad_for_refine'
+            )(nucleus_context_at_cyto)
         _gp_c, _gd_c = _geo_prior(
             cytoplasm_prob, cytoplasm_dist,
             getattr(cfg, 'median_max_dist_cytoplasm', 30.0) or 30.0, 'cyto')
@@ -619,6 +643,53 @@ class CytoNucsStarDistModel:
         print(f"  ✓ Cytoplasm refinement: 3-class prompted mask ({mask_n_filter} ch) "
               f"+ geometry prior ({_n_geo} ch), промптов за форвард: {n_pr}")
 
+        # ============================================================
+        # LEVELS THE RUN DOES NOT HAVE (model.levels)
+        # ============================================================
+        # Everything above is built for both levels, but a Keras model holds only the layers its
+        # outputs reach. The tensors of an absent level are replaced here by weightless
+        # "nothing here" values of the same names and shapes (probability 0, background mask,
+        # quality 0), so its decoder, heads and mask branch are not part of the network, and
+        # losses, trainer and inference read the same outputs as with both levels.
+        absent = {}
+        for head, tag, grid_reference, prompts in (
+                ('nucleus', 'nuc', encoder_features[nuc_skip], p_at_nuc),
+                ('cytoplasm', 'cyto', cell_encoder_features[cyto_skip], p_at_cyto)):
+            if head in levels:
+                continue
+            features = [_nothing(grid_reference, [0.], f'{tag}_none_{part}') for part in ('features', 'geo_prob', 'geo_dist')]
+            if head == 'cytoplasm':
+                _ctx_for_refine = _nothing(grid_reference, [0.], 'cyto_none_ctx')
+            absent[head] = dict(
+                prob_logit=_nothing(grid_reference, [-20.], f'{tag}_none_prob_logit'),
+                # Named as the real layers: the detection pass fetches them by name.
+                dist=_nothing(grid_reference, [0.] * int(cfg.n_rays), f'{head}_dist'),
+                features=features,
+                semantic=_nothing(grid_reference, [-20.], f'{tag}_none_semantic'),
+                logits=[_nothing(q, [20., -20., -20.], f'{tag}_none_mask_logit_{k}',
+                                 linked=features + ([_ctx_for_refine] if head == 'cytoplasm' else []))
+                        for k, q in enumerate(prompts)],
+                hidden=[_nothing(q, [0.], f'{tag}_none_hidden_{k}') for k, q in enumerate(prompts)],
+                fine=_nothing(prompts[0], [0.] * FINE_CHANNELS, f'{tag}_none_fine_features'),
+                quality=[layers.Lambda(lambda t: tf.zeros([tf.shape(t)[0], 1], tf.float32),
+                                       name=f'{tag}_none_quality_{k}')(q) for k, q in enumerate(prompts)])
+        if 'nucleus' in absent:
+            none = absent['nucleus']
+            _prob_logit_nuc, nucleus_dist = none['prob_logit'], none['dist']
+            nucleus_prob = layers.Activation('sigmoid', name='nucleus_prob')(_prob_logit_nuc)
+            x_nucleus_for_refine, _gp_n, _gd_n = none['features']
+            _nuc_logits, _nuc_hidden, _nuc_quality = none['logits'], none['hidden'], none['quality']
+            _nuc_mask_logit = _stack_prompts(_nuc_logits, 'nucleus_none_mask_logit')
+            nucleus_mask = layers.Lambda(lambda t: tf.nn.softmax(t, axis=-1)[..., 1:2], name='nucleus_none_mask')(_nuc_mask_logit)
+        if 'cytoplasm' in absent:
+            none = absent['cytoplasm']
+            _prob_logit_cyto, cytoplasm_dist = none['prob_logit'], none['dist']
+            cytoplasm_prob = layers.Activation('sigmoid', name='cytoplasm_prob')(_prob_logit_cyto)
+            x_cytoplasm_decoder_for_refine, _gp_c, _gd_c = none['features']
+            _cyto_logits, _cyto_hidden, _cyto_quality = none['logits'], none['hidden'], none['quality']
+            _cyto_mask_logit = _stack_prompts(_cyto_logits, 'cytoplasm_none_mask_logit')
+            cytoplasm_mask = layers.Lambda(lambda t: tf.nn.softmax(t, axis=-1)[..., 1:2], name='cytoplasm_none_mask')(_cyto_mask_logit)
+
         outputs = {
             'nucleus_prob': nucleus_prob,
             'nucleus_dist': nucleus_dist,
@@ -641,6 +712,9 @@ class CytoNucsStarDistModel:
             # full gradient (Panoptic-DeepLab semantic branch, HoVer-Net NP branch).
             # Created last: optimizer slots are restored by variable index.
             for head, feat in (('nucleus', x_nucleus), ('cytoplasm', x_cytoplasm)):
+                if head in absent:
+                    outputs[head + '_semantic_logit'] = absent[head]['semantic']
+                    continue
                 outputs[head + '_semantic_logit'] = ConvLayer(
                     1, 1, padding='same', activation=None, kernel_initializer='glorot_uniform',
                     name=head + '_semantic_logit')(feat)
@@ -664,6 +738,9 @@ class CytoNucsStarDistModel:
             for head, tag, logits_k, hidden_k, prompt_k, hidden_runtime, grid in (
                     ('nucleus', 'nuc', picked[0], picked[1], picked[2], _nuc_hidden[0], nucleus_grid),
                     ('cytoplasm', 'cyto', picked[3], picked[4], picked[5], _cyto_hidden[0], cytoplasm_grid)):
+                if head in absent:
+                    fine_runtime[head] = absent[head]['fine']
+                    continue
                 window = training_window(cfg, head)
                 hidden_proj = ConvLayer(FINE_CHANNELS, 1, padding='same', activation='relu',
                                         kernel_initializer='he_normal', name=f'{tag}_fine_hidden_proj')
@@ -774,6 +851,11 @@ class CytoNucsStarDistModel:
         result['refinement_full_resolution'] = bool(self.config.refinement_full_resolution)
         if self.config.refinement_full_resolution:
             result['fine_wiring'] = self.fine_wiring
+        if getattr(self.config, 'unet_norm_groups', 0):
+            result['unet_norm_groups'] = int(self.config.unet_norm_groups)
+        roles = [role for role in ('nucleus', 'cytoplasm') if role in (getattr(self.config, 'level_roles', None) or ('nucleus', 'cytoplasm'))]
+        if roles != ['nucleus', 'cytoplasm']:
+            result['roles'] = roles                              # one level: the other role has no layers
         return json.loads(json.dumps(result))
 
     # Order of the added heads in every checkpoint saved so far (v3.1 semantic, v3.2 fine).

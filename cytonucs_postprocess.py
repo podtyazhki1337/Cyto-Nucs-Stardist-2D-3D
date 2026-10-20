@@ -85,17 +85,32 @@ def local_prompt_mask(p_grid, shape, grid, center, sigma, threshold):
     exact_nodes = nodes[tuple(slice(0, (int(s) - 1) // int(gg) + 1) for s, gg in zip(shape, g))]
     if not exact_nodes.any():
         return full()                      # foreground could appear only between the last nodes
-    cc, _ = label(nodes, structure=generate_binary_structure(nd, nd))
-    pts = np.argwhere(nodes)
+    # Only nodes in a box around the prompt can pass the distance test below.
+    pad = np.ceil((2 * np.maximum(sigma, 1) + g) / g).astype(int) + 1
+    box_lo = np.maximum(0, center_full // g - pad)
+    box_hi = np.minimum(np.array(nodes.shape), center_full // g + pad + 1)
+    pts = np.argwhere(nodes[tuple(slice(int(a), int(b)) for a, b in zip(box_lo, box_hi))]) + box_lo
     # Distance from the prompt to the nearest point of each node's interpolation cell.
     gap = np.maximum(np.abs(pts * g - center_full) - g, 0) / np.maximum(sigma, 1)
     near = pts[np.sum(gap ** 2, axis=1) <= 4.0 + 1e-9]
     if len(near) == 0:
         return (*empty, True)                   # foreground exists, but none within reach of the prompt
-    labels = np.unique(cc[tuple(near.T)])
-    member = np.isin(cc, labels)
-    idx = np.argwhere(member)
-    lo_node, hi_node = idx.min(0), idx.max(0)
+    # Node components of the near nodes, labelled in a box grown until none of them reaches one of
+    # its faces inside the grid (then they are whole).
+    structure = generate_binary_structure(nd, nd)
+    while True:
+        cc, _ = label(nodes[tuple(slice(int(a), int(b)) for a, b in zip(box_lo, box_hi))], structure=structure)
+        boxes = find_objects(cc)
+        own = [boxes[k - 1] for k in np.unique(cc[tuple((near - box_lo).T)])]
+        lo_node = box_lo + np.min([[sl.start for sl in b] for b in own], axis=0)
+        hi_node = box_lo + np.max([[sl.stop - 1 for sl in b] for b in own], axis=0)
+        open_lo = (lo_node == box_lo) & (box_lo > 0)
+        open_hi = (hi_node == box_hi - 1) & (box_hi < np.array(nodes.shape))
+        if not (open_lo.any() or open_hi.any()):
+            break
+        width = box_hi - box_lo
+        box_lo = np.maximum(0, box_lo - width)
+        box_hi = np.minimum(np.array(nodes.shape), box_hi + width)
     lo = np.maximum(0, (lo_node - 1) * g)
     # Foreground voxels lie strictly inside (n-1)g .. (n+1)g of a foreground node n, so the
     # first and last window rows stay background and a touch means the object continues.
@@ -307,13 +322,19 @@ def _assemble_objects(candidates, shape, mode, min_remaining_fraction, observer,
     if nested and not 0 < containment_threshold <= 1:
         raise ValueError('object_quality_containment requires containment_threshold in (0,1]')
     committed = []
+    committed_lo, committed_hi = [], []      # boxes of the committed masks: only overlapping ones can conflict
     conflicts = []
     label_ranks = {}
     trace = getattr(observer, 'record_assembly_decision', None)
     for rank, c in enumerate(ordered):
         if nested:
             conflict = None
-            for accepted_rank, accepted, original in committed:
+            overlapping = []
+            if committed:
+                c_lo = np.asarray(c['lo']); c_hi = c_lo + np.array(c['mask'].shape)
+                overlapping = np.flatnonzero(np.all(np.minimum(np.asarray(committed_hi), c_hi) >
+                                                    np.maximum(np.asarray(committed_lo), c_lo), axis=1))
+            for accepted_rank, accepted, original in (committed[j] for j in overlapping):
                 iou = candidate_iou(c, accepted)
                 intersection = iou * (c['area'] + accepted['area']) / (1 + iou)
                 coverage = intersection / max(1, min(c['area'], accepted['area']))
@@ -371,6 +392,7 @@ def _assemble_objects(candidates, shape, mode, min_remaining_fraction, observer,
             accepted = mask_candidate(c['score'], free, c['lo'])
             accepted['predicted_quality'] = -priority(c)[1]
             committed.append((rank, accepted, c))
+            committed_lo.append(np.asarray(accepted['lo'])); committed_hi.append(accepted['lo'] + np.array(accepted['mask'].shape))
     if observer is not None:
         observer.observe('competition', labels=out)
         observer.observe('final', labels=out)

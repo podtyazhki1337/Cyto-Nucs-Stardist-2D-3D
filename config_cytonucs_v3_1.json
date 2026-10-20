@@ -105,7 +105,12 @@
     "mask_quality_head": true,
     "mask_quality_pooling": "mask",
     "refinement_pool": "auto",
-    "refinement_full_resolution": false
+    "refinement_full_resolution": false,
+    "unet_norm_groups": 0,
+    "levels": [
+      "nucleus",
+      "cytoplasm"
+    ]
   },
   "training": {
     "train_patch_size": [
@@ -137,7 +142,17 @@
     "nucleus_prob_grid_normalize": true,
     "detector_prompt_slots": 1,
     "cell_predicted_nucleus_fraction": 0.5,
-    "dist_target_stride": null
+    "dist_target_stride": null,
+    "tile_sampling_by_objects": 0.0,
+    "train_region_crops": false,
+    "partial_annotation": false,
+    "unknown_label": null,
+    "annotated_anchor_share": 0.0,
+    "init_weights": null,
+    "weight_decay": 0.0,
+    "ema_decay": 0.0,
+    "extra_train_dirs": [],
+    "extra_train_share": 0.0
   },
   "inference": {
     "checkpoint_path": "models/cytonucs_emese_HK_3_training_v3_1/weights_best.weights.h5",
@@ -182,7 +197,9 @@
     "nms_candidate_spacing": 0.12,
     "nms_border_exclude_xy": 2,
     "residual_proposals": false,
-    "refinement_roi_snap": true
+    "refinement_roi_snap": true,
+    "tta_flips": false,
+    "refinement_batch": 0
   },
   "loss_weights": {
     "lambda_prob_nucleus": 1.0,
@@ -255,7 +272,13 @@
     "prompt_inside_target": true,
     "neighbor_cell_prompt_prob": 1.0,
     "cell_z_pair_prob": 0.5,
-    "nucleus_z_pair_prob": 0.5
+    "nucleus_z_pair_prob": 0.5,
+    "elastic_prob": 0.0,
+    "elastic_alpha": 0.0,
+    "elastic_sigma": 8.0,
+    "zoom_z_range": null,
+    "flip_z_prob": 0.0,
+    "saturation_prob": 0.0
   },
   "evaluation": {
     "eval_dice_every": 5,

@@ -6,11 +6,12 @@ Creates training batches with augmentation.
 Supports repooling and automatic assignment creation.
 """
 import numpy as np
+from scipy import ndimage as ndi
 import tensorflow as tf
 from tensorflow.keras.utils import Sequence
 from pathlib import Path
 import imageio
-from csbdeep.utils import normalize
+from cytonucs_runtime import normalize_percentiles, percentile_range
 from skimage.transform import rescale
 import json
 import random
@@ -76,6 +77,77 @@ def label_counts(labels):
 def partial_labels(crop, reference):
     """IDs present in `crop` with fewer voxels than in `reference` (a label_counts dict)."""
     return {k for k, n in label_counts(crop).items() if k and n < reference.get(k, n)}
+
+
+def split_unknown(labels, unknown_label):
+    """training.unknown_label: the labels with those voxels set to background, and the boolean mask of
+    the voxels whose annotation is unknown (None when there are none)."""
+    if unknown_label is None:
+        return labels, None
+    unknown = labels == unknown_label
+    if not unknown.any():
+        return labels, None
+    return np.where(unknown, 0, labels).astype(labels.dtype), unknown
+
+
+def with_unknown(labels, unknown):
+    """Labels as int32 with the voxels of unknown annotation at -1: flips, rotations and order-0
+    zoom carry the mark along with the labels."""
+    out = labels.astype(np.int32)
+    out[unknown] = -1
+    return out
+
+
+def elastic_displacement(shape, alpha, sigma, rng):
+    """Smooth random XY displacement (dy, dx) of about `alpha` px, correlated over `sigma` px; it fades
+    to zero over 2 * sigma px at the crop faces, so objects there are not pushed out of the crop."""
+    fields = []
+    for _ in range(2):
+        field = ndi.gaussian_filter(rng.normal(size=shape), sigma)
+        fields.append(field / (field.std() + 1e-8) * alpha)
+    ramp = lambda n: np.clip(np.minimum(np.arange(n), np.arange(n)[::-1]) / (2 * sigma), 0, 1)
+    taper = np.minimum.outer(ramp(shape[0]), ramp(shape[1]))
+    return fields[0] * taper, fields[1] * taper
+
+
+def warp_yx(array, dy, dx, order, nd):
+    """The same XY displacement applied to every slice and channel of (Z,) Y, X[, C]; order 0 for labels."""
+    a = np.asarray(array)
+    h, w = dy.shape
+    yy, xx = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing='ij')
+    coords = np.stack([yy + dy, xx + dx])
+    moved = np.moveaxis(a, (nd - 2, nd - 1), (-2, -1)) if a.ndim > nd else a
+    out = np.stack([ndi.map_coordinates(plane, coords, order=order, mode='nearest')
+                    for plane in moved.reshape((-1, h, w))]).reshape(moved.shape)
+    return np.ascontiguousarray(np.moveaxis(out, (-2, -1), (nd - 2, nd - 1)) if a.ndim > nd else out)
+
+
+def without_unknown(labels, dtype):
+    """Inverse of with_unknown: (labels in `dtype`, boolean mask of the unknown voxels)."""
+    unknown = labels < 0
+    return np.where(unknown, 0, labels).astype(dtype), unknown
+
+
+def window_sum_table(region):
+    """Summed-area table of a boolean YX region, one row and column of zeros in front."""
+    return np.pad(np.cumsum(np.cumsum(region, 0, dtype=np.int64), 1), ((1, 0), (1, 0)))
+
+
+def window_inside(table, start, size):
+    """Whether the YX window lies entirely inside the region of window_sum_table."""
+    (y, x), (h, w) = start, size
+    if y < 0 or x < 0 or y + h >= table.shape[0] or x + w >= table.shape[1]:
+        return False
+    return int(table[y + h, x + w] - table[y, x + w] - table[y + h, x] + table[y, x]) == h * w
+
+
+def allowed_crop_starts(region, size):
+    """allowed[y, x]: the size window starting at (y, x) lies entirely inside the boolean YX region."""
+    h, w = size
+    if h > region.shape[0] or w > region.shape[1]:
+        return np.zeros((0, 0), bool)
+    t = window_sum_table(region)
+    return t[h:, w:] - t[:-h, w:] - t[h:, :-w] + t[:-h, :-w] == h * w
 
 
 class CytoNucsDataGenerator(Sequence):
@@ -158,22 +230,57 @@ class CytoNucsDataGenerator(Sequence):
             return sorted(set(files))
 
         self.image_files = find_all_images(self.dataset_dir / 'images')
-        self.nucleus_files = find_all_images(self.dataset_dir / 'nucleus_masks')
-        self.cytoplasm_files = find_all_images(self.dataset_dir / 'cytoplasm_masks')
         if not self.image_files:
             raise ValueError(f'No images found in {self.dataset_dir / "images"}')
+        # A level the run does not have (model.levels) needs no mask folder: its masks are empty.
+        # Role -> level name of the run; the masks of a role are read from '<level>_masks'.
+        self.role_levels = dict(getattr(config, 'level_roles', None) or {'nucleus': 'nucleus', 'cytoplasm': 'cytoplasm'})
+        self.levels = tuple(role for role in ('nucleus', 'cytoplasm') if role in self.role_levels)   # roles present
+        # training.partial_annotation: a training file may lack the masks of some levels of the
+        # run (not annotated there). Validation and test files must have them all.
+        self.partial = bool(getattr(config, 'partial_annotation', False)) and subset == 'train'
+
+        def mask_files(name):
+            if name not in self.levels:
+                return [None] * len(self.image_files)
+            found = find_all_images(self.dataset_dir / (self.role_levels[name] + '_masks'))
+            if not self.partial:
+                return found
+            by_name = {f.name: f for f in found}
+            unknown = sorted(set(by_name) - {f.name for f in self.image_files})
+            if unknown:
+                raise ValueError(f'{self.role_levels[name]}_masks holds files without an image: {unknown[:5]}')
+            return [by_name.get(f.name) for f in self.image_files]
+
+        self.nucleus_files, self.cytoplasm_files = mask_files('nucleus'), mask_files('cytoplasm')
+        if self.partial:
+            bare = [f.name for f, n, c in zip(self.image_files, self.nucleus_files, self.cytoplasm_files) if n is None and c is None]
+            if bare and getattr(config, 'pair_index', None) is not None:
+                # One pair of a hierarchy: files that annotate neither of its levels belong to other pairs.
+                keep = [i for i, (n, c) in enumerate(zip(self.nucleus_files, self.cytoplasm_files)) if n is not None or c is not None]
+                self.image_files, self.nucleus_files, self.cytoplasm_files = (
+                    [files[i] for i in keep] for files in (self.image_files, self.nucleus_files, self.cytoplasm_files))
+                if not self.image_files:
+                    raise ValueError(f'No training file annotates {list(self.role_levels.values())}')
+            elif bare:
+                raise ValueError(f'Images without masks of any level: {bare[:5]}')
 
         assert len(self.image_files) == len(self.nucleus_files) == len(self.cytoplasm_files), \
             "Mismatch in number of images, nucleus masks, and cytoplasm masks"
 
         # Check that filenames match
         for img_f, nuc_f, cyto_f in zip(self.image_files, self.nucleus_files, self.cytoplasm_files):
-            assert img_f.name == nuc_f.name == cyto_f.name, \
-                f"Filename mismatch: {img_f.name}, {nuc_f.name}, {cyto_f.name}"
+            assert all(f is None or f.name == img_f.name for f in (nuc_f, cyto_f)), \
+                f"Filename mismatch: {img_f.name}, {nuc_f and nuc_f.name}, {cyto_f and cyto_f.name}"
 
-        # Load assignments if available
-        self.assignments_dir = self.dataset_dir / 'assignments'
+        # Load assignments if available: 'assignments' holds the nucleus -> cytoplasm pairs; the
+        # pairs of other levels are read from 'assignments_<inner>_<outer>' or found by overlap.
+        self.assignments_name = ('assignments' if self.role_levels == {'nucleus': 'nucleus', 'cytoplasm': 'cytoplasm'} or
+                                 len(self.role_levels) < 2 else
+                                 'assignments_' + self.role_levels['nucleus'] + '_' + self.role_levels['cytoplasm'])
+        self.assignments_dir = self.dataset_dir / self.assignments_name
         self.has_assignments = self.assignments_dir.exists()
+        self.paired = len(self.levels) == 2                     # nucleus-cell pairs exist only with both levels
 
         # Load metadata if available
         self.meta = None
@@ -205,6 +312,10 @@ class CytoNucsDataGenerator(Sequence):
         # Initial pool
         self.repool(seed=0)
 
+        self.region_pool = None
+        if subset == 'train' and getattr(config, 'train_region_crops', False):
+            self._load_regions()
+
         self.indices = np.arange(len(self.data_pool))
         self.on_epoch_end()
 
@@ -224,12 +335,21 @@ class CytoNucsDataGenerator(Sequence):
         self.data_pool = []
         for idx in pool_ids:
             from cytonucs_runtime import read_model_image
-            img = read_model_image(self.image_files[idx], nd, self.config.n_channel_in)
+            # Channels of the image files; a hierarchy adds its pair code in __getitem__.
+            channels = int(getattr(self.config, 'n_image_channels', self.config.n_channel_in))
+            img = read_model_image(self.image_files[idx], nd, channels)
             # 3D RGB-стек сохранён как (Z, C, H, W) -> канал в конец (Z, H, W, C)
-            if nd == 3 and img.ndim == 4 and img.shape[-1] != self.config.n_channel_in and img.shape[1] == self.config.n_channel_in:
+            if nd == 3 and img.ndim == 4 and img.shape[-1] != channels and img.shape[1] == channels:
                 img = np.moveaxis(img, 1, -1)
-            nucleus_mask = np.asarray(imageio.volread(self.nucleus_files[idx]))
-            cytoplasm_mask = np.asarray(imageio.volread(self.cytoplasm_files[idx]))
+            nucleus_mask, cytoplasm_mask = (
+                np.zeros(img.shape[:nd], np.uint16) if f is None else np.asarray(imageio.volread(f))
+                for f in (self.nucleus_files[idx], self.cytoplasm_files[idx]))
+            # training.unknown_label: voxels whose annotation of a level is unknown (sparse annotation).
+            nucleus_mask, nucleus_unknown = split_unknown(nucleus_mask, getattr(self.config, 'unknown_label', None))
+            cytoplasm_mask, cytoplasm_unknown = split_unknown(cytoplasm_mask, getattr(self.config, 'unknown_label', None))
+            if self.subset != 'train' and (nucleus_unknown is not None or cytoplasm_unknown is not None):
+                raise ValueError(f'{self.image_files[idx].name}: unknown_label in {self.subset} masks; '
+                                 'validation and test masks must be complete')
 
             # ПЕРЦЕНТИЛЬНАЯ НОРМАЛИЗАЦИЯ — ОДИН РАЗ НА ТОМ.
             # Раньше normalize(1, 99.8) звался в __getitem__ по ПОЛНОМУ тому на
@@ -238,9 +358,9 @@ class CytoNucsDataGenerator(Sequence):
             # Статистика глобальная по тому и от кропа с аугментацией не
             # зависит, поэтому кэшируется без изменения результата.
             if nd == 2 and img.ndim == 3 and img.shape[-1] in (3, 4):
-                img = normalize(img.astype(np.float32), 1, 99.8, axis=(0, 1))
+                img = normalize_percentiles(img, 1, 99.8, axis=(0, 1))
             else:
-                img = normalize(img.astype(np.float32), 1, 99.8,
+                img = normalize_percentiles(img, 1, 99.8,
                                 axis=tuple(range(nd)))
             img = np.ascontiguousarray(img, dtype=np.float32)
 
@@ -258,7 +378,12 @@ class CytoNucsDataGenerator(Sequence):
                                  axis=1).astype(np.int32)
             if len(fg_coords) == 0:  # фолбэк как в каноне
                 fg_coords = np.argwhere(seed_mask > 0).astype(np.int32)
-            if self.has_assignments:
+            # Levels of the run annotated in this file (all of them unless training.partial_annotation).
+            annotated = tuple(name for name, f in (('nucleus', self.nucleus_files[idx]), ('cytoplasm', self.cytoplasm_files[idx]))
+                              if f is not None)
+            if not getattr(self, 'paired', True) or len(annotated) < 2:
+                assignments = {}
+            elif self.has_assignments:
                 assignment_file = (self.assignments_dir /
                                    (Path(self.image_files[idx].name).stem + '.json'))
                 if assignment_file.exists():
@@ -277,14 +402,160 @@ class CytoNucsDataGenerator(Sequence):
                 'image': img,
                 'nucleus_mask': nucleus_mask,
                 'cytoplasm_mask': cytoplasm_mask,
+                'nucleus_unknown': nucleus_unknown,
+                'cytoplasm_unknown': cytoplasm_unknown,
                 'fg_coords': fg_coords,
                 'assignments': assignments,
-                'filename': self.image_files[idx].name
+                'filename': self.image_files[idx].name,
+                'annotated': annotated,
+                'object_count': int(np.count_nonzero(np.unique(nucleus_mask))) +
+                                int(np.count_nonzero(np.unique(cytoplasm_mask)))
             })
 
         print(f'  Loaded {len(self.data_pool)} samples into pool '
               f'(нормализовано и проиндексировано один раз)')
         self._pool_seed = seed
+        counts = np.array([s['object_count'] for s in self.data_pool], np.float64)
+        self._tile_weights = counts / counts.sum() if counts.sum() > 0 else None
+        # Partial annotation: tiles grouped by their annotated levels; a batch stays inside one group.
+        self._annotation_groups = None
+        if getattr(self, 'partial', False):
+            self._annotation_groups = {}
+            for index, sample in enumerate(self.data_pool):
+                self._annotation_groups.setdefault(sample['annotated'], []).append(index)
+            print('  Annotated levels of the training files: ' +
+                  ', '.join(f"{'+'.join(k)}: {len(v)}" for k, v in sorted(self._annotation_groups.items())))
+
+    def _pick_tile(self, rng):
+        """Pool tile of one training crop: uniform, or with probability
+        training.tile_sampling_by_objects in proportion to the objects it holds.
+
+        A crop covers most of a tile, so the tile decides what a step sees. With uniform tiles
+        the few dense ones, which hold most objects, get as many steps as nearly empty ones.
+        """
+        share = float(getattr(self.config, 'tile_sampling_by_objects', 0.0))
+        weights = getattr(self, '_tile_weights', None)
+        if share > 0 and weights is not None and rng.random() < share:
+            return int(rng.choice(len(self.data_pool), p=weights))
+        return int(rng.choice(len(self.data_pool)))
+
+    def _load_regions(self):
+        """Whole source volumes for training crops at any position inside the train blocks
+        (dataset_prep/add_train_regions.py). The tile pool stays: geometry and the train-side
+        metric read it. Images are kept as stored and normalised per crop."""
+        from scipy.ndimage import distance_transform_edt, find_objects
+        from cytonucs_runtime import read_model_image
+        root = self.dataset_dir.parent / 'train_regions'
+        index = root / 'regions.json'
+        if not index.is_file():
+            raise FileNotFoundError(f'training.train_region_crops needs {index}: '
+                                    'run dataset_prep/add_train_regions.py on the dataset')
+        nd = int(self.config.ndim)
+        patch = tuple(int(v) for v in self.config.train_patch_size)
+        self.region_pool = []
+        for name, entry in json.loads(index.read_text()).items():
+            channels = int(getattr(self.config, 'n_image_channels', self.config.n_channel_in))
+            image = read_model_image(root / 'images' / name, nd, channels)
+            if nd == 3 and image.ndim == 4 and image.shape[-1] != channels and image.shape[1] == channels:
+                image = np.moveaxis(image, 1, -1)
+            # Levels of the run annotated in this volume: all of them, or with
+            # training.partial_annotation those whose mask file exists.
+            folder = lambda level: root / (self.role_levels[level] + '_masks') / name
+            annotated = tuple(level for level in ('nucleus', 'cytoplasm') if level in self.levels
+                              and (not self.partial or folder(level).is_file()))
+            if not annotated:
+                raise ValueError(f'{name}: no masks of any level in {root}')
+            # Label IDs of the source volume are kept (assignments refer to them), in the tiles' dtype.
+            nucleus, cytoplasm = (
+                m.astype(np.uint16) if 0 <= m.min() and m.max() <= np.iinfo(np.uint16).max else m
+                for m in (np.asarray(imageio.volread(folder(level))) if level in annotated
+                          else np.zeros(image.shape[:nd], np.uint16) for level in ('nucleus', 'cytoplasm')))
+            nucleus, nucleus_unknown = split_unknown(nucleus, getattr(self.config, 'unknown_label', None))
+            cytoplasm, cytoplasm_unknown = split_unknown(cytoplasm, getattr(self.config, 'unknown_label', None))
+            pairs = {}
+            if self.paired and len(annotated) == 2:
+                stored = root / self.assignments_name / (Path(name).stem + '.json')
+                pairs = (json.loads(stored.read_text()) if stored.is_file() else compute_nucleus_cell_assignments(
+                    nucleus, cytoplasm, max_distance=getattr(self.config, 'max_assignment_distance', 100.0))[0])
+            region = np.zeros(nucleus.shape[-2:], bool)
+            for y0, y1, x0, x1 in entry['train_blocks']:
+                region[y0:y1, x0:x1] = True
+            allowed = allowed_crop_starts(region, patch[-2:])
+            if not allowed.any():
+                raise ValueError(f'{name}: no {patch[-2:]} crop fits into the train blocks')
+            # Bounding-box centres of the cells (nuclei where a volume has no cell) inside the train blocks.
+            labels = cytoplasm if cytoplasm.max() > 0 else nucleus
+            boxes = find_objects(labels)
+            anchors = [([(sl.start + sl.stop) // 2 for sl in box], label)
+                       for label, box in enumerate(boxes, 1) if box is not None]
+            anchors = [(c, label) for c, label in anchors if region[c[-2], c[-1]]]
+            # Sparse annotation: anchors none of whose voxels has an unknown level
+            # (training.annotated_anchor_share of the object-centred crops start from them).
+            unknown = [u for u in (nucleus_unknown, cytoplasm_unknown) if u is not None]
+            annotated_anchors = None
+            if unknown:
+                unknown = np.logical_or.reduce(unknown)
+                annotated_anchors = np.array([i for i, (_, label) in enumerate(anchors) if not
+                                              unknown[boxes[label - 1]][labels[boxes[label - 1]] == label].any()], np.int64)
+            self.region_pool.append(dict(
+                image=image, nucleus_mask=nucleus, cytoplasm_mask=cytoplasm, filename=name, annotated=annotated,
+                nucleus_unknown=nucleus_unknown, cytoplasm_unknown=cytoplasm_unknown, annotated_anchors=annotated_anchors,
+                assignments={int(k): int(v) for k, v in pairs.items()},
+                blocks=[tuple(b) for b in entry['train_blocks']], table=window_sum_table(region),
+                starts=np.flatnonzero(allowed), starts_shape=allowed.shape,
+                nearest=distance_transform_edt(~allowed, return_distances=False, return_indices=True).astype(np.int32),
+                anchors=np.array([c for c, _ in anchors], np.int64).reshape(-1, nd),
+                anchor_labels=np.array([label for _, label in anchors], np.int64), percentiles={},
+                # Counted here once: the first batches come from several prefetch threads.
+                _label_counts=dict(nucleus_mask=label_counts(nucleus), cytoplasm_mask=label_counts(cytoplasm))))
+            print(f'  Train region {name}: {len(entry["train_blocks"])} block(s), {len(anchors)} anchor object(s), '
+                  f'{int(allowed.sum())} crop positions in XY' +
+                  ('' if annotated_anchors is None else f', {len(annotated_anchors)} anchor(s) without unknown annotation'))
+        counts = np.array([len(s['anchors']) for s in self.region_pool], np.float64)
+        self._region_weights = counts / counts.sum() if counts.sum() > 0 else None
+
+    def _region_crop(self, sample, patch, rng):
+        """Start of one patch-sized training crop inside the train blocks, and its anchor cell.
+
+        With probability fg_crop_prob the crop is centred on a random object, shifted by up to
+        1/16 of the patch (the refinement ROI at inference is centred on its prompt up to the
+        snapping step); else it is any allowed position. A start outside the train blocks moves
+        to the nearest allowed one.
+        """
+        nd = len(patch)
+        spatial = sample['nucleus_mask'].shape
+        free = [max(spatial[a] - patch[a], 0) for a in range(nd)]
+        if len(sample['anchors']) and rng.random() < getattr(self.config, 'fg_crop_prob', 0.9):
+            annotated = sample.get('annotated_anchors')
+            share = float(getattr(self.config, 'annotated_anchor_share', 0.0))
+            if share > 0 and annotated is not None and len(annotated) and rng.random() < share:
+                k = int(annotated[int(rng.integers(len(annotated)))])
+            else:
+                k = int(rng.integers(len(sample['anchors'])))
+            center = sample['anchors'][k] + [int(rng.integers(-(p // 16), p // 16 + 1)) for p in patch]
+            starts = [int(np.clip(center[a] - patch[a] // 2, 0, free[a])) for a in range(nd)]
+            starts[-2:] = [int(v) for v in sample['nearest'][:, starts[-2], starts[-1]]]
+            return starts, int(sample['anchor_labels'][k])
+        starts = [int(rng.integers(0, free[a] + 1)) for a in range(nd - 2)]
+        y, x = np.unravel_index(int(sample['starts'][int(rng.integers(len(sample['starts'])))]), sample['starts_shape'])
+        return starts + [int(y), int(x)], 0
+
+    def _region_normalize(self, sample, crop, starts, patch):
+        """Percentile normalisation of a region crop with the statistics of the tile around it:
+        the train block that holds the crop centre, over the Z range of the crop. Train and
+        validation tiles are normalised per tile (one block, one Z slab) in the same way."""
+        from csbdeep.utils import normalize_mi_ma
+        nd = len(patch)
+        cy, cx = starts[-2] + patch[-2] // 2, starts[-1] + patch[-1] // 2
+        block = next(i for i, (y0, y1, x0, x1) in enumerate(sample['blocks']) if y0 <= cy < y1 and x0 <= cx < x1)
+        key = (block,) + tuple(starts[:-2])
+        if key not in sample['percentiles']:
+            y0, y1, x0, x1 = sample['blocks'][block]
+            context = sample['image'][tuple(slice(s, s + p) for s, p in zip(starts[:-2], patch[:-2])) +
+                                      (slice(y0, y1), slice(x0, x1))]
+            sample['percentiles'][key] = percentile_range(context, axis=tuple(range(nd)))
+        mi, ma = sample['percentiles'][key]
+        return np.ascontiguousarray(normalize_mi_ma(crop.astype(np.float32), mi, ma), dtype=np.float32)
 
     def get_cell_properties(self, prop='cells_median_extent_p'):
         """
@@ -343,8 +614,21 @@ class CytoNucsDataGenerator(Sequence):
         # локальный rng: __getitem__ вызывается из НЕСКОЛЬКИХ потоков
         # префетчера, глобальный np.random между ними шарится
         pick = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch if is_train else 0, int(idx)]))
-        if is_train:
-            crop_indices = [int(pick.choice(len(self.data_pool))) for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
+        regions = getattr(self, 'region_pool', None) if is_train else None
+        if regions:
+            crop_indices = [int(pick.choice(len(regions), p=self._region_weights))
+                            for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
+            if getattr(self, 'partial', False):                 # one batch, one set of annotated levels
+                same = [i for i, r in enumerate(regions) if r['annotated'] == regions[crop_indices[0]]['annotated']]
+                crop_indices = [i if i in same else int(pick.choice(same)) for i in crop_indices]
+        elif is_train:
+            crop_indices = [CytoNucsDataGenerator._pick_tile(self, pick)
+                            for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
+            groups = getattr(self, '_annotation_groups', None)
+            if groups:
+                # One batch, one set of annotated levels: the loss of a level is switched per batch.
+                same = groups[self.data_pool[crop_indices[0]]['annotated']]
+                crop_indices = [i if i in same else int(pick.choice(same)) for i in crop_indices]
         else:
             crop_indices = [int(self.indices[int(idx) % max(1, len(self.indices))])]
 
@@ -353,13 +637,18 @@ class CytoNucsDataGenerator(Sequence):
         # k-major: tg_n_k[k][b]
         tg_n_k = [[] for _ in range(n_pr)]
         tg_c_k = [[] for _ in range(n_pr)]
+        # training.unknown_label: '<role>_known' voxel maps and, per prompt, whether its target is known
+        # (an empty target where the annotation is unknown does not say "no object here").
+        sparse = is_train and getattr(self.config, 'unknown_label', None) is not None
+        tk_n_k = [[] for _ in range(n_pr)]
+        tk_c_k = [[] for _ in range(n_pr)]
 
         for _ci, i in enumerate(crop_indices):
             # ДЕТЕРМИНИРОВАННЫЙ val: иначе каждая эпоха валидируется на другом
             # кропе с другим промптом, и val_loss мерит дисперсию выборки.
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch if is_train else 0, int(idx), int(_ci), 1]))
 
-            sample = self.data_pool[i]
+            sample = regions[i] if regions else self.data_pool[i]
             img_full = sample['image']
             nuc_full = sample['nucleus_mask']
             cyto_full = sample['cytoplasm_mask']
@@ -374,6 +663,11 @@ class CytoNucsDataGenerator(Sequence):
                 f = float(rng.uniform(*zr))
                 # Never invent reflected foreground with background labels.
                 f = max(f, max(patch[a] / spatial[a] for a in zoom_axes))
+            # augmentation.zoom_z_range: a separate stretch along Z (object depth in slices).
+            fz = 1.0
+            zoom_z = getattr(self.config, 'zoom_z_range', None)
+            if nd == 3 and is_train and self.augmenter is not None and zoom_z is not None and rng.random() < 0.5:
+                fz = max(float(rng.uniform(*zoom_z)), patch[0] / spatial[0])
 
             need = list(patch)
             if f != 1.0:
@@ -382,28 +676,46 @@ class CytoNucsDataGenerator(Sequence):
                 # outer XY row and objects there were always cut by one voxel in training.
                 for a in zoom_axes:
                     need[a] = int(np.ceil(patch[a] / f)) + 2
+            if fz != 1.0:
+                need[0] = int(np.ceil(patch[0] / fz)) + 1
             need = [min(need[a], spatial[a]) for a in range(nd)]
 
-            # центр кропа: с вероятностью p_fg на случайном объекте
-            p_fg = getattr(self.config, 'fg_crop_prob', 0.9)
-            center = None
-            fg = sample['fg_coords']
-            if rng.random() < p_fg and len(fg) > 0:
-                center = fg[int(rng.integers(len(fg)))][:nd]
+            anchor = 0
+            if regions:
+                starts, anchor = self._region_crop(sample, patch, rng)
+                if f != 1.0 or fz != 1.0:
+                    # The larger crop of a zoom-out keeps its centre; where it would leave the
+                    # train blocks or the volume, this crop is taken without zoom.
+                    grown = [starts[a] - (need[a] - patch[a]) // 2 for a in range(nd)]
+                    if (all(0 <= g and g + n <= s for g, n, s in zip(grown, need, spatial))
+                            and window_inside(sample['table'], grown[-2:], need[-2:])):
+                        starts = grown
+                    else:
+                        f, fz, need = 1.0, 1.0, [min(patch[a], spatial[a]) for a in range(nd)]
+            else:
+                # центр кропа: с вероятностью p_fg на случайном объекте
+                p_fg = getattr(self.config, 'fg_crop_prob', 0.9)
+                center = None
+                fg = sample['fg_coords']
+                if rng.random() < p_fg and len(fg) > 0:
+                    center = fg[int(rng.integers(len(fg)))][:nd]
 
-            starts = []
-            for a in range(nd):
-                sh, p = spatial[a], need[a]
-                if sh <= p:
-                    starts.append(0)
-                elif center is not None:
-                    # center — валидный ЦЕНТР патча (канон), не воксель объекта
-                    starts.append(max(0, min(int(center[a]) - p // 2, sh - p)))
-                else:
-                    starts.append(int(rng.integers(0, sh - p + 1)))
+                starts = []
+                for a in range(nd):
+                    sh, p = spatial[a], need[a]
+                    if sh <= p:
+                        starts.append(0)
+                    elif center is not None:
+                        # center — валидный ЦЕНТР патча (канон), не воксель объекта
+                        starts.append(max(0, min(int(center[a]) - p // 2, sh - p)))
+                    else:
+                        starts.append(int(rng.integers(0, sh - p + 1)))
             sl = tuple(slice(s, s + n) for s, n in zip(starts, need))
 
-            img = np.ascontiguousarray(img_full[sl])
+            if regions:
+                img = self._region_normalize(sample, img_full[sl], starts, need)
+            else:
+                img = np.ascontiguousarray(img_full[sl])
             nucleus_mask = np.ascontiguousarray(nuc_full[sl])
             cytoplasm_mask = np.ascontiguousarray(cyto_full[sl])
             # Objects cut by this crop: fewer voxels than in the source volume. A crop
@@ -415,17 +727,37 @@ class CytoNucsDataGenerator(Sequence):
                     counts[key] = label_counts(full)
             crop_cut = {'nucleus': partial_labels(nucleus_mask, counts['nucleus_mask']),
                         'cytoplasm': partial_labels(cytoplasm_mask, counts['cytoplasm_mask'])}
+            # Voxels of unknown annotation go through zoom and augmentation as label -1.
+            unknown = {role: None if sample.get(role + '_unknown') is None else sample[role + '_unknown'][sl]
+                       for role in ('nucleus', 'cytoplasm')}
+            dtypes = (nucleus_mask.dtype, cytoplasm_mask.dtype)
+            if unknown['nucleus'] is not None:
+                nucleus_mask = with_unknown(nucleus_mask, unknown['nucleus'])
+            if unknown['cytoplasm'] is not None:
+                cytoplasm_mask = with_unknown(cytoplasm_mask, unknown['cytoplasm'])
 
             # ZOOM по патчу
-            if f != 1.0:
+            if f != 1.0 or fz != 1.0:
                 from scipy.ndimage import zoom as ndzoom
                 zf = [1.0] * nd
                 for a in zoom_axes:
                     zf[a] = f
+                if nd == 3:
+                    zf[0] = fz
                 zf_img = tuple(zf) + ((1.0,) if img.ndim > nd else ())
                 img = ndzoom(img, zf_img, order=1)
                 nucleus_mask = ndzoom(nucleus_mask, tuple(zf), order=0)
                 cytoplasm_mask = ndzoom(cytoplasm_mask, tuple(zf), order=0)
+
+            # Elastic deformation in XY (augmentation.elastic_prob): one smooth displacement for every
+            # slice, fading out at the crop faces; labels (unknown voxels packed as -1) by nearest neighbour.
+            elastic = float(getattr(self.config, 'elastic_prob', 0.0))
+            if is_train and self.augmenter is not None and elastic > 0 and rng.random() < elastic:
+                dy, dx = elastic_displacement(nucleus_mask.shape[-2:], float(self.config.elastic_alpha),
+                                              float(self.config.elastic_sigma), rng)
+                img = warp_yx(img, dy, dx, 1, nd)
+                nucleus_mask = warp_yx(nucleus_mask, dy, dx, 0, nd)
+                cytoplasm_mask = warp_yx(cytoplasm_mask, dy, dx, 0, nd)
 
             # Аугментация (флипы, транспоз, интенсивность) — уже по патчу
             if self.augmenter is not None:
@@ -434,6 +766,11 @@ class CytoNucsDataGenerator(Sequence):
                         img, nucleus_mask, cytoplasm_mask, rng=rng, config=self.config)
                 else:
                     img, nucleus_mask, cytoplasm_mask = self.augmenter(img, nucleus_mask, cytoplasm_mask)
+
+            if unknown['nucleus'] is not None:
+                nucleus_mask, unknown['nucleus'] = without_unknown(nucleus_mask, dtypes[0])
+            if unknown['cytoplasm'] is not None:
+                cytoplasm_mask, unknown['cytoplasm'] = without_unknown(cytoplasm_mask, dtypes[1])
 
             # Центральный кроп / паддинг ровно до patch
             cur = img.shape[:nd]
@@ -454,6 +791,7 @@ class CytoNucsDataGenerator(Sequence):
                 before_central = (label_counts(nucleus_mask), label_counts(cytoplasm_mask))
             nucleus_mask = nucleus_mask[sl2]
             cytoplasm_mask = cytoplasm_mask[sl2]
+            unknown = {role: None if u is None else u[sl2] for role, u in unknown.items()}
             if central:
                 crop_cut['nucleus'] |= partial_labels(nucleus_mask, before_central[0])
                 crop_cut['cytoplasm'] |= partial_labels(cytoplasm_mask, before_central[1])
@@ -464,6 +802,7 @@ class CytoNucsDataGenerator(Sequence):
                 img = np.pad(img, pw_img, mode='constant')
                 nucleus_mask = np.pad(nucleus_mask, pw, mode='constant')
                 cytoplasm_mask = np.pad(cytoplasm_mask, pw, mode='constant')
+                unknown = {role: None if u is None else np.pad(u, pw, mode='constant') for role, u in unknown.items()}
 
             # StarDist GT зависит ТОЛЬКО от масок -> считается один раз на кроп
             _pn, _dn = compute_stardist_gt(nucleus_mask, self.config,
@@ -475,6 +814,13 @@ class CytoNucsDataGenerator(Sequence):
                                            aniso=self._cyto_aniso)
 
             img_ch_base = img[..., np.newaxis] if img.ndim == nd else img
+            pair_channels = int(getattr(self.config, 'n_pair_channels', 0) or 0)
+            if pair_channels:
+                # Hierarchy of three or more levels: one constant channel per adjacent pair says
+                # which pair the two roles hold. Added after augmentation, right behind the image.
+                code = np.zeros(img_ch_base.shape[:nd] + (pair_channels,), np.float32)
+                code[..., int(self.config.pair_index)] = 1.
+                img_ch_base = np.concatenate([img_ch_base, code], axis=-1)
 
             def _prompt_at(shape, c, extent, rng_=rng, augment=True, owner=None):
                 # PROMPT AUGMENTATION. На обучении промпт строится по ТОЧНОМУ
@@ -506,6 +852,10 @@ class CytoNucsDataGenerator(Sequence):
             cyto_ids = list(cyto_ids[cyto_ids > 0])
             if len(cyto_ids) > 1:
                 rng.shuffle(cyto_ids)
+            if anchor in cyto_ids:
+                # The crop is centred on this cell: it is the first prompt, its neighbours follow.
+                cyto_ids.remove(anchor)
+                cyto_ids.insert(0, anchor)
             nuc_present = {int(v) for v in np.unique(nucleus_mask) if v > 0}
 
             # Compute only when enabled; preserve the old RNG sequence at zero.
@@ -565,7 +915,7 @@ class CytoNucsDataGenerator(Sequence):
                     # empty; the cell head still owns the cell containing the prompt.
                     for _attempt in range(64):
                         center_neg = tuple(int(rng.integers(s)) for s in nucleus_mask.shape)
-                        if nucleus_mask[center_neg] == 0:
+                        if nucleus_mask[center_neg] == 0 and not any(u is not None and u[center_neg] for u in unknown.values()):
                             if nuc_present:
                                 sized = np.argwhere(nucleus_mask == int(rng.choice(sorted(nuc_present))))
                                 extent = sized.max(0) - sized.min(0) + 1
@@ -616,6 +966,17 @@ class CytoNucsDataGenerator(Sequence):
                     nuclear_z_pair = True
             y_batch.setdefault('nucleus_z_prompt_pair', []).append(nuclear_z_pair)
 
+            if sparse:
+                # An empty target is known only if no voxel of unknown annotation lies within about one
+                # sigma of its prompt (a cell whose nuclei are not annotated says nothing about nuclei).
+                for k, (pr_n, pr_c) in enumerate(prompts):
+                    for role, prompt, targets, flags in (('nucleus', pr_n, tg_n_k, tk_n_k), ('cytoplasm', pr_c, tg_c_k, tk_c_k)):
+                        u = unknown[role]
+                        flags[k].append(float(u is None or targets[k][-1].any() or not u[prompt > .6].any()))
+                for role, u in unknown.items():
+                    y_batch.setdefault(role + '_known', []).append(
+                        np.ones(nucleus_mask.shape, np.float32) if u is None else (~u).astype(np.float32))
+
             # [img..., pr_nuc_0, pr_cyto_0, pr_nuc_1, pr_cyto_1, ...]
             img_ch = np.concatenate(
                 [img_ch_base] + [p[..., np.newaxis] for pair in prompts for p in pair],
@@ -633,6 +994,11 @@ class CytoNucsDataGenerator(Sequence):
             y_batch.setdefault('cytoplasm_prob', []).append(_pc)
             y_batch.setdefault('cytoplasm_dist', []).append(_dc)
 
+        if is_train and getattr(self, 'partial', False):
+            # 1 where the level's loss applies to this batch: annotated here, or not a level of the run.
+            annotated = sample.get('annotated', self.levels)
+            y_batch['levels_present'] = np.array([float(name not in self.levels or name in annotated)
+                                                  for name in ('nucleus', 'cytoplasm')], np.float32)
         X_batch = np.stack(X_batch)
         for _k in ('nucleus_instances', 'cytoplasm_instances',
                    'nucleus_prob', 'nucleus_dist', 'cytoplasm_prob', 'cytoplasm_dist',
@@ -644,6 +1010,10 @@ class CytoNucsDataGenerator(Sequence):
             [np.stack(v) for v in tg_n_k], axis=0)
         y_batch['cytoplasm_target'] = np.concatenate(
             [np.stack(v) for v in tg_c_k], axis=0)
+        if sparse:
+            for role, flags in (('nucleus', tk_n_k), ('cytoplasm', tk_c_k)):
+                y_batch[role + '_known'] = np.stack(y_batch[role + '_known'])
+                y_batch[role + '_target_known'] = np.concatenate([np.asarray(v, np.float32) for v in flags])
         return X_batch, y_batch
 
     def _visualize_gt_comparison(self, img, nucleus_mask_original, cytoplasm_mask_original,
@@ -865,10 +1235,26 @@ def cytonucs_augmenter_3d(img, nucleus_mask, cytoplasm_mask, rng=None, config=No
         if rng.random() < float(getattr(config, 'flip_prob', 0.5)):
             img, nucleus_mask, cytoplasm_mask = [np.flip(a, axis=ax)
                                                 for a in (img, nucleus_mask, cytoplasm_mask)]
+    # augmentation.flip_z_prob: flip along Z (depth order of the slices).
+    flip_z = float(getattr(config, 'flip_z_prob', 0.0) or 0.0)
+    if flip_z and rng.random() < flip_z:
+        img, nucleus_mask, cytoplasm_mask = [np.flip(a, axis=0) for a in (img, nucleus_mask, cytoplasm_mask)]
     img = img * rng.uniform(*getattr(config, 'intensity_range', (0.8, 1.2)))
     img = img + rng.uniform(*getattr(config, 'intensity_offset', (-0.1, 0.1)))
     gamma = rng.uniform(*getattr(config, 'gamma_range', (0.9, 1.1)))
     img = np.sign(img) * np.abs(img) ** gamma
+    # augmentation.saturation_prob: one channel clipped at a random high percentile of the crop, as a
+    # saturated detector channel in a bright, dense region.
+    saturation = float(getattr(config, 'saturation_prob', 0.0) or 0.0)
+    if saturation and rng.random() < saturation:
+        img = np.array(img, np.float32)
+        channel = int(rng.integers(img.shape[-1])) if img.ndim == 4 else None
+        plane = img[..., channel] if channel is not None else img
+        level = np.percentile(plane, rng.uniform(80., 99.))
+        if channel is not None:
+            img[..., channel] = np.minimum(plane, level)
+        else:
+            img = np.minimum(plane, level)
     sigma = float(getattr(config, 'noise_sigma', 0.01))
     if sigma > 0:
         img = img + rng.normal(0, sigma, img.shape)

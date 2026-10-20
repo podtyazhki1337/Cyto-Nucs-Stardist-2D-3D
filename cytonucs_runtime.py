@@ -28,15 +28,23 @@ def align_training_history(history, completed_epochs):
     return result
 
 
-def deployed_metric(jtpr, total_pairs, ap_gated, pairs_lost, jtpr_weight):
+def checkpoint_jtpr_weight(config):
+    """Weight of JTPR in the checkpoint metric: loss_params.checkpoint_w_jtpr; 0 for a run with
+    one object level (model.levels), which has no nucleus-cell pairs."""
+    levels = getattr(config, 'levels', ('nucleus', 'cytoplasm'))
+    return float(getattr(config, 'checkpoint_w_jtpr', 0.7)) if len(levels) == 2 else 0.0
+
+
+def deployed_metric(jtpr, total_pairs, ap_gated, pairs_lost, jtpr_weight, levels=2):
     """Checkpoint metric of what inference outputs: after the calibrated quality/size gates.
 
     ap_gated: {head: AP after that head's gate}; pairs_lost: joint pairs whose nucleus or
     cell mask the gates remove (a pair removed in both heads counts twice, so this is a
-    lower bound on the gated JTPR).
+    lower bound on the gated JTPR). levels: object levels of the run; the AP term is their
+    mean (the level a run does not have contributes 0).
     """
     lost = sum(pairs_lost.values()) / max(int(total_pairs), 1)
-    return jtpr_weight * (jtpr - lost) + (1.0 - jtpr_weight) * 0.5 * sum(ap_gated.values())
+    return jtpr_weight * (jtpr - lost) + (1.0 - jtpr_weight) * sum(ap_gated.values()) / levels
 
 
 def history_selection_metrics(history, jtpr_weight=0.7):
@@ -80,6 +88,26 @@ def restored_best_metric(history, checkpoint_best, selection_start_epoch=0, jtpr
     values = [checkpoint_best] + metrics
     return max((float(v) for v in values if v is not None and math.isfinite(float(v))),
                default=float('-inf'))
+
+
+def percentile_range(x, axis=None, pmin=1.0, pmax=99.8):
+    """(low, high) percentiles of x over axis (keepdims) for the percentile normalisation. A channel whose high
+    percentile equals its low one while brighter pixels exist (nearly empty: a few hundred pixels above the
+    background, e.g. 7 HeLaCytoNuc nucleus channels) takes its maximum as high: dividing by ~0 would blow those
+    pixels up to ~1e20. Every other channel gets exactly csbdeep's percentiles."""
+    import numpy as np
+    x = np.asarray(x, np.float32)
+    low = np.percentile(x, pmin, axis=axis, keepdims=True)
+    high = np.percentile(x, pmax, axis=axis, keepdims=True)
+    top = np.max(x, axis=axis, keepdims=True)
+    return low, np.where((high - low < 1e-6) & (top > low), top, high)
+
+
+def normalize_percentiles(x, pmin=1.0, pmax=99.8, axis=None):
+    """csbdeep.utils.normalize(x, pmin, pmax, axis) with the guard of percentile_range for nearly empty channels."""
+    import numpy as np
+    low, high = percentile_range(x, axis, pmin, pmax)
+    return ((np.asarray(x, np.float32) - low) / (high - low + 1e-20)).astype(np.float32)
 
 
 def read_model_image(path, ndim, channels):

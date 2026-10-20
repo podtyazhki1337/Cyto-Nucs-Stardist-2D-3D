@@ -17,5 +17,22 @@
 /audit/*
 !/audit/*.py
 
+# Baselines of the paper: their code (StarDist runs, the vendored HydraStarDist package with its BSD licence),
+# not their models or logs.
+!/baselines/
+/baselines/*
+!/baselines/*.py
+!/baselines/stardist3d/
+/baselines/stardist3d/*
+!/baselines/stardist3d/*.py
+!/baselines/hydrastardist/
+/baselines/hydrastardist/*
+!/baselines/hydrastardist/*.py
+!/baselines/hydrastardist/LICENSE
+!/baselines/hydrastardist/hydrastardist/
+!/baselines/cellpose/
+/baselines/cellpose/*
+!/baselines/cellpose/*.py
+
 __pycache__/
 *.pyc

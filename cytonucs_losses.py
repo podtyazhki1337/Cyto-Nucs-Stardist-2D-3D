@@ -125,6 +125,25 @@ class CytoNucsLoss:
         current_epoch = (self.current_epoch if current_epoch is None else current_epoch) - 1              # для warmup (0-based)
 
         y_true = self._create_gt_from_instances(y_true_raw)
+        # training.partial_annotation: 'levels_present' is 1 for a level annotated in this batch
+        # (or not a level of the run) and 0 for a level whose masks the files of the batch lack;
+        # the terms of such a level are switched off, since empty masks there mean "unknown".
+        # The terms tying nuclei to cells (WBR, containment) stay: they read whatever
+        # annotation exists and never ask for an object.
+        if 'levels_present' in y_true_raw:
+            present = tf.cast(tf.reshape(y_true_raw['levels_present'], [-1]), tf.float32)
+            on = {'nucleus': present[0], 'cytoplasm': present[1]}
+        else:
+            on = {'nucleus': 1.0, 'cytoplasm': 1.0}
+        # training.unknown_label: '<role>_known' is 1 where the annotation of the level is known and
+        # '<role>_target_known' is 1 for a prompt whose target is known. Voxel terms of a level are
+        # averaged over its known voxels; an unknown empty target is skipped by the prompt terms.
+        known, slot_known = {}, {}
+        for head in ('nucleus', 'cytoplasm'):
+            given = head + '_known' in y_true_raw
+            known[head] = tf.stop_gradient(self._subsample(
+                tf.cast(y_true_raw[head + '_known'], tf.float32)[..., None], getattr(cfg, head + '_grid'))) if given else None
+            slot_known[head] = tf.reshape(tf.cast(y_true_raw[head + '_target_known'], tf.float32), [-1]) if given else None
         # Objects cut by the training crop (generator masks: fewer voxels than in the
         # source volume); older inputs carry only per-axis face flags.
         crop_cut = {h: y_true_raw.get(h + '_crop_cut') for h in ('nucleus', 'cytoplasm')}
@@ -157,12 +176,12 @@ class CytoNucsLoss:
             y_true['nucleus_prob'], y_pred['nucleus_prob'],
             y_true['nucleus_dist'], y_pred['nucleus_dist'],
             name='nucleus', prob_logit=y_pred.get('nucleus_prob_logit'),
-            instances=object_labels('nucleus'))
+            instances=object_labels('nucleus'), known=known['nucleus'])
         loss_cytoplasm = self._stardist_loss(
             y_true['cytoplasm_prob'], y_pred['cytoplasm_prob'],
             y_true['cytoplasm_dist'], y_pred['cytoplasm_dist'],
             name='cytoplasm', prob_logit=y_pred.get('cytoplasm_prob_logit'),
-            instances=object_labels('cytoplasm'))
+            instances=object_labels('cytoplasm'), known=known['cytoplasm'])
         warmup = self._warmup_factor(current_epoch)
 
         # Бинарный GT-контейнер клеток на цито-гриде — общий для WBR
@@ -176,6 +195,9 @@ class CytoNucsLoss:
             tf.expand_dims(tf.cast(y_true_raw['nucleus_instances'] > 0,
                                    tf.float32), axis=-1)))
         container_fg = tf.stop_gradient(tf.maximum(cyto_fg_gt, nuc_fg_at_cyto))
+        if known['cytoplasm'] is not None:
+            # Where the cells are not annotated, a nucleus may lie inside one.
+            container_fg = tf.maximum(container_fg, 1. - known['cytoplasm'])
 
         # === 2. WBR ===
         wbr_raw = self._wbr_loss(y_pred['nucleus_prob'], container_fg)
@@ -195,16 +217,18 @@ class CytoNucsLoss:
                 y_pred['nucleus_prob'], nuc_inst_g, name='nucleus')
             loss_frag_cyto = self._fragmentation_loss(
                 y_pred['cytoplasm_prob'], cyto_inst_g, name='cytoplasm')
-            loss_fragmentation = self.lambda_fragmentation * (loss_frag_nuc + loss_frag_cyto) / 2.0
+            loss_fragmentation = self.lambda_fragmentation * (
+                on['nucleus'] * loss_frag_nuc + on['cytoplasm'] * loss_frag_cyto) / 2.0
 
         # === 5. Background Penalty ===
         loss_background = tf.constant(0.0, dtype=tf.float32)
         if self.lambda_background_penalty > 0:
             loss_bg_nuc = self._background_penalty_loss(
-                y_pred['nucleus_prob'], y_true['nucleus_prob'], name='nucleus')
+                y_pred['nucleus_prob'], y_true['nucleus_prob'], name='nucleus', known=known['nucleus'])
             loss_bg_cyto = self._background_penalty_loss(
-                y_pred['cytoplasm_prob'], y_true['cytoplasm_prob'], name='cytoplasm')
-            loss_background = self.lambda_background_penalty * (loss_bg_nuc + loss_bg_cyto) / 2.0
+                y_pred['cytoplasm_prob'], y_true['cytoplasm_prob'], name='cytoplasm', known=known['cytoplasm'])
+            loss_background = self.lambda_background_penalty * (
+                on['nucleus'] * loss_bg_nuc + on['cytoplasm'] * loss_bg_cyto) / 2.0
 
 
         # === 6. Mask refinement — БЕЗ warmup.
@@ -224,9 +248,10 @@ class CytoNucsLoss:
                 self._grid_subsample_cytoplasm(
                     tf.expand_dims(tf.cast(y_true_raw['cytoplasm_instances'] > 0,
                                            tf.float32), axis=-1))))
-            loss_cyto_mask = self.lambda_cyto_mask * (
+            loss_cyto_mask = on['cytoplasm'] * self.lambda_cyto_mask * (
                     0.5 * self._refinement_ce_loss(
-                y_pred['cytoplasm_mask_logit'], gt_mask_semantic, _cyto_any) +
+                y_pred['cytoplasm_mask_logit'], gt_mask_semantic, _cyto_any,
+                None if known['cytoplasm'] is None else _tile_prompts(known['cytoplasm']), slot_known['cytoplasm']) +
                     0.5 * self._refinement_overlap_loss(
                 y_pred['cytoplasm_mask'], gt_mask_semantic))
 
@@ -238,9 +263,10 @@ class CytoNucsLoss:
                 self._grid_subsample_nucleus(
                     tf.expand_dims(tf.cast(y_true_raw['nucleus_instances'] > 0,
                                            tf.float32), axis=-1))))
-            loss_nuc_mask = self.lambda_nuc_mask * (
+            loss_nuc_mask = on['nucleus'] * self.lambda_nuc_mask * (
                     0.5 * self._refinement_ce_loss(
-                y_pred['nucleus_mask_logit'], gt_nuc_semantic, _nuc_any) +
+                y_pred['nucleus_mask_logit'], gt_nuc_semantic, _nuc_any,
+                None if known['nucleus'] is None else _tile_prompts(known['nucleus']), slot_known['nucleus']) +
                     0.5 * self._refinement_overlap_loss(
                 y_pred['nucleus_mask'], gt_nuc_semantic))
 
@@ -263,39 +289,43 @@ class CytoNucsLoss:
                 target = crop(tf.cast(y_true_raw[head + '_target'], tf.float32)[slot * first:(slot + 1) * first, ..., None],
                               begin, size)
                 any_instance = crop(tf.cast(y_true_raw[head + '_instances'] > 0, tf.float32)[..., None], begin, size)
+                voxels, prompts = None, None
+                if known[head] is not None:
+                    voxels = crop(tf.cast(y_true_raw[head + '_known'], tf.float32)[..., None], begin, size)
+                    prompts = slot_known[head][slot * first:(slot + 1) * first]
                 probability = tf.nn.softmax(logit, axis=-1)[..., 1:2]
-                head_loss = weight * (0.5 * self._refinement_ce_loss(logit, target, any_instance) +
-                                      0.5 * self._refinement_overlap_loss(probability, target))
+                head_loss = on[head] * weight * (0.5 * self._refinement_ce_loss(logit, target, any_instance, voxels, prompts) +
+                                                 0.5 * self._refinement_overlap_loss(probability, target))
                 fine_monitoring[head + '_fine_mask'] = head_loss
                 fine_mask += head_loss
         consistency = tf.constant(0., tf.float32)
         if self.lambda_consistency:
             consistency = self.lambda_consistency * warmup * 0.5 * sum(
-                self._consistency_loss(y_pred[h + '_prob'], y_true[h + '_prob'])
+                on[h] * self._consistency_loss(y_pred[h + '_prob'], y_true[h + '_prob'])
                 for h in ('nucleus', 'cytoplasm'))
         prompt_consistency = tf.constant(0., tf.float32)
         if cfg.prompt_consistency_weight and self.n_prompts > 1:
             for head in ('nucleus', 'cytoplasm'):
                 target = self._subsample(tf.cast(y_true_raw[head + '_target'][..., None], tf.float32),
                                          getattr(cfg, head + '_grid'))
-                prompt_consistency += cfg.prompt_consistency_weight * 0.5 * self._prompt_consistency(
+                prompt_consistency += on[head] * cfg.prompt_consistency_weight * 0.5 * self._prompt_consistency(
                     y_pred[head + '_mask'], target)
         cell_prompt_separation = tf.constant(0., tf.float32)
         if cfg.cell_prompt_separation_weight and self.n_prompts > 1:
             target = self._subsample(tf.cast(y_true_raw['cytoplasm_target'][..., None], tf.float32),
                                      cfg.cytoplasm_grid)
-            cell_prompt_separation = cfg.cell_prompt_separation_weight * self._cell_prompt_separation(
+            cell_prompt_separation = on['cytoplasm'] * cfg.cell_prompt_separation_weight * self._cell_prompt_separation(
                 y_pred['cytoplasm_mask_logit'], target)
         cell_z_dice = tf.constant(0., tf.float32)
         if cfg.cell_z_dice_weight:
             target = self._subsample(tf.cast(y_true_raw['cytoplasm_target'][..., None], tf.float32),
                                      cfg.cytoplasm_grid)
-            cell_z_dice = cfg.cell_z_dice_weight * self._cell_z_dice(y_pred['cytoplasm_mask'], target)
+            cell_z_dice = on['cytoplasm'] * cfg.cell_z_dice_weight * self._cell_z_dice(y_pred['cytoplasm_mask'], target)
         nucleus_z_dice = tf.constant(0., tf.float32)
         if cfg.nucleus_z_dice_weight:
             target = self._subsample(tf.cast(y_true_raw['nucleus_target'][..., None], tf.float32),
                                      cfg.nucleus_grid)
-            nucleus_z_dice = cfg.nucleus_z_dice_weight * self._cell_z_dice(y_pred['nucleus_mask'], target)
+            nucleus_z_dice = on['nucleus'] * cfg.nucleus_z_dice_weight * self._cell_z_dice(y_pred['nucleus_mask'], target)
         semantic_foreground = tf.constant(0., tf.float32)
         semantic_monitoring = {}
         if cfg.semantic_foreground_weight:
@@ -305,14 +335,19 @@ class CytoNucsLoss:
                                          getattr(cfg, head + '_grid'))
                 logit = tf.cast(y_pred[head + '_semantic_logit'], tf.float32)
                 probability = tf.sigmoid(logit)
-                bce = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=target, logits=logit))
-                overlap = self._refinement_overlap_loss(probability, target)
+                if known[head] is None:
+                    bce = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=target, logits=logit))
+                    overlap = self._refinement_overlap_loss(probability, target)
+                else:
+                    bce = tf.math.divide_no_nan(tf.reduce_sum(known[head] * tf.nn.sigmoid_cross_entropy_with_logits(
+                        labels=target, logits=logit)), tf.reduce_sum(known[head]))
+                    overlap = self._refinement_overlap_loss(probability * known[head], target * known[head])
                 binary = tf.cast(probability > 0.5, tf.float32)
                 semantic_monitoring[head + '_semantic_bce'] = bce
                 semantic_monitoring[head + '_semantic_overlap'] = overlap
                 semantic_monitoring[head + '_semantic_dice'] = tf.math.divide_no_nan(
                     2. * tf.reduce_sum(binary * target), tf.reduce_sum(binary) + tf.reduce_sum(target))
-                semantic_foreground += cfg.semantic_foreground_weight * 0.5 * (0.5 * bce + 0.5 * overlap)
+                semantic_foreground += on[head] * cfg.semantic_foreground_weight * 0.5 * (0.5 * bce + 0.5 * overlap)
         mask_quality = tf.constant(0., tf.float32)
         quality_monitoring = {}
         if cfg.mask_quality_weight:
@@ -357,27 +392,32 @@ class CytoNucsLoss:
                             y_true_raw[head + '_target'], self.ndim,
                             None if truncating_axes is None else
                             tf.tile(tf.cast(truncating_axes, tf.float32), [self.n_prompts, 1]))
+                    if slot_known[head] is not None:
+                        eligible *= slot_known[head]
                     quality_monitoring[head + '_quality_supervised_fraction'] = tf.reduce_mean(eligible)
                     quality_monitoring[head + '_quality_complete_positive_fraction'] = tf.reduce_mean(eligible * positive)
                     error_mean = tf.math.divide_no_nan(tf.reduce_sum(error * eligible), tf.reduce_sum(eligible))
+                elif slot_known[head] is not None:
+                    error_mean = tf.math.divide_no_nan(tf.reduce_sum(error * slot_known[head]), tf.reduce_sum(slot_known[head]))
                 else:
                     error_mean = tf.reduce_mean(error)
-                mask_quality += cfg.mask_quality_weight * .5 * error_mean
+                mask_quality += on[head] * cfg.mask_quality_weight * .5 * error_mean
                 if cfg.mask_quality_rank_weight:
                     # Order over every prompt: a crop-cut object looks like a volume-cut one at
                     # inference, and background prompts (target 0) must rank below real masks.
                     rank, pair_accuracy, pair_count = quality_rank_loss(
-                        tf.reshape(y_pred[head + '_quality'], [-1]), quality_target, tf.ones_like(error))
+                        tf.reshape(y_pred[head + '_quality'], [-1]), quality_target,
+                        tf.ones_like(error) if slot_known[head] is None else slot_known[head])
                     quality_monitoring[head + '_quality_rank_loss'] = rank
                     quality_monitoring[head + '_quality_pair_accuracy'] = pair_accuracy
                     quality_monitoring[head + '_quality_rank_pairs'] = pair_count
-                    mask_quality += cfg.mask_quality_rank_weight * rank
+                    mask_quality += on[head] * cfg.mask_quality_rank_weight * rank
         # === TOTAL ===
         total_loss = (
-                cfg.lambda_prob_nucleus * loss_nucleus['bce'] +
-                cfg.lambda_dist_nucleus * loss_nucleus['distance'] +
-                cfg.lambda_prob_cytoplasm * loss_cytoplasm['bce'] +
-                cfg.lambda_dist_cytoplasm * loss_cytoplasm['distance'] +
+                on['nucleus'] * cfg.lambda_prob_nucleus * loss_nucleus['bce'] +
+                on['nucleus'] * cfg.lambda_dist_nucleus * loss_nucleus['distance'] +
+                on['cytoplasm'] * cfg.lambda_prob_cytoplasm * loss_cytoplasm['bce'] +
+                on['cytoplasm'] * cfg.lambda_dist_cytoplasm * loss_cytoplasm['distance'] +
                 loss_wbr +
                 self.lambda_containment * warmup * loss_containment +
                 loss_fragmentation +
@@ -501,7 +541,7 @@ class CytoNucsLoss:
     # ============================================================
 
     def _stardist_loss(self, prob_true, prob_pred, dist_true, dist_pred,
-                       name='object', prob_logit=None, instances=None):
+                       name='object', prob_logit=None, instances=None, known=None):
 
         prob_true_squeeze = tf.squeeze(prob_true, axis=-1)
         prob_pred_squeeze = tf.squeeze(prob_pred, axis=-1)
@@ -519,7 +559,14 @@ class CytoNucsLoss:
             p = tf.clip_by_value(prob_pred_squeeze, eps, 1.0 - eps)
             bce_raw = -(prob_true_squeeze * tf.math.log(p) +
                         (1.0 - prob_true_squeeze) * tf.math.log(1.0 - p))
-        loss_bce = tf.reduce_mean(bce_raw)
+        if known is None:
+            loss_bce = tf.reduce_mean(bce_raw)
+        else:
+            # Voxel BCE over the voxels whose annotation is known (training.unknown_label).
+            known = tf.squeeze(known, axis=-1)
+            loss_bce = tf.math.divide_no_nan(tf.reduce_sum(bce_raw * known), tf.reduce_sum(known))
+            foreground_mask *= known
+            background_mask *= known
         probability_metrics = {}
         object_weight = getattr(self.config, name + '_prob_object_weight', 0.0)
         peak_weight = self.config.prob_object_peak_weight if name in ('nucleus', 'cytoplasm') else 0.0
@@ -671,6 +718,11 @@ class CytoNucsLoss:
             self._match_to_cytoplasm(self._grid_subsample_nucleus(
                 tf.expand_dims(tf.cast(y_true_raw['nucleus_instances'] > 0,
                                        tf.float32), axis=-1)))))
+
+        if 'cytoplasm_known' in y_true_raw:
+            # Where the cells are not annotated, a nucleus may lie inside one (training.unknown_label).
+            cyto_fg_gt = tf.maximum(cyto_fg_gt, 1. - self._grid_subsample_cytoplasm(
+                tf.cast(y_true_raw['cytoplasm_known'], tf.float32)[..., None]))
 
         # 1. GEOMETRIC CONTAINMENT
         loss_geometric = tf.reduce_mean(nuc_prob * (1.0 - cyto_fg_gt))
@@ -846,7 +898,7 @@ class CytoNucsLoss:
     # === BACKGROUND PENALTY LOSS (уже Pure TensorFlow) ===
     # ============================================================
 
-    def _background_penalty_loss(self, prob_pred, prob_gt, name='object'):
+    def _background_penalty_loss(self, prob_pred, prob_gt, name='object', known=None):
         """
         Усиленный штраф за высокие predictions на фоне.
         Pure TensorFlow - без изменений, эта функция уже корректна.
@@ -857,6 +909,8 @@ class CytoNucsLoss:
 
         # Фон = где GT prob < 0.1 (чистый background)
         background_mask = tf.cast(prob_gt_squeeze < 0.1, tf.float32)
+        if known is not None:
+            background_mask *= tf.squeeze(known, axis=-1)
 
         # Predictions на фоне
         pred_on_background = prob_pred_squeeze * background_mask
@@ -1058,7 +1112,7 @@ class CytoNucsLoss:
             tf.constant(0.0, tf.float32))
         return loss
 
-    def _refinement_ce_loss(self, logit, target_fg, inst_any):
+    def _refinement_ce_loss(self, logit, target_fg, inst_any, known=None, prompt_known=None):
         """
         Трёхклассовая CE для промпт-маски: 0 фон, 1 целевой инстанс, 2 другие.
 
@@ -1071,6 +1125,8 @@ class CytoNucsLoss:
         класса и затем между классами; выбранный объект не теряет вес при
         росте числа окружающих инстансов. False сохраняет старое усреднение
         по всем вокселям. Пустые target получают mask_ce_empty_weight.
+        known (rows aligned with the targets, 1 = annotation known) leaves out the voxels whose
+        class is unknown; prompt_known (one flag per row) the prompts whose target is unknown.
         """
         z = tf.cast(logit, tf.float32)  # (B, ..., 3)
         c1 = tf.cast(tf.squeeze(target_fg, axis=-1) > 0.5, tf.float32)
@@ -1081,7 +1137,11 @@ class CytoNucsLoss:
         spatial_dims = list(range(1, len(c1.shape)))
         valid = tf.cast(tf.reduce_sum(c1, axis=spatial_dims) > 0.5, tf.float32)  # (B,)
         valid = tf.where(valid > 0, valid, float(getattr(self.config, 'mask_ce_empty_weight', 0.25)))
+        if prompt_known is not None:
+            valid *= prompt_known
         n_valid = tf.reduce_sum(valid)
+        if known is not None:
+            labels *= tf.cast(known, tf.float32)                # unknown voxels belong to no class
 
         ce_per_voxel = tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=z)
         if self.config.mask_ce_class_balance:
@@ -1092,6 +1152,10 @@ class CytoNucsLoss:
                 tf.reduce_sum(ce_per_voxel[..., None] * labels, axis=spatial_dims), class_count)
             ce_per_image = tf.math.divide_no_nan(tf.reduce_sum(class_loss, axis=-1),
                 tf.reduce_sum(tf.cast(class_count > 0, tf.float32), axis=-1))
+        elif known is not None:
+            weight = tf.reduce_sum(labels, axis=-1)
+            ce_per_image = tf.math.divide_no_nan(tf.reduce_sum(ce_per_voxel * weight, axis=spatial_dims),
+                                                 tf.reduce_sum(weight, axis=spatial_dims))
         else:
             ce_per_image = tf.reduce_mean(ce_per_voxel, axis=spatial_dims)
         return tf.where(

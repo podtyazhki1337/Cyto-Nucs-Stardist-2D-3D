@@ -267,7 +267,7 @@ class ConfigTests(unittest.TestCase):
             raw = json.loads(path.read_text())
             for section, keys in NEW.items():
                 for key, (legacy, v3) in keys.items():
-                    self.assertEqual(raw[section][key], v3 if path.name in ('config_cytonucs_v3.json', 'config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json') else legacy,
+                    self.assertEqual(raw[section][key], v3 if path.name in ('config_cytonucs_v3.json', 'config_cytonucs_v3_1.json', 'config_cytonucs_v3_2.json', 'config_cytonucs_v3_3.json', 'config_cytonucs_v3_4.json', 'config_cytonucs_v4.json', 'config_cytonucs_v5.json') else legacy,
                                      (path.name, key))
         raw = json.loads((ROOT / 'config_cytonucs_v3.json').read_text())
         self.assertFalse(raw['inference']['residual_proposals'])

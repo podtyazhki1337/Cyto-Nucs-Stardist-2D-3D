@@ -24,6 +24,10 @@ def setup_gpu(memory_limit=None, allow_growth=True, visible_devices=None):
     if visible_devices is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(visible_devices)
 
+    # The paper-run queue caps a job that shares its GPU (GPU_MEMORY_LIMIT_MB); a limit in the config wins.
+    if memory_limit is None and int(os.environ.get('GPU_MEMORY_LIMIT_MB', 0) or 0):
+        memory_limit = int(os.environ['GPU_MEMORY_LIMIT_MB'])
+
     # Get list of GPUs
     gpus = tf.config.list_physical_devices('GPU')
 

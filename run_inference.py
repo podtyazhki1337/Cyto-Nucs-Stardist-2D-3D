@@ -6,7 +6,7 @@ import numpy as np
 import imageio.v2 as imageio
 import tifffile
 from tqdm import tqdm
-from csbdeep.utils import normalize
+from cytonucs_runtime import normalize_percentiles as normalize
 from stardist.matching import matching_dataset
 
 from cytonucs_config import CytoNucsConfig
