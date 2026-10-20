@@ -43,7 +43,8 @@ class CytoNucsConfig:
                          predicted_prompt_sample_peaks=False, reset_best_on_resume=False,
                          dist_target_stride=None, tile_sampling_by_objects=0.0, train_region_crops=False,
                          partial_annotation=False, unknown_label=None, annotated_anchor_share=0.0,
-                         init_weights=None, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0),
+                         init_weights=None, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0,
+                         val_loss_every_n_epochs=1),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25,
@@ -489,7 +490,7 @@ class CytoNucsConfig:
         architecture_plan(self)
         if isinstance(self.refinement_batch, bool) or not isinstance(self.refinement_batch, (int, np.integer)) or self.refinement_batch < 0:
             raise ValueError(f'refinement_batch must be a nonnegative integer, got {self.refinement_batch!r}')
-        for key in ('image_batch_size', 'prompts_per_crop', 'log_every_steps',
+        for key in ('image_batch_size', 'prompts_per_crop', 'log_every_steps', 'val_loss_every_n_epochs',
                     'prefetch_workers', 'prefetch_depth', 'refine_feature_cache_windows', 'predicted_prompt_start_epoch'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:

@@ -453,6 +453,30 @@ class TensorFlowTests(unittest.TestCase):
         for a,b in zip(self.model.keras_model.weights,fresh.keras_model.weights):
             np.testing.assert_allclose(a.numpy(),b.numpy(),rtol=1e-5,atol=1e-6)
 
+    def test_patch_validation_loss_every_n_epochs(self):
+        import copy
+        n=np.zeros((8,32,32),np.int32); n[2:6,10:20,10:20]=1
+        c=np.zeros_like(n); c[1:7,6:24,6:24]=1
+        y={'nucleus_instances':n[None], 'cytoplasm_instances':c[None],
+           'nucleus_target':np.repeat((n>0)[None],2,axis=0).astype('float32'),
+           'cytoplasm_target':np.repeat((c>0)[None],2,axis=0).astype('float32')}
+        for head,mask in (('nucleus',n),('cytoplasm',c)):
+            prob,dist=compute_stardist_gt(mask,self.cfg,getattr(self.cfg,head+'_grid'))
+            y[head+'_prob']=prob[None]; y[head+'_dist']=dist[None].astype('float32')
+        x=np.ones((1,8,32,32,5),np.float32)
+        class Gen:
+            def __len__(self): return 1
+            def __getitem__(self,idx): return x,y
+            def set_epoch(self,epoch): self.epoch=epoch
+        cfg=copy.copy(self.cfg); cfg.val_loss_every_n_epochs=2
+        trainer=CytoNucsTrainer(self.model,cfg,CytoNucsLoss(cfg),0)
+        trainer.train(Gen(),Gen(),epochs=3,steps_per_epoch=1)
+        losses=trainer.history['val_loss']
+        self.assertEqual(len(losses),3)                      # one entry per epoch, the last epoch always
+        self.assertIsNone(losses[0]); self.assertTrue(np.isfinite(losses[1]) and np.isfinite(losses[2]))
+        self.assertEqual(len(trainer.history['val_nucleus_mask']),3)
+        self.assertIsNone(trainer.history['val_nucleus_mask'][0])
+
     def test_negative_prompt_ce_has_gradient(self):
         loss=CytoNucsLoss(self.cfg)
         z=tf.Variable(tf.zeros((1,2,4,4,3)))

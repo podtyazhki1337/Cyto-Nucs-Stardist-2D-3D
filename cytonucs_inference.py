@@ -485,7 +485,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         return candidates
 
     batch = int(getattr(config, 'refinement_batch', 0) or 0)
-    batched = batch > 0 and stage_audit is None             # the stage audit follows the one-prompt path
+    batched = batch > 0
 
     def fine_windows(h, logit, hidden_h, cache_key, prompts, coarse, run_shape, net_shape):
         """Full-resolution probability of head h for a chunk of prompts over a window that contains each

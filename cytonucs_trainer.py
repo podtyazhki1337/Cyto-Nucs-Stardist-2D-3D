@@ -800,8 +800,15 @@ class CytoNucsTrainer:
                     experiment.log_metric("train_loss", train_loss, epoch=epoch + 1)
                     experiment.log_metric("learning_rate", self.optimizer.learning_rate.numpy(), epoch=epoch + 1)
 
-                # Validation loop
-                if val_generator is not None:
+                # Validation loop: patch losses are a training diagnostic (checkpoints are chosen by full
+                # validation), computed every val_loss_every_n_epochs epochs and at the last one.
+                val_every = int(getattr(self.config, 'val_loss_every_n_epochs', 1) or 1)
+                val_now = (epoch + 1) % val_every == 0 or epoch + 1 == epochs
+                if val_generator is not None and not val_now:
+                    for key, values in self.history.items():          # keep one entry per epoch
+                        if key.startswith('val_') and isinstance(values, list) and len(values) == epoch:
+                            values.append(None)
+                if val_generator is not None and val_now:
                     val_sums = {}
                     val_pbar = tqdm(range(len(val_generator)), desc='Validation')
                     for step in val_pbar:
