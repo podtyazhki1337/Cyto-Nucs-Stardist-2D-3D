@@ -225,8 +225,10 @@ def candidate_iou(a, b):
 
 def assemble_masks(candidates, shape, dedup_iou=0.5, containment_threshold=0.0,
                    overlap_threshold=0.0, observer=None, assembly_mode='voxel',
-                   min_remaining_fraction=0.5):
-    """Mask NMS then voxelwise probability competition; no polygon ownership."""
+                   min_remaining_fraction=0.5, owned_prompt=False):
+    """Mask NMS then voxelwise probability competition; no polygon ownership.
+    owned_prompt (object modes): a candidate whose prompt centre lies on an object already written is the
+    same object prompted again and is not written."""
     candidates = [c for c in candidates if c is not None]
     original_count = len(candidates)
     if observer is not None:
@@ -235,7 +237,7 @@ def assemble_masks(candidates, shape, dedup_iou=0.5, containment_threshold=0.0,
         raise ValueError('Unknown mask assembly mode')
     if assembly_mode != 'voxel':
         return _assemble_objects(candidates, shape, assembly_mode,
-                                 min_remaining_fraction, observer, containment_threshold)
+                                 min_remaining_fraction, observer, containment_threshold, owned_prompt)
     if containment_threshold > 0:
         # Prefer a complete mask over a much smaller nested proposal. Opt-in:
         # imperfect large masks can also contain a genuinely different object.
@@ -296,7 +298,7 @@ def assemble_masks(candidates, shape, dedup_iou=0.5, containment_threshold=0.0,
 
 
 def _assemble_objects(candidates, shape, mode, min_remaining_fraction, observer,
-                      containment_threshold=0.0):
+                      containment_threshold=0.0, owned_prompt=False):
     """Commit one connected object at a time; later masks cannot steal voxels.
 
     No geometric pre-NMS: reject duplicates only against actually committed voxels.
@@ -359,6 +361,13 @@ def _assemble_objects(candidates, shape, mode, min_remaining_fraction, observer,
                 if trace is not None:
                     trace(rank, 'nested', c, blockers=[conflict['accepted_rank']],
                           quality=-priority(c)[1])
+                continue
+        if owned_prompt and c.get('prompt_center') is not None:
+            at = tuple(np.clip(np.round(np.asarray(c['prompt_center'], np.float64)).astype(int), 0, np.array(shape) - 1))
+            if out[at]:
+                rejected += 1
+                if trace is not None:
+                    trace(rank, 'prompt_owned', c, blockers=[label_ranks[int(out[at])]], quality=-priority(c)[1])
                 continue
         sl = tuple(slice(int(l), int(l+s)) for l,s in zip(c['lo'],c['mask'].shape))
         free = c['mask'] & (out[sl] == 0)

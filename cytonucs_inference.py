@@ -111,10 +111,75 @@ def _window_size(extent, net_shape, grid):
     return tuple(size)
 
 
+REFINE_WINDOW_SIZES = (8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)   # head-grid nodes per axis
+
+
+def _refiner_reach(config):
+    """Receptive-field radius of the prompted refiner in head-grid nodes per axis (plus a safety node) and its
+    total pooling factor, over both heads (they share the grid when windows are used)."""
+    from cytonucs_geometry import refinement_pool_schedule
+    nd = int(config.ndim)
+    reach, factor = np.zeros(nd, int), np.ones(nd, int)
+    for head in ('nucleus', 'cytoplasm'):
+        schedule = [np.asarray(p, int) for p in refinement_pool_schedule(config, head)]
+        r, stride = np.zeros(nd, int), np.ones(nd, int)
+        for pool in schedule:
+            r += stride + (pool - 1) * stride                    # 3x3 convolution, then pooling
+            stride = stride * pool
+        r += stride                                              # bottleneck (or the two convolutions without depth)
+        for pool in reversed(schedule):
+            stride = stride // pool
+            r += stride                                          # convolution after upsampling
+        reach = np.maximum(reach, r + 2)
+        factor = np.lcm(factor, np.prod(schedule, axis=0) if schedule else np.ones(nd, int))
+    return reach, factor
+
+
+def _refine_window_runner(model, kind, fn, size):
+    """Compiled refinement of per-prompt windows of static `size` (head-grid nodes) cut from the ROI features on
+    the device: (features [1, *grid_roi, c] each, prompt windows [m, *size*grid, 1], window starts [m, nd] in
+    head-grid nodes) -> the outputs of the nucleus (refine) or cell network for the windows."""
+    cache = model.__dict__.setdefault('_compiled_refine_windows', {})
+    key = (kind, id(fn), tuple(size))
+    if key not in cache:
+        nd = len(size)
+        offsets = tf.stack(tf.meshgrid(*[tf.range(w, dtype=tf.int32) for w in size], indexing='ij'), -1)
+        expand = (slice(None),) + (None,) * nd
+
+        def run(features, prompt_windows, begins):
+            index = begins[expand] + offsets[None]
+            crops = [tf.gather_nd(f[0], index) for f in features]
+            return fn(crops + ([prompt_windows] if kind == 'cytoplasm' else [prompt_windows, prompt_windows]))
+        cache[key] = tf.function(run, reduce_retracing=True)
+    return cache[key]
+
+
+_EMBED_RUNNERS = {}
+
+
+def _embed_windows(windows, starts, grid_roi):
+    """Windows [m, *size, c] placed at starts [m, nd] into zeros [m, *grid_roi, c] on the device (one scatter)."""
+    size, channels = tuple(int(v) for v in windows.shape[1:-1]), int(windows.shape[-1])
+    key = (size, tuple(int(v) for v in grid_roi), channels)
+    if key not in _EMBED_RUNNERS:
+        nd = len(size)
+        offsets = tf.stack(tf.meshgrid(*[tf.range(w, dtype=tf.int32) for w in size], indexing='ij'), -1)
+        expand = (slice(None),) + (None,) * nd
+        full = tf.constant(key[1], tf.int32)
+
+        def embed(w, start):
+            m = tf.shape(w)[0]
+            index = start[expand] + offsets[None]
+            batch = tf.broadcast_to(tf.reshape(tf.range(m), [-1] + [1] * (nd + 1)), tf.concat([tf.shape(index)[:-1], [1]], 0))
+            return tf.scatter_nd(tf.concat([batch, index], -1), w, tf.concat([[m], full, [channels]], 0))
+        _EMBED_RUNNERS[key] = tf.function(embed, reduce_retracing=True)
+    return _EMBED_RUNNERS[key](windows, starts)
+
+
 def _fine_window_runner(model, head, head_fn, grid, size):
     """Compiled fine head on per-prompt windows of static `size`, cut on the device: (coarse logits
     [n, *grid_shape, 3], hidden [n, *grid_shape, c], full-resolution features [1, *net, f], network input
-    [1, *net, i], prompts [n, *net, 1], items [m], window starts [m, nd]) -> foreground probability
+    [1, *net, i], prompt windows [m, *size, 1], items [m], window starts [m, nd]) -> foreground probability
     [m, *size]. The windows are those of window_inputs (training) and fine_window_arrays (one-prompt
     inference)."""
     from cytonucs_fine_mask import pad_last_node
@@ -136,12 +201,12 @@ def _fine_window_runner(model, head, head_fn, grid, size):
             batch = tf.broadcast_to(items[expand + (None,)], tf.concat([tf.shape(index)[:-1], [1]], 0))
             return tf.gather_nd(t, tf.concat([batch, index], -1))
 
-        def run(logit, hidden, features, image, prompts, items, begins):
+        def run(logit, hidden, features, image, prompt_windows, items, begins):
             grid_begins = begins // tf.constant(grid, tf.int32)
             inputs = [cut(pad_last_node(logit, grid), items, grid_begins, grid_offsets),
                       cut(pad_last_node(hidden, grid), items, grid_begins, grid_offsets),
                       cut(features, None, begins, full_offsets), cut(image, None, begins, full_offsets),
-                      cut(prompts, items, begins, full_offsets)]
+                      prompt_windows]
             return tf.nn.softmax(head_fn(inputs), axis=-1)[..., 1]
         cache[key] = tf.function(run, reduce_retracing=True)
     return cache[key]
@@ -253,7 +318,8 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     diagnostics = {h: dict(attempted=0, empty_threshold=0, missing_component=0,
                           nonfinite=0, quality_nonfinite=0, quality_rejected=0, accepted=0, quality=[],
                           roi_expansions=0, roi_boundary_remaining=0,
-                          residual_peaks=0, residual_prompts=0, area_gate_removed=0)
+                          residual_peaks=0, residual_prompts=0, area_gate_removed=0,
+                          windowed=0, window_fallbacks=0)
                    for h in ('nucleus', 'cytoplasm')}
     if config.mask_quality_min == 'auto':
         quality_min = {h: float((quality_gates or {}).get(h, 0.0)) for h in ('nucleus', 'cytoplasm')}
@@ -348,10 +414,12 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         feature_cache.move_to_end(cache_key)
         return cache_key, crop.shape[:nd]
 
-    def gaussian_prompt(center, sigma, net_shape, out=None):
+    def gaussian_prompt(center, sigma, net_shape, out=None, start=None):
         # Open (broadcast) axes: the same per-voxel arithmetic as a full meshgrid, bit for bit,
-        # without building nd full-ROI coordinate arrays per prompt.
-        axes = np.ix_(*[np.arange(s, dtype=np.float32) for s in net_shape])
+        # without building nd full-ROI coordinate arrays per prompt. start: the window [start, start + net_shape)
+        # of the ROI prompt (the same values).
+        start = (0,) * len(net_shape) if start is None else tuple(int(v) for v in start)
+        axes = np.ix_(*[np.arange(b, b + s, dtype=np.float32) for b, s in zip(start, net_shape)])
         return np.exp(-0.5 * sum(((g-center[a])/sigma[a])**2 for a, g in enumerate(axes)), out=out)
 
     def head_threshold(h):
@@ -487,7 +555,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     batch = int(getattr(config, 'refinement_batch', 0) or 0)
     batched = batch > 0
 
-    def fine_windows(h, logit, hidden_h, cache_key, prompts, coarse, run_shape, net_shape):
+    def fine_windows(h, logit, hidden_h, cache_key, items, coarse, run_shape, net_shape):
         """Full-resolution probability of head h for a chunk of prompts over a window that contains each
         prompt's first fine window: {k: (begin, map)}. Prompts with the same window size (_window_size) go
         through the fine head together."""
@@ -506,7 +574,10 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             for m0 in range(0, len(members), per_call):
                 part = members[m0:m0 + per_call]
                 begins = np.stack([_place_window(*windows[k], size, net_shape, grid) for k in part])
-                probability = runner(logit, hidden_h, features, network_input, prompts,
+                prompt_windows = np.empty((len(part),) + tuple(size), np.float32)
+                for j, k in enumerate(part):
+                    gaussian_prompt(*items[k], size, out=prompt_windows[j], start=begins[j])
+                probability = runner(logit, hidden_h, features, network_input, tf.convert_to_tensor(prompt_windows[..., None]),
                                      tf.constant(part, tf.int32), tf.constant(begins, tf.int32)).numpy()
                 for k, begin, prob in zip(part, begins, probability):
                     maps[k] = (begin, prob)
@@ -532,78 +603,237 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             cache_key, net_shape = roi_input(origin, run_shape)
             features = feature_cache[cache_key]
             repeated = {}
+            grid = tuple(int(v) for v in config.nucleus_grid)
+            grid_roi = tuple(int(v) // g for v, g in zip(net_shape, grid))
+            # Refinement over a window around each prompt (inference.refinement_windows): the refiner is local
+            # (convolutions and pooling at aligned window starts; the prompt enters as offsets from its own
+            # peak), so inside the window minus its receptive field it gives the full-ROI values.
+            windowed = (bool(getattr(config, 'refinement_windows', False))
+                        and tuple(config.cytoplasm_grid) == grid
+                        and all(tuple(int(v) for v in f.shape[1:1 + nd]) == grid_roi for f in features))
+            reach, factor = _refiner_reach(config)
+            a_cell = np.asarray(getattr(config, 'rays_anisotropy_cytoplasm', config.anisotropy), np.float64)
+            cell_extent = 2 * float(getattr(config, 'median_max_dist_cytoplasm', None) or 60.0) / a_cell
+
+            def window_of(kind, center, sigma):
+                """Window (start, size) in head-grid nodes: 1.5x the prompt's object extent (4 sigma; for a
+                nucleus prompt at least 1.5x a median cell, which the same pass draws) and the fine window's margin,
+                plus the reach on both sides; aligned to the refiner's pooling; the whole axis when it does not fit."""
+                extent = 6 * np.asarray(sigma, np.float64)
+                if kind == 'nucleus':
+                    extent = np.maximum(extent, 1.5 * cell_extent)
+                extent = extent + 2 * np.array([3 * g + 3 for g in grid])
+                start, size = [], []
+                for ax in range(nd):
+                    need = int(np.ceil(extent[ax] / grid[ax])) + 2 * int(reach[ax])
+                    w = next((v for v in REFINE_WINDOW_SIZES if v >= need and v % factor[ax] == 0), None)
+                    if w is None or w >= grid_roi[ax]:
+                        start.append(0); size.append(grid_roi[ax]); continue
+                    b0 = int(round(center[ax] / grid[ax] - w / 2))
+                    start.append(max(0, min(b0, grid_roi[ax] - w)) // factor[ax] * factor[ax]); size.append(w)
+                return np.array(start), tuple(size)
+
+            def valid(start, size):
+                """Full-resolution [lo, hi) where a window gives the full-ROI values (all of an axis at a ROI face)."""
+                lo = [(b + int(r) if b > 0 else 0) * g for b, r, g in zip(start, reach, grid)]
+                hi = [(b + w - int(r) if b + w < G else G) * g for b, w, r, g, G in zip(start, size, reach, grid, grid_roi)]
+                return np.array(lo), np.array(hi)
+
+            def parse(kind, outputs, n):
+                """(logits, hidden, quality) per head from the outputs of the nucleus or cell network."""
+                hidden = {}
+                if kind == 'cytoplasm':
+                    if fine_enabled:
+                        outputs = list(outputs); hidden['cytoplasm'] = outputs.pop()
+                        outputs = outputs if config.mask_quality_head else outputs[0]
+                    quality = {}
+                    if config.mask_quality_head:
+                        outputs, cell_quality = outputs
+                        quality['cytoplasm'] = np.asarray(cell_quality).reshape(n, -1)[:, 0]
+                    return {'cytoplasm': outputs}, hidden, quality
+                if fine_enabled:
+                    outputs = list(outputs); hidden['cytoplasm'] = outputs.pop(); hidden['nucleus'] = outputs.pop()
+                quality = ({h: np.asarray(q).reshape(n, -1)[:, 0] for h, q in zip(('nucleus', 'cytoplasm'), outputs[2:])}
+                           if config.mask_quality_head else {})
+                return dict(zip(('nucleus', 'cytoplasm'), outputs[:2])), hidden, quality
+
+            def full_roi(kind, ids):
+                """The network over the whole ROI for the prompts `ids` (indices into prepared)."""
+                n = len(ids)
+                if kind not in repeated:
+                    # Backbone features repeated once per ROI for the largest chunk; smaller calls take a slice.
+                    used = features if kind == 'nucleus' else [features[k] for k in (1, 2, 5, 6)]
+                    largest = max(len(c) for kd, c in chunks if kd == kind)
+                    repeated[kind] = [tf.repeat(f, max(largest, n), axis=0) for f in used]
+                if int(repeated[kind][0].shape[0]) < n:
+                    repeated[kind] = [tf.repeat(f[:1], n, axis=0) for f in repeated[kind]]
+                inputs = repeated[kind] if n == int(repeated[kind][0].shape[0]) else [f[:n] for f in repeated[kind]]
+                buffer = np.empty((n,) + tuple(net_shape), np.float32)
+                for k, i in enumerate(ids):
+                    gaussian_prompt(prepared[i][2], prepared[i][3], net_shape, out=buffer[k])
+                prompts = tf.convert_to_tensor(buffer[..., None])
+                if kind == 'cytoplasm':
+                    return prompts, cell_fn(inputs + [prompts])
+                return prompts, refine_fn(inputs + [prompts, prompts])
 
             def launch(kind, chunk):
                 """Prompts and refinement network of one chunk; the device runs it while the previous
                 chunk is assembled on the host."""
                 nonlocal runs
-                n = len(chunk)
-                if kind not in repeated:
-                    # Backbone features repeated once per ROI for the largest chunk; smaller chunks take a slice.
-                    used = features if kind == 'nucleus' else [features[k] for k in (1, 2, 5, 6)]
-                    largest = max(len(c) for kd, c in chunks if kd == kind)
-                    repeated[kind] = [tf.repeat(f, largest, axis=0) for f in used]
-                inputs = repeated[kind] if n == int(repeated[kind][0].shape[0]) else [f[:n] for f in repeated[kind]]
-                buffer = np.empty((n,) + tuple(net_shape), np.float32)
-                for k, i in enumerate(chunk):
-                    gaussian_prompt(prepared[i][2], prepared[i][3], net_shape, out=buffer[k])
-                prompts = tf.convert_to_tensor(buffer[..., None])
-                runs += n
-                if kind == 'cytoplasm':
-                    return chunk, prompts, cell_fn(inputs + [prompts])
-                return chunk, prompts, refine_fn(inputs + [prompts, prompts])
+                runs += len(chunk)
+                if not windowed:
+                    return ('full', chunk) + full_roi(kind, chunk)
+                windows = [window_of(kind, prepared[i][2], prepared[i][3]) for i in chunk]
+                groups = OrderedDict()
+                for k, (_, size) in enumerate(windows):
+                    groups.setdefault(size, []).append(k)
+                used = features if kind == 'nucleus' else [features[k] for k in (1, 2, 5, 6)]
+                fn = cell_fn if kind == 'cytoplasm' else refine_fn
+                parts = []
+                for size, ks in groups.items():
+                    per_call = max(1, REFINE_BATCH_NODES // int(np.prod(size)))
+                    runner = _refine_window_runner(model, kind, fn, size)
+                    full_size = tuple(w * g for w, g in zip(size, grid))
+                    for m0 in range(0, len(ks), per_call):
+                        part = ks[m0:m0 + per_call]
+                        starts = np.stack([windows[k][0] for k in part])
+                        prompt_windows = np.empty((len(part),) + full_size, np.float32)
+                        for j, k in enumerate(part):
+                            gaussian_prompt(prepared[chunk[k]][2], prepared[chunk[k]][3], full_size,
+                                            out=prompt_windows[j], start=starts[j] * np.array(grid))
+                        parts.append((part, starts, size, runner(used, tf.convert_to_tensor(prompt_windows[..., None]),
+                                                                 tf.constant(starts, tf.int32))))
+                return ('windows', chunk, windows, parts)
 
-            def process(kind, chunk, prompts, logits):
+            def process(mode, kind, chunk, *launched):
                 n = len(chunk)
-                hidden = {}
-                if kind == 'cytoplasm':
-                    if fine_enabled:
-                        logits = list(logits); hidden['cytoplasm'] = logits.pop()
-                        logits = logits if config.mask_quality_head else logits[0]
-                    quality = {}
-                    if config.mask_quality_head:
-                        logits, cell_quality = logits
-                        quality['cytoplasm'] = np.asarray(cell_quality).reshape(n, -1)[:, 0]
-                    head_logits = [('cytoplasm', logits)]
-                else:
-                    if fine_enabled:
-                        logits = list(logits); hidden['cytoplasm'] = logits.pop(); hidden['nucleus'] = logits.pop()
-                    quality = ({h: np.asarray(q).reshape(n, -1)[:, 0] for h, q in zip(('nucleus', 'cytoplasm'), logits[2:])}
-                               if config.mask_quality_head else {})
-                    head_logits = list(zip(('nucleus', 'cytoplasm'), logits))
                 items = [(prepared[i][2], prepared[i][3]) for i in chunk]
-                for h, logit in head_logits:
-                    grid = getattr(config, f'{h}_grid')
-                    p_grids = tf.nn.softmax(logit, axis=-1)[..., 1].numpy()
-                    threshold = head_threshold(h)
-                    coarse = [local_prompt_mask(p_grids[k], run_shape, grid, center, sigma, threshold)
-                              if np.all(np.isfinite(p_grids[k])) else None for k, (center, sigma) in enumerate(items)]
-                    maps = (fine_windows(h, logit, hidden[h], cache_key, prompts, coarse, run_shape, net_shape)
+                heads = ('cytoplasm',) if kind == 'cytoplasm' else ('nucleus', 'cytoplasm')
+                full_rows = {}                             # chunk index -> (prompt, logits, hidden) over the whole ROI
+                if mode == 'full':
+                    prompts, outputs = launched
+                    logits, hidden, quality = parse(kind, outputs, n)
+                    p_grids = {h: tf.nn.softmax(logits[h], axis=-1)[..., 1].numpy() for h in heads}
+                    coarse = {}
+                    for h in heads:
+                        threshold = head_threshold(h)
+                        coarse[h] = [local_prompt_mask(p_grids[h][k], run_shape, grid, center, sigma, threshold)
+                                     if np.all(np.isfinite(p_grids[h][k])) else None for k, (center, sigma) in enumerate(items)]
+                else:
+                    windows, parts = launched
+                    p_grids = {h: np.zeros((n,) + grid_roi, np.float32) for h in heads}
+                    quality, coarse, embedded = {}, {h: [None] * n for h in heads}, {h: [] for h in heads}
+                    for part, starts, size, outputs in parts:
+                        logit_w, hidden_w, quality_w = parse(kind, outputs, len(part))
+                        starts_t = tf.constant(starts, tf.int32)
+                        for h in heads:
+                            threshold = head_threshold(h)
+                            prob = tf.nn.softmax(logit_w[h], axis=-1)[..., 1].numpy()
+                            for j, k in enumerate(part):
+                                p_grids[h][k][tuple(slice(int(b), int(b) + w) for b, w in zip(starts[j], size))] = prob[j]
+                                if np.all(np.isfinite(prob[j])):
+                                    # The prompt mask evaluated on the window (zero probability outside it).
+                                    offset = starts[j] * np.array(grid)
+                                    extent = np.minimum(np.array(size) * np.array(grid), np.asarray(run_shape) - offset)
+                                    lo, pw, fg, mask, any_fg = local_prompt_mask(prob[j], tuple(int(v) for v in extent), grid,
+                                                                                 items[k][0] - offset, items[k][1], threshold)
+                                    coarse[h][k] = (np.asarray(lo) + offset, pw, fg, mask, any_fg)
+                            if fine_enabled:
+                                embedded[h].append((part, _embed_windows(logit_w[h], starts_t, grid_roi),
+                                                    _embed_windows(hidden_w[h], starts_t, grid_roi)))
+                        for hq, values in quality_w.items():
+                            quality.setdefault(hq, np.zeros(n))[part] = values
+                if mode == 'windows':
+                    # A prompt whose mask (with the fine window's margin and one extra grid node) leaves the part of
+                    # its window that equals the full ROI is refined over the whole ROI.
+                    outside = []
+                    for k in range(n):
+                        lo_v, hi_v = valid(*windows[k])
+                        for h in heads:
+                            c = coarse[h][k]
+                            if c is None or not c[4]:
+                                continue
+                            margin = np.array([2 * g + 3 for g in grid])
+                            lo = np.asarray(c[0]) - margin
+                            hi = np.asarray(c[0]) + np.array(c[3].shape) + margin + np.array(grid)
+                            if np.any(np.maximum(lo, 0) < lo_v) or np.any(np.minimum(hi, np.asarray(run_shape)) > hi_v):
+                                outside.append(k); break
+                    diagnostics[kind]['windowed'] += n
+                    diagnostics[kind]['window_fallbacks'] += len(outside)
+                    if outside:
+                        prompts_f, outputs_f = full_roi(kind, [chunk[k] for k in outside])
+                        logit_f, hidden_f, quality_f = parse(kind, outputs_f, len(outside))
+                        for j, k in enumerate(outside):
+                            full_rows[k] = (prompts_f[j:j + 1], {h: logit_f[h][j] for h in heads},
+                                            {h: hidden_f[h][j] for h in hidden_f})
+                            for h in heads:
+                                p_grids[h][k] = tf.nn.softmax(logit_f[h][j], axis=-1)[..., 1].numpy()
+                                coarse[h][k] = (local_prompt_mask(p_grids[h][k], run_shape, grid, *items[k], head_threshold(h))
+                                                if np.all(np.isfinite(p_grids[h][k])) else None)
+                            for h, values in quality_f.items():
+                                quality[h][k] = values[j]
+                    # Logits and fine features over the ROI grid for the fine head: windows placed in zeros (the
+                    # fine head reads them only inside the valid part), whole-ROI rows as computed.
+                    logits, hidden = {h: None for h in heads}, {}
+                    if fine_enabled:
+                        inverse = np.argsort([k for part, _, _ in embedded[heads[0]] for k in part])
+                        rows = sorted(full_rows)
+                        for h in heads:
+                            logits[h] = tf.gather(tf.concat([e[1] for e in embedded[h]], 0), inverse)
+                            hidden[h] = tf.gather(tf.concat([e[2] for e in embedded[h]], 0), inverse)
+                            if rows:
+                                index = tf.constant([[k] for k in rows], tf.int32)
+                                logits[h] = tf.tensor_scatter_nd_update(logits[h], index, tf.stack([full_rows[k][1][h] for k in rows]))
+                                hidden[h] = tf.tensor_scatter_nd_update(hidden[h], index, tf.stack([full_rows[k][2][h] for k in rows]))
+                    prompts = None
+
+                def prompt_row(k):
+                    if mode == 'full':
+                        return prompts[k:k + 1]
+                    if k in full_rows:
+                        return full_rows[k][0]
+                    return tf.convert_to_tensor(gaussian_prompt(*items[k], net_shape)[None, ..., None], tf.float32)
+
+                for h in heads:
+                    logit = logits[h]
+                    maps = (fine_windows(h, logit, hidden[h], cache_key, items, coarse[h], run_shape, net_shape)
                             if fine_enabled else {})
 
-                    def probability_at(start, stop, k, h=h, logit=logit, grid=grid, maps=maps):
+                    def probability_at(start, stop, k, h=h, logit=logit, maps=maps):
                         end = np.minimum(stop, np.asarray(run_shape))
                         if k in maps:
                             begin, prob = maps[k]
                             if np.all(begin <= start) and np.all(end <= begin + np.array(prob.shape)):
                                 return prob[tuple(slice(int(s0 - b), int(e - b)) for s0, e, b in zip(start, end, begin))]
-                        # A grown window outside the computed one: the per-window pass of _fine_prompt_mask.
-                        arrays = fine_window_arrays(logit[k:k + 1], hidden[h][k:k + 1],
-                                                    [*fine_cache[cache_key], prompts[k:k + 1]], start, stop, grid)
+                        # A grown window outside the computed one: the per-window pass of _fine_prompt_mask, with
+                        # the whole-ROI refinement when the window leaves the valid part of a refinement window.
+                        logit_k, hidden_k = logit[k:k + 1], hidden[h][k:k + 1]
+                        if mode == 'windows' and k not in full_rows:
+                            lo_v, hi_v = valid(*windows[k])
+                            if np.any(np.asarray(start) < lo_v) or np.any(np.asarray(stop) + np.array(grid) > hi_v):
+                                diagnostics[kind]['window_fallbacks'] += 1
+                                prompts_f, outputs_f = full_roi(kind, [chunk[k]])
+                                logit_f, hidden_f, _ = parse(kind, outputs_f, 1)
+                                full_rows[k] = (prompts_f, {hh: logit_f[hh][0] for hh in heads},
+                                                {hh: hidden_f[hh][0] for hh in hidden_f})
+                        if k in full_rows:
+                            logit_k, hidden_k = full_rows[k][1][h][None], full_rows[k][2][h][None]
+                        arrays = fine_window_arrays(logit_k, hidden_k, [*fine_cache[cache_key], prompt_row(k)],
+                                                    start, stop, grid)
                         prob = tf.nn.softmax(fine_head_fns[h](arrays), axis=-1)[0, ..., 1].numpy()
                         return prob[tuple(slice(0, int(e - s0)) for s0, e in zip(start, end))]
 
                     for k, i in enumerate(chunk):
                         center, sigma = items[k]
-                        fine_mask = (lambda lo, mask_shape, threshold, k=k, grid=grid, center=center, sigma=sigma,
+                        fine_mask = (lambda lo, mask_shape, threshold, k=k, center=center, sigma=sigma,
                                      probability_at=probability_at: _fine_mask_windows(
                                          lambda start, stop: probability_at(start, stop, k), lo, mask_shape,
                                          run_shape, net_shape, grid, center, sigma, threshold))
                         expand = (lambda c, roi, s, step, i=i:
                                   follow.append((i, ('cytoplasm', c, None, roi, s, step))) or _PENDING)
                         out[i][0 if h == 'nucleus' else 1] = head_candidate(
-                            h, p_grids[k], {q: float(v[k]) for q, v in quality.items()}, origin, run_shape,
-                            net_shape, center, sigma, fine_mask, expand, specs[i][5], coarse=coarse[k])
+                            h, p_grids[h][k], {q: float(v[k]) for q, v in quality.items()}, origin, run_shape,
+                            net_shape, center, sigma, fine_mask, expand, specs[i][5], coarse=coarse[h][k])
 
             # Prompts per refinement call: `batch`, fewer for large (3D) ROIs.
             nodes = int(np.prod([-(-s // g) for s, g in zip(net_shape, config.nucleus_grid)]))
@@ -616,14 +846,15 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             for j, (kind, _) in enumerate(chunks):
                 current = pending
                 pending = launch(*chunks[j + 1]) if j + 1 < len(chunks) else None
-                process(kind, *current)
+                process(current[0], kind, *current[1:])
         if follow:
             for (i, _), (_, cell) in zip(follow, run_batched([spec for _, spec in follow])):
                 out[i][1] = cell
         return out
 
-    jobs = [('nucleus', ctr, d) for ctr, d, _ in anchors(nuc_labels, nuc_coords, nuc_probs, nuc_dists)]
-    jobs += [('cytoplasm', ctr, d) for ctr, d, _ in anchors(cyto_labels, cyto_coords, cyto_probs, cyto_dists)]
+    anchored = [('nucleus', ctr, d, score) for ctr, d, score in anchors(nuc_labels, nuc_coords, nuc_probs, nuc_dists)]
+    anchored += [('cytoplasm', ctr, d, score) for ctr, d, score in anchors(cyto_labels, cyto_coords, cyto_probs, cyto_dists)]
+    jobs = [job[:3] for job in anchored]
     results = [None] * len(jobs)
     if batched:
         for index, ((head, ctr, d), (n, c)) in enumerate(zip(jobs, run_batched([(head, ctr, d, None, None, 0)
@@ -636,6 +867,11 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             for index, (head, _, (ctr, d)) in group:
                 n, c = run(ctr, d, head)
                 results[index] = (n if head == 'nucleus' else None, c)
+    # Detection probability of the prompt's peak (0 for a label without a peak), for offline threshold tuning.
+    for (_, _, _, score), pair in zip(anchored, results):
+        for candidate in pair:
+            if candidate is not None:
+                candidate['detection_score'] = float(score)
     # Restore old candidate ordering: competition tie-breaks and evidence stay stable.
     for (head, _, _), (n, c) in zip(jobs, results):
         if head == 'nucleus':

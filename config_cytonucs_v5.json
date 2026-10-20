@@ -208,7 +208,8 @@
     "residual_proposals": false,
     "refinement_roi_snap": true,
     "tta_flips": false,
-    "refinement_batch": 0
+    "refinement_batch": 0,
+    "refinement_windows": false
   },
   "loss_weights": {
     "lambda_prob_nucleus": 1.0,

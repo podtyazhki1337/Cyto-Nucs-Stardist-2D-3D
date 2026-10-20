@@ -137,6 +137,61 @@ class BatchedRefinementTests(unittest.TestCase):
                     windows += int(wa.shape != tuple(cfg.refinement_patch_size))
         self.assertEqual(windows, len(self.nuclei))                # nuclear windows smaller than the ROI
 
+    def test_windowed_refinement_equals_the_whole_roi(self):
+        # A 96-voxel ROI (48 grid nodes): windows of 24-32 nodes around each prompt; masks inside them.
+        shape = (8, 96, 96)
+        nuclei = np.array([[4, 20, 20], [4, 50, 60], [3, 75, 30], [5, 30, 80]])
+        cells = np.array([[4, 22, 24], [4, 70, 70]])
+
+        def labels(points):
+            out = np.zeros(shape, np.int32)
+            for k, c in enumerate(points, 1):
+                out[tuple(c)] = k
+            return out
+
+        def run(cfg, runners, fine, windows, sink):
+            cfg.refinement_batch, cfg.refinement_windows = 4, windows
+            model = SimpleNamespace()
+            with contextlib.ExitStack() as stack:
+                if fine:
+                    stack.enter_context(patch.object(inference, '_fine_refinement_runners', return_value=runners))
+                else:
+                    stack.enter_context(patch.object(inference, '_refinement_runners', return_value=runners[:2]))
+                    stack.enter_context(patch.object(inference, '_cytoplasm_refinement_runner', return_value=runners[3]))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    out = inference.predict_instances_prompted(
+                        model, cfg, np.zeros(shape + (cfg.n_channel_in,), np.float32), nuclei, np.ones(len(nuclei)),
+                        cells, np.ones(len(cells)), nuc_dists=np.full((len(nuclei), 12), 2.5), nuc_labels=labels(nuclei),
+                        cyto_labels=labels(cells), verbose=False, candidate_sink=sink, mask_thresh=.45)
+            return out, model.last_refinement_diagnostics
+
+        grid_features = lambda x: [x[:, :, ::2, ::2]] * 7                    # features on the head grid
+        for fine in (False, True):
+            base = dict(BASE, refinement_patch_size=shape, median_max_dist_cytoplasm=6.)
+            cfg = config(refinement_full_resolution=True, **base) if fine else config(**base)
+            runners = self.fine_runners(cfg) if fine else self.coarse_runners()
+            runners = (grid_features,) + tuple(runners[1:])
+            whole, windowed = {}, {}
+            (n1, c1, p1), d1 = run(cfg, runners, fine, False, whole)
+            (n2, c2, p2), d2 = run(cfg, runners, fine, True, windowed)
+            np.testing.assert_array_equal(n1, n2, err_msg=str(fine)); np.testing.assert_array_equal(c1, c2, err_msg=str(fine))
+            self.assertEqual(p1, p2)
+            self.assertEqual(len(np.unique(n1)), len(nuclei) + 1)
+            if not fine:
+                self.assertEqual(len(np.unique(c1)), len(nuclei) + len(cells) + 1)
+            for head in ('nucleus', 'cytoplasm'):
+                self.assertEqual(d1[head]['accepted'], d2[head]['accepted'])
+                self.assertEqual(d1[head]['windowed'], 0)
+                self.assertGreater(d2[head]['windowed'], 0)
+                if not fine:                       # (the random fine head grows its windows past the refinement windows)
+                    self.assertEqual(d2[head]['window_fallbacks'], 0)
+                for a, b in zip(whole[head], windowed[head]):
+                    self.assertEqual(a is None, b is None)
+                    if a is not None:
+                        np.testing.assert_array_equal(a['mask'], b['mask'])
+                        if not fine:
+                            np.testing.assert_array_equal(a['probability_window'][1], b['probability_window'][1])
+
     def test_setting_is_validated(self):
         for bad in (-1, True, 1.5):
             with self.assertRaises(ValueError):
