@@ -5,11 +5,11 @@ Reads configuration from config_cytonucs.json
 Similar logic to original train.py
 """
 import numpy as np
+from cytonucs_runtime import write_instance_mask
 import tensorflow as tf
 from pathlib import Path
 import json
 import sys
-from comet_ml import Experiment
 from tqdm import tqdm
 from cytonucs_gpu_setup import setup_gpu, print_gpu_info
 # Import CytoNucs modules
@@ -23,8 +23,8 @@ from cytonucs_data_generator import (
     prepare_cytonucs_dataset
 )
 from cytonucs_trainer import CytoNucsTrainer, DiceCallback
-from cytonucs_inference import CytoNucsPredictor, compute_jtpr
-
+from cytonucs_inference import CytoNucsPredictor, compute_jtpr, load_gt_assignments
+import tifffile
 
 def load_config(config_path='config_cytonucs.json'):
     """Load configuration from JSON file"""
@@ -76,15 +76,20 @@ def run_inference_only(config_dict, config_path):
         basedir=config_dict['output']['basedir']
     )
     model.load_weights(checkpoint_path)
+    if model_config.mask_quality_min == 'auto' and model.loaded_quality_gates is None:
+        raise ValueError(f'{checkpoint_path} has no calibrated quality gates: use a checkpoint saved '
+                         'at a full validation with refinement_stage_audit, or a numeric mask_quality_min')
+    if ('auto' in (model_config.mask_thresh_nucleus, model_config.mask_thresh_cytoplasm)
+            and model.loaded_mask_thresholds is None):
+        raise ValueError(f'{checkpoint_path} has no calibrated mask thresholds: run this config with '
+                         '"mode": "calibrate" (or finish training), or set numeric mask_thresh_nucleus/cytoplasm')
     print("✅ Model loaded")
 
     # ========== Loaders / helpers ==========
     def _load_volume(path):
         """Читает том и нормализует порядок осей RGB-стека к (Z, Y, X, C)."""
-        arr = np.asarray(imageio.volread(str(path)))
-        if ndim == 3 and arr.ndim == 4 and arr.shape[-1] not in (3, 4) and arr.shape[1] in (3, 4):
-            arr = np.moveaxis(arr, 1, -1)  # (Z,C,Y,X) -> (Z,Y,X,C)
-        return arr
+        from cytonucs_runtime import read_model_image
+        return read_model_image(path, ndim, model_config.n_channel_in)
 
     def _to_model_input(img):
         """(spatial...) или (spatial..., C) -> нормализованный (spatial..., C)."""
@@ -116,30 +121,46 @@ def run_inference_only(config_dict, config_path):
         for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF', '*.png', '*.PNG',
                     '*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
             files.extend(list(path.glob(ext)))
-        return sorted(files)
+        return sorted(set(files))
+
+    # Какие сплиты гонять. Строка допускается ради удобства ("test"), но
+    # разворачивается в список: `for split in ('test')` перебирал бы СИМВОЛЫ,
+    # а не сплиты, и молча не находил ни одного файла.
+    eval_splits = config_dict.get('inference', {}).get('eval_splits', ['test', 'val'])
+    if isinstance(eval_splits, str):
+        eval_splits = [eval_splits]
+    eval_splits = [str(s) for s in eval_splits]
 
     image_files, nucleus_mask_files, cytoplasm_mask_files = [], [], []
-    for split in ('test', 'val'):
+    split_of_file = []  # источник каждого файла, для имени и печати
+    for split in eval_splits:
         d = Path(config_dict['data']['dataset_dir']) / split
-        if d.exists():
-            start = len(image_files)
-            image_files.extend(find_all_images(d / 'images'))
-            nucleus_mask_files.extend(find_all_images(d / 'nucleus_masks'))
-            cytoplasm_mask_files.extend(find_all_images(d / 'cytoplasm_masks'))
-            print(f"📂 Loaded {len(image_files) - start} images from {split}")
+        if not d.exists():
+            print(f"⚠️  Сплит '{split}' не найден: {d}")
+            continue
+        _im = find_all_images(d / 'images')
+        _nu = find_all_images(d / 'nucleus_masks')
+        _cy = find_all_images(d / 'cytoplasm_masks')
+        assert len(_im) == len(_nu) == len(_cy), (
+            f"{split}: {len(_im)} img, {len(_nu)} nuc, {len(_cy)} cyto")
+        image_files.extend(_im)
+        nucleus_mask_files.extend(_nu)
+        cytoplasm_mask_files.extend(_cy)
+        split_of_file.extend([split] * len(_im))
+        print(f"📂 Loaded {len(_im)} images from {split}")
 
     if len(image_files) == 0:
-        print("❌ No images found in test or validation directories")
+        print(f"❌ Нет изображений в сплитах {eval_splits} "
+              f"({config_dict['data']['dataset_dir']})")
         sys.exit(1)
 
     assert len(image_files) == len(nucleus_mask_files) == len(cytoplasm_mask_files), \
         f"Mismatch: {len(image_files)} img, {len(nucleus_mask_files)} nuc, {len(cytoplasm_mask_files)} cyto"
 
     print(f"\n📊 Total images for inference: {len(image_files)}")
-    print("\nINFERENCE Database (test + validation):")
+    print(f"\nINFERENCE Database ({', '.join(eval_splits)}):")
     for idx, im_file in enumerate(image_files):
-        source = "val" if "val" in str(im_file.parent.parent) else "test"
-        print(f"{idx}\t{im_file.name}\t[{source}]")
+        print(f"{idx}\t{im_file.name}\t[{split_of_file[idx]}]")
 
     # ========== Create Predictor ==========
     predictor = CytoNucsPredictor(
@@ -152,12 +173,8 @@ def run_inference_only(config_dict, config_path):
     print(f"Predictor initialized: prob_nuc={predictor.prob_thresh_nucleus}, "
           f"prob_cyto={predictor.prob_thresh_cytoplasm}, nms={predictor.nms_thresh}")
 
-    dataset_sources = []
-    if any("test" in str(f.parent.parent) for f in image_files):
-        dataset_sources.append("test")
-    if any("val" in str(f.parent.parent) for f in image_files):
-        dataset_sources.append("val")
-    dataset_name = "_".join(dataset_sources) if dataset_sources else "inference"
+
+    dataset_name = "_".join(eval_splits) if eval_splits else "inference"
 
     viz_dir = Path(model.basedir) / model.name / f'inference_{dataset_name}'
     viz_dir.mkdir(parents=True, exist_ok=True)
@@ -165,11 +182,9 @@ def run_inference_only(config_dict, config_path):
     masks_dir.mkdir(parents=True, exist_ok=True)
 
     save_tiff = config_dict.get('inference', {}).get('save_pred_tiff', True)
-    mask_axes = 'ZYX' if ndim == 3 else 'YX'
 
     def _save_mask(arr, path):
-        tifffile.imwrite(str(path), np.asarray(arr).astype(np.uint16),
-                         metadata={'axes': mask_axes})
+        write_instance_mask(path, arr)
 
     # один раз, а не на каждом изображении
     dice_callback = DiceCallback(model, None, eval_every=1, save_best=False)
@@ -178,6 +193,11 @@ def run_inference_only(config_dict, config_path):
     y_true_nucleus, y_pred_nucleus = [], []
     y_true_cytoplasm, y_pred_cytoplasm = [], []
     pred_assignments = []
+    gt_assignments = [load_gt_assignments(f) for f in nucleus_mask_files]
+    _n_gt = sum(1 for a in gt_assignments if a is not None)
+    print(f"📎 Истинный mapping ядро->клетка найден для {_n_gt}/{len(gt_assignments)} томов"
+          + ("" if _n_gt == len(gt_assignments)
+             else " — остальные считаются эвристикой, знаменатель JTPR завышен"))
     for i in tqdm(range(len(image_files)), desc=f"Inference on {dataset_name}"):
         img_path = image_files[i]
         nuc_mask_path = nucleus_mask_files[i]
@@ -279,7 +299,7 @@ def run_inference_only(config_dict, config_path):
 
         y_true_nucleus.append(nucleus_gt);   y_pred_nucleus.append(nucleus_pred)
         y_true_cytoplasm.append(cytoplasm_gt); y_pred_cytoplasm.append(cytoplasm_pred)
-        pred_assignments.append(dict(getattr(predictor, '_prompt_assignments', {}) or {}))
+        pred_assignments.append(getattr(predictor, '_prompt_assignments', None))
         _pc = getattr(predictor, '_prompt_coords_nuc', None)
         if _pc is not None and len(_pc) > 0:
             _hi = np.array(nucleus_gt.shape) - 1
@@ -358,15 +378,19 @@ def run_inference_only(config_dict, config_path):
 
     print("\n  Computing JTPR...")
     jtpr_values, joint_tp_total, total_pairs_total = [], 0, 0
+    interior_tp, interior_pairs = 0, 0
     for idx_img, (nuc_pred, cyto_pred, nuc_gt, cyto_gt) in enumerate(zip(
             y_pred_nucleus, y_pred_cytoplasm, y_true_nucleus, y_true_cytoplasm)):
         _ap = pred_assignments[idx_img] if idx_img < len(pred_assignments) else None
         jtpr, d = compute_jtpr(nucleus_pred=nuc_pred, cytoplasm_pred=cyto_pred,
                                nucleus_gt=nuc_gt, cytoplasm_gt=cyto_gt, iou_thresh=0.5,
-                               assignments_pred=_ap if _ap else None)
+                               assignments_pred=_ap,
+                               assignments_gt=gt_assignments[idx_img])
         jtpr_values.append(jtpr)
         joint_tp_total += d['joint_tp']
         total_pairs_total += d['total_pairs']
+        interior_tp += d['interior_joint_tp']
+        interior_pairs += d['interior_total_pairs']
     mean_jtpr = np.mean(jtpr_values) if jtpr_values else 0.0
     global_jtpr = joint_tp_total / total_pairs_total if total_pairs_total > 0 else 0.0
 
@@ -377,8 +401,8 @@ def run_inference_only(config_dict, config_path):
     print(f"  Nucleus   | Dice: {mean_dice_nucleus:.4f} | AP: {ap_nucleus:.4f} (AP@50: {ap50_nucleus:.4f})")
     print(f"  Cytoplasm | Dice: {mean_dice_cytoplasm:.4f} | AP: {ap_cytoplasm:.4f} (AP@50: {ap50_cytoplasm:.4f})")
     print(f"  JTPR      | Mean: {mean_jtpr:.4f} | Global: {global_jtpr:.4f} ({joint_tp_total}/{total_pairs_total})")
-    print(f"  ▸ JTPR ограничен сверху min(nuc TP, cyto TP) = "
-          f"min({s_n.tp}, {s_c.tp}) из {total_pairs_total} пар")
+    print(f"  Matched nuclei={s_n.tp}, matched cells={s_c.tp}; one cell can support multiple pairs")
+    print(f"  JTPR interior (no XY-face GT): {interior_tp}/{interior_pairs}")
     print("=" * 60)
 
     results = {
@@ -403,11 +427,65 @@ def run_inference_only(config_dict, config_path):
         'prob_thresh_nucleus': predictor.prob_thresh_nucleus,
         'prob_thresh_cytoplasm': predictor.prob_thresh_cytoplasm,
         'nms_thresh': predictor.nms_thresh,
+        'mask_quality_min': model_config.mask_quality_min,
+        'quality_gates': predictor.quality_gates,
+        'mask_thresholds': predictor.mask_thresholds,
+        'interior_joint_tp': int(interior_tp), 'interior_total_pairs': int(interior_pairs),
     }
     with open(viz_dir / 'results.json', 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\n✅ Results saved to: {viz_dir}")
     return model, predictor, results
+
+def save_mask_calibration(weights_path, thresholds, calibration, report_path):
+    """Store calibrated mask thresholds with the checkpoint and a readable report."""
+    from cytonucs_runtime import write_mask_thresholds, resolve_resume_epoch
+    report = dict(thresholds=thresholds, calibration=calibration,
+                  checkpoint=str(weights_path) if weights_path is not None else None)
+    if weights_path is not None:
+        try:
+            report['checkpoint_epoch'] = resolve_resume_epoch(weights_path)
+        except ValueError:
+            report['checkpoint_epoch'] = None
+        write_mask_thresholds(weights_path, dict(epoch=report['checkpoint_epoch'], **thresholds))
+    Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(report_path).write_text(json.dumps(report, indent=2), encoding='utf-8')
+    print(f"✅ Mask thresholds {thresholds} saved to {weights_path} and {report_path}")
+
+
+def run_mask_calibration(config_dict, config_path):
+    """Calibrate mask_thresh_*='auto' for inference.checkpoint_path on the validation split.
+
+    For a run stopped before its end-of-training calibration. Writes the thresholds into
+    the checkpoint (HDF5 attribute) and mask_calibration.json next to it.
+    """
+    from cytonucs_inference import CytoNucsPredictor
+    from cytonucs_trainer import calibrate_mask_thresholds
+    model_config = CytoNucsConfig.from_json(config_path)
+    if 'auto' not in (model_config.mask_thresh_nucleus, model_config.mask_thresh_cytoplasm):
+        raise ValueError('mode calibrate requires mask_thresh_nucleus or mask_thresh_cytoplasm = "auto"')
+    checkpoint_path = Path(config_dict['inference']['checkpoint_path'])
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f'Checkpoint not found: {checkpoint_path}')
+    if config_dict['model'].get('use_gpu', False):
+        gpu_config = config_dict.get('gpu_config', {})
+        setup_gpu(memory_limit=gpu_config.get('memory_limit', None),
+                  allow_growth=gpu_config.get('allow_growth', True),
+                  visible_devices=gpu_config.get('visible_devices', None))
+    model = build_cytonucs_model(config=model_config, name=config_dict['experiment']['name'],
+                                 basedir=config_dict['output']['basedir'])
+    model.load_weights(checkpoint_path)
+    val_generator = CytoNucsDataGenerator(dataset_dir=Path(config_dict['data']['dataset_dir']) / 'val',
+                                          config=model_config, rays=model_config.rays, augmenter=None,
+                                          shuffle=False, subset='val')
+    predictor = CytoNucsPredictor(model=model, config=model_config,
+                                  prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
+                                  prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),
+                                  nms_thresh=config_dict['inference'].get('nms_thresh', 0.3))
+    thresholds, calibration = calibrate_mask_thresholds(predictor, val_generator.data_pool)
+    save_mask_calibration(checkpoint_path, thresholds, calibration, checkpoint_path.parent / 'mask_calibration.json')
+    return thresholds
+
 
 def run_threshold_optimization(config_dict, config_path):
     """
@@ -443,10 +521,8 @@ def run_threshold_optimization(config_dict, config_path):
     model.load_weights(checkpoint_path)
 
     def _load_volume(path):
-        arr = np.asarray(imageio.volread(str(path)))
-        if ndim == 3 and arr.ndim == 4 and arr.shape[-1] not in (3, 4) and arr.shape[1] in (3, 4):
-            arr = np.moveaxis(arr, 1, -1)
-        return arr
+        from cytonucs_runtime import read_model_image
+        return read_model_image(path, ndim, model_config.n_channel_in)
 
     def _to_model_input(img):
         if img.ndim == ndim:
@@ -458,7 +534,7 @@ def run_threshold_optimization(config_dict, config_path):
         for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF', '*.png', '*.PNG',
                     '*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
             files.extend(list(path.glob(ext)))
-        return sorted(files)
+        return sorted(set(files))
 
     # На каких сплитах подбирать. По умолчанию val: подбор на test — это
     # подгонка под тестовую выборку, и в статье так писать нельзя.
@@ -475,14 +551,16 @@ def run_threshold_optimization(config_dict, config_path):
         return None
     print(f"📂 Подбор на {len(image_files)} томах из {splits}")
 
-    val_images, val_nuc, val_cyto = [], [], []
+    val_images, val_nuc, val_cyto, val_asg = [], [], [], []
     for f_img, f_n, f_c in zip(image_files, nuc_files, cyto_files):
         assert f_img.name == f_n.name == f_c.name, f"Filename mismatch: {f_img.name}"
         val_images.append(_to_model_input(_load_volume(f_img)))
         val_nuc.append(np.asarray(imageio.volread(str(f_n))))
         val_cyto.append(np.asarray(imageio.volread(str(f_c))))
+        val_asg.append(load_gt_assignments(f_n))
         print(f"   {f_img.name}: {val_images[-1].shape}, "
-              f"GT nuc={len(np.unique(val_nuc[-1]))-1} cyto={len(np.unique(val_cyto[-1]))-1}")
+              f"GT nuc={len(np.unique(val_nuc[-1])) - 1} cyto={len(np.unique(val_cyto[-1])) - 1}"
+              f"{'' if val_asg[-1] is None else f', пар GT={len(val_asg[-1])}'}")
 
     predictor = CytoNucsPredictor(
         model=model, config=model_config,
@@ -497,6 +575,7 @@ def run_threshold_optimization(config_dict, config_path):
         prob_thresh_range=eval_cfg.get('prob_thresh_range', [0.3, 0.4, 0.5, 0.6, 0.7]),
         nms_thresh_range=eval_cfg.get('nms_thresh_range', [0.15, 0.2, 0.25, 0.3, 0.4]),
         mask_thresh_range=eval_cfg.get('mask_thresh_range', [0.25, 0.35, 0.45, 0.55]),
+        val_assignments=val_asg,
     )
 
     thresh_path = (Path(config_dict['output']['basedir']) /
@@ -544,8 +623,9 @@ def main(config_path='config_cytonucs.json'):
     else:
         print("\n💻 Running on CPU (use_gpu=False in config)")
     # Set random seeds
-    np.random.seed(42)
-    tf.random.set_seed(42)
+    seed = int(config_dict['training'].get('seed', 42))
+    np.random.seed(seed)
+    tf.keras.utils.set_random_seed(seed)
     # ========== MODE SELECTION ==========
     mode = config_dict.get('mode', 'train')  # По умолчанию training
 
@@ -557,11 +637,15 @@ def main(config_path='config_cytonucs.json'):
         print("\n🎯 MODE: THRESHOLD OPTIMIZATION ONLY")
         result = run_threshold_optimization(config_dict, config_path)
         return result
+    elif mode == 'calibrate':
+        print("\n🎯 MODE: MASK THRESHOLD CALIBRATION")
+        return run_mask_calibration(config_dict, config_path)
     else:
         print("\n🎓 MODE: TRAINING")
     # ========== Initialize Experiment Tracking ==========
     experiment = None
     if config_dict['experiment']['use_comet']:
+        from comet_ml import Experiment
         experiment = Experiment(
             api_key=config_dict['experiment']['comet_api_key'],
             project_name=config_dict['experiment']['comet_project'],
@@ -655,10 +739,20 @@ def main(config_path='config_cytonucs.json'):
     # между срезами (examples/3D/2_training.ipynb). От неё зависят и лучи, и
     # grid. Делается ПОСЛЕ создания генераторов, потому что нужны загруженные
     # маски, и ДО build_cytonucs_model, потому что модель читает гриды.
-    model_config.set_anisotropy_from_labels(
-        [s['nucleus_mask'] for s in train_generator.data_pool],
-        [s['cytoplasm_mask'] for s in train_generator.data_pool],
-        update_grid=True)
+    resume_geometry = config_dict['training'].get('resume_from_checkpoint')
+    if resume_geometry:
+        # Ray channel identities must stay identical to the saved weights.
+        source_geometry = Path(resume_geometry).parent / 'geometry.json'
+        destination_geometry = Path(model_config.geometry_path)
+        if source_geometry.resolve() != destination_geometry.resolve():
+            destination_geometry.parent.mkdir(parents=True, exist_ok=True)
+            destination_geometry.write_bytes(source_geometry.read_bytes())
+        print('Resume: preserving checkpoint ray geometry and grids')
+    else:
+        model_config.set_anisotropy_from_labels(
+            [s['nucleus_mask'] for s in train_generator.data_pool],
+            [s['cytoplasm_mask'] for s in train_generator.data_pool],
+            update_grid=True)
     for _gen in (train_generator, val_generator):
         _gen._nuc_grid = tuple(int(g) for g in model_config.nucleus_grid)
         _gen._cyto_grid = tuple(int(g) for g in model_config.cytoplasm_grid)
@@ -668,156 +762,6 @@ def main(config_path='config_cytonucs.json'):
         _gen._cyto_aniso = model_config.rays_anisotropy_cytoplasm
     print(f"  ✓ Гриды генераторов обновлены: nucleus={train_generator._nuc_grid}, "
           f"cytoplasm={train_generator._cyto_grid}")
-    # ============================================================
-    # === COMPUTE MEDIAN RADIUS FOR ADAPTIVE FOOTPRINT ===
-    # ============================================================
-
-    # print("\n📊 Computing training statistics for adaptive footprint...")
-    #
-    # all_nuc_radii = []
-    # all_cyto_radii = []
-    #
-    # num_samples = min(10, len(train_generator.data_pool))
-    #
-    # for i in range(num_samples):
-    #     sample = train_generator.data_pool[i]
-    #
-    #     from skimage.measure import regionprops
-    #     from scipy.ndimage import distance_transform_edt
-    #
-    #     # === NUCLEUS STATISTICS ===
-    #     nuc_mask = sample['nucleus_mask']
-    #     nuc_props = regionprops(nuc_mask)
-    #
-    #     for prop in nuc_props:
-    #         # Метод 1: Через area (быстро, всегда работает)
-    #         if model_config.ndim == 2:
-    #             radius_from_area = np.sqrt(prop.area / np.pi)
-    #         else:
-    #             radius_from_area = (prop.area * 3 / (4 * np.pi)) ** (1 / 3)
-    #
-    #         # КРИТИЧНО: Пропускаем слишком маленькие объекты
-    #         if radius_from_area < 3.0:
-    #             continue
-    #
-    #         # Метод 2: Через StarDist distances (точно, но может fail)
-    #         obj_mask = (nuc_mask == prop.label).astype(np.int32)
-    #
-    #         try:
-    #             # Вызываем StarDist для получения distances
-    #             if model_config.ndim == 2:
-    #                 from stardist.geometry import star_dist
-    #                 dist_map = star_dist(obj_mask, model_config.n_rays, mode='cpp')
-    #             else:
-    #                 from stardist.geometry import star_dist3D
-    #                 dist_map = star_dist3D(obj_mask, model_config.rays, mode='cpp')
-    #
-    #             # Берём distances в центре объекта
-    #             center = tuple(int(c) for c in prop.centroid)
-    #
-    #             # ЗАЩИТА: проверяем, что центр внутри маски
-    #             if obj_mask[center] == 0:
-    #                 # Центр снаружи - используем центроид маски
-    #                 from scipy.ndimage import center_of_mass
-    #                 center = tuple(int(c) for c in center_of_mass(obj_mask))
-    #
-    #             dists_at_center = dist_map[center]
-    #
-    #             # ЗАЩИТА: фильтруем нулевые/NaN значения
-    #             valid_dists = dists_at_center[dists_at_center > 0.1]  # минимум 0.1 px
-    #
-    #             if len(valid_dists) >= model_config.n_rays * 0.5:  # минимум 50% лучей валидны
-    #                 mean_radius = np.mean(valid_dists)
-    #
-    #                 # ЗАЩИТА: проверяем разумность
-    #                 if 1.0 < mean_radius < 200.0:  # разумный диапазон для 2D
-    #                     all_nuc_radii.append(mean_radius)
-    #                 else:
-    #                     # Fallback: используем area-based
-    #                     all_nuc_radii.append(radius_from_area)
-    #             else:
-    #                 # Слишком мало валидных лучей
-    #                 all_nuc_radii.append(radius_from_area)
-    #
-    #         except Exception as e:
-    #             # StarDist failed - используем area-based
-    #             print(f"    Warning: StarDist failed for nucleus {prop.label}: {e}")
-    #             all_nuc_radii.append(radius_from_area)
-    #
-    #     # === CYTOPLASM STATISTICS (то же самое) ===
-    #     cyto_mask = sample['cytoplasm_mask']
-    #     cyto_props = regionprops(cyto_mask)
-    #
-    #     for prop in cyto_props:
-    #         if model_config.ndim == 2:
-    #             radius_from_area = np.sqrt(prop.area / np.pi)
-    #         else:
-    #             radius_from_area = (prop.area * 3 / (4 * np.pi)) ** (1 / 3)
-    #
-    #         # Пропускаем маленькие объекты
-    #         if radius_from_area < 5.0:  # cytoplasm обычно больше
-    #             continue
-    #
-    #         obj_mask = (cyto_mask == prop.label).astype(np.int32)
-    #
-    #         try:
-    #             if model_config.ndim == 2:
-    #                 from stardist.geometry import star_dist
-    #                 dist_map = star_dist(obj_mask, model_config.n_rays, mode='cpp')
-    #             else:
-    #                 from stardist.geometry import star_dist3D
-    #                 dist_map = star_dist3D(obj_mask, model_config.rays, mode='cpp')
-    #
-    #             center = tuple(int(c) for c in prop.centroid)
-    #
-    #             if obj_mask[center] == 0:
-    #                 from scipy.ndimage import center_of_mass
-    #                 center = tuple(int(c) for c in center_of_mass(obj_mask))
-    #
-    #             dists_at_center = dist_map[center]
-    #             valid_dists = dists_at_center[dists_at_center > 0.1]
-    #
-    #             if len(valid_dists) >= model_config.n_rays * 0.5:
-    #                 mean_radius = np.mean(valid_dists)
-    #
-    #                 if 2.0 < mean_radius < 500.0:  # разумный диапазон для cytoplasm
-    #                     all_cyto_radii.append(mean_radius)
-    #                 else:
-    #                     all_cyto_radii.append(radius_from_area)
-    #             else:
-    #                 all_cyto_radii.append(radius_from_area)
-    #
-    #         except Exception as e:
-    #             print(f"    Warning: StarDist failed for cytoplasm {prop.label}: {e}")
-    #             all_cyto_radii.append(radius_from_area)
-    #
-    # # === ВЫЧИСЛЯЕМ МЕДИАНЫ с FALLBACK ===
-    # if len(all_nuc_radii) > 0:
-    #     nuc_median_radius = np.median(all_nuc_radii)
-    #     print(f"  ✅ Median nucleus radius: {nuc_median_radius:.1f} px (from {len(all_nuc_radii)} objects)")
-    # else:
-    #     nuc_median_radius = 10.0
-    #     print(f"  ⚠️  No valid nucleus objects, using fallback: {nuc_median_radius} px")
-    #
-    # if len(all_cyto_radii) > 0:
-    #     cyto_median_radius = np.median(all_cyto_radii)
-    #     print(f"  ✅ Median cytoplasm radius: {cyto_median_radius:.1f} px (from {len(all_cyto_radii)} objects)")
-    # else:
-    #     cyto_median_radius = 30.0
-    #     print(f"  ⚠️  No valid cytoplasm objects, using fallback: {cyto_median_radius} px")
-    #
-    # # СОХРАНЯЕМ В CONFIG
-    # model_config.median_max_dist_nucleus = float(nuc_median_radius)
-    # model_config.median_max_dist_cytoplasm = float(cyto_median_radius)
-    # model_config.median_radius_train = float(cyto_median_radius)
-
-    # # Дополнительная статистика
-    # if len(all_nuc_radii) > 0:
-    #     print(f"    Nucleus radius range: [{np.min(all_nuc_radii):.1f}, {np.max(all_nuc_radii):.1f}] px")
-    # if len(all_cyto_radii) > 0:
-    #     print(f"    Cytoplasm radius range: [{np.min(all_cyto_radii):.1f}, {np.max(all_cyto_radii):.1f}] px")
-
-
     print(f"Steps per epoch: {model_config.train_steps_per_epoch} (from config)")
 
     # ========== Build Model ==========
@@ -844,6 +788,10 @@ def main(config_path='config_cytonucs.json'):
         checkpoint_path = Path(config_dict['training']['resume_from_checkpoint'])
         if checkpoint_path.exists():
             print(f"\n📥 Resuming from checkpoint: {checkpoint_path}")
+            from cytonucs_runtime import resolve_resume_epoch
+            if not Path(str(checkpoint_path) + '.state.index').exists():
+                # Fail before accepting a weights-only checkpoint with unknown epoch.
+                resolve_resume_epoch(checkpoint_path)
             model.load_weights(checkpoint_path)
 
             # Extract epoch from filename
@@ -860,7 +808,7 @@ def main(config_path='config_cytonucs.json'):
                     loaded_history = json.load(f)
                 print(f"   Loaded history: {len(loaded_history.get('train_loss', []))} epochs")
         else:
-            print(f"\n⚠️  Checkpoint not found: {checkpoint_path}, starting fresh")
+            raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
     # ========== КОНЕЦ БЛОКА ==========
     print("\nModel Summary:")
     model.summary()
@@ -888,25 +836,34 @@ def main(config_path='config_cytonucs.json'):
     steps_per_epoch = model_config.train_steps_per_epoch
 
     class WarmupExponentialDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
-        def __init__(self, initial_lr, warmup_steps, decay_steps, decay_rate, min_lr=1e-6):
+        def __init__(self, initial_lr, warmup_steps, decay_steps, decay_rate,
+                     min_lr=1e-6, step_offset=0, staircase=False):
             super().__init__()
             self.initial_lr = tf.cast(initial_lr, tf.float32)
             self.warmup_steps = tf.cast(warmup_steps, tf.float32)
             self.decay_steps = tf.cast(decay_steps, tf.float32)
             self.decay_rate = tf.cast(decay_rate, tf.float32)
             self.min_lr = tf.cast(min_lr, tf.float32)
+            # Оптимизатор создаётся ПОСЛЕ load_weights и стартует с iterations=0.
+            # Без смещения resume с эпохи 500 повторно прогревается и
+            # возвращает lr к initial_lr — модель выбивается из минимума.
+            self.step_offset = tf.cast(step_offset, tf.float32)
+            self.staircase = bool(staircase)
 
         def __call__(self, step):
-            step = tf.cast(step, tf.float32)
-            # Линейный прогрев от min_lr до initial_lr
+            step = tf.cast(step, tf.float32) + self.step_offset
             warmup_lr = self.min_lr + (self.initial_lr - self.min_lr) * (step / self.warmup_steps)
-            # Экспоненциальное затухание
             decay_step = step - self.warmup_steps
-            decay_lr = self.initial_lr * tf.pow(self.decay_rate, decay_step / self.decay_steps)
+            power = decay_step / self.decay_steps
+            if self.staircase:
+                power = tf.floor(power)
+            decay_lr = self.initial_lr * tf.pow(self.decay_rate, power)
             return tf.where(step < self.warmup_steps, warmup_lr, tf.maximum(decay_lr, self.min_lr))
 
         def get_config(self):
-            return { "initial_lr": float(self.initial_lr), "warmup_steps": float(self.warmup_steps), "decay_steps": float(self.decay_steps), "decay_rate": float(self.decay_rate), "min_lr": float(self.min_lr) }
+            return {"initial_lr": float(self.initial_lr), "warmup_steps": float(self.warmup_steps),
+                    "decay_steps": float(self.decay_steps), "decay_rate": float(self.decay_rate),
+                    "min_lr": float(self.min_lr), "step_offset": float(self.step_offset), "staircase": self.staircase}
 
     initial_lr = config_dict['training']['initial_learning_rate']
     steps_per_epoch = model_config.train_steps_per_epoch
@@ -919,10 +876,13 @@ def main(config_path='config_cytonucs.json'):
         warmup_steps=max(1, int(lr_warmup_epochs * steps_per_epoch)),
         decay_steps=decay_steps,
         decay_rate=decay_rate,
-        min_lr=min_lr
+        min_lr=min_lr,
+        step_offset=int(start_epoch) * int(steps_per_epoch),
+        staircase=config_dict['training'].get('lr_staircase', False),
     )
     print(f"  ✓ LR: warmup {lr_warmup_epochs} эпох -> {initial_lr}, "
-          f"decay {decay_rate} / {decay_steps} шагов, floor {min_lr}")
+          f"decay {decay_rate} / {decay_steps} шагов, floor {min_lr}, "
+          f"старт с шага {int(start_epoch) * int(steps_per_epoch)}")
     gradient_clip_norm = config_dict['training']['gradient_clip_norm']
     trainer = CytoNucsTrainer(
         model=model,
@@ -932,8 +892,29 @@ def main(config_path='config_cytonucs.json'):
         optimizer=Adam(learning_rate=schedule)
     )
     # Restore history if resuming
+    resume_path = config_dict['training'].get('resume_from_checkpoint')
+    if resume_path:
+        from cytonucs_runtime import resolve_resume_epoch
+        state_restored = trainer.restore_training_state(resume_path)
+        start_epoch = resolve_resume_epoch(
+            resume_path, int(trainer.state_epoch.numpy()) if state_restored else None)
+        if model_config.reset_best_on_resume:
+            trainer.state_selection_start.assign(start_epoch)
+        # Exactly one time source: restored iterations OR weights-only epoch offset.
+        schedule.step_offset = tf.constant(
+            0 if state_restored else start_epoch * steps_per_epoch, tf.float32)
+        trainer.current_step = (int(trainer.optimizer.iterations.numpy()) if state_restored
+                                else start_epoch * steps_per_epoch)
+        print(f'Resume effective: next_epoch={start_epoch + 1}, '
+              f'optimizer_iterations={int(trainer.optimizer.iterations.numpy())}, '
+              f'lr_step_offset={int(schedule.step_offset.numpy())}, '
+              f'learning_rate={float(trainer.optimizer.learning_rate.numpy()):.9g}')
+    if resume_path:
+        from cytonucs_trainer import sync_object_min_area
+        sync_object_min_area(loss_fn, getattr(model, 'loaded_quality_gates', None))
     if 'loaded_history' in locals():
-        trainer.history = loaded_history
+        from cytonucs_runtime import align_training_history
+        trainer.history = align_training_history(loaded_history, start_epoch)
         print(f"✓ Restored training history")
 
     # Callbacks
@@ -991,18 +972,28 @@ def main(config_path='config_cytonucs.json'):
             ].get(
                 'nms_thresh',
                 0.3
-            )
+            ),
+
+            train_generator=
+            train_generator
         )
 
-        callbacks.append(
-            dice_callback
-        )
+        dice_callback.trainer = trainer
+        from cytonucs_runtime import restored_best_metric
+        dice_callback.best_metric = (float('-inf') if resume_path and model_config.reset_best_on_resume
+                                     else restored_best_metric(trainer.history, float(trainer.state_best_full.numpy()),
+                                         int(trainer.state_selection_start.numpy()),
+                                         float(getattr(model_config, 'checkpoint_w_jtpr', 0.7))))
+        trainer.state_best_full.assign(dice_callback.best_metric)
+        callbacks.append(dice_callback)
 
     # ========== Training Loop ==========
     print("\n" + "=" * 60)
     print("Starting training...")
     print("=" * 60 + "\n")
 
+    from cytonucs_runtime import save_effective_config
+    save_effective_config(model, train_generator, val_generator)
     trainer.train(
         train_generator=train_generator,
         val_generator=val_generator,
@@ -1053,6 +1044,30 @@ def main(config_path='config_cytonucs.json'):
             "\n⚠️ No full-volume best checkpoint found. "
             "Using final epoch weights."
         )
+        # Gates loaded at resume belong to another epoch; keep only a calibration
+        # of these final weights.
+        pending = getattr(model, 'pending_quality_gates', None)
+        model.loaded_quality_gates = (
+            {k: v for k, v in pending.items() if k != 'epoch'}
+            if pending and pending['epoch'] == int(trainer.state_epoch.numpy()) else None)
+        model.loaded_mask_thresholds = None
+
+    # ========== MASK THRESHOLDS: calibrated once, on the final model ==========
+    mask_thresholds = None
+    if 'auto' in (model_config.mask_thresh_nucleus, model_config.mask_thresh_cytoplasm):
+        print("\n" + "=" * 60)
+        print("Calibrating mask thresholds on validation...")
+        print("=" * 60 + "\n")
+        from cytonucs_trainer import calibrate_mask_thresholds
+        calibration_predictor = CytoNucsPredictor(
+            model=model, config=model_config,
+            prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
+            prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),
+            nms_thresh=config_dict['inference'].get('nms_thresh', 0.3))
+        mask_thresholds, calibration = calibrate_mask_thresholds(calibration_predictor, val_generator.data_pool)
+        model.loaded_mask_thresholds = mask_thresholds
+        save_mask_calibration(best_fullval_path if best_fullval_path.exists() else None, mask_thresholds,
+                              calibration, best_fullval_path.parent / 'mask_calibration.json')
     # ========== Threshold Optimization ==========
 
     print("\n" + "=" * 60)
@@ -1098,6 +1113,10 @@ def main(config_path='config_cytonucs.json'):
     val_nucleus_masks = []
     val_cytoplasm_masks = []
     val_filenames = []
+    # Истинный маппинг ядро->клетка. Генератор уже прочитал его из
+    # assignments/*.json в repool(); здесь он просто переносится дальше,
+    # чтобы знаменатель JTPR не строился эвристикой.
+    val_assignments_gt = []
 
     print(
         "\nLoading FULL validation volumes..."
@@ -1135,7 +1154,9 @@ def main(config_path='config_cytonucs.json'):
                 f'val_{len(val_images):03d}'
             )
         )
-
+        val_assignments_gt.append(
+            sample.get('assignments')
+        )
         print(
             f"   {val_filenames[-1]}: "
             f"{img.shape}, "
@@ -1216,7 +1237,9 @@ def main(config_path='config_cytonucs.json'):
         best_params = predictor.optimize_thresholds(
             val_images, val_nucleus_masks, val_cytoplasm_masks,
             prob_thresh_range=eval_cfg.get('prob_thresh_range', [0.2, 0.3, 0.4, 0.5]),
-            nms_thresh_range=eval_cfg.get('nms_thresh_range', [0.2, 0.3, 0.4, 0.5])
+            nms_thresh_range=eval_cfg.get('nms_thresh_range', [0.2, 0.3, 0.4, 0.5]),
+            mask_thresh_range=eval_cfg.get('mask_thresh_range'),
+            val_assignments=val_assignments_gt
         )
 
         if experiment:
@@ -1245,6 +1268,7 @@ def main(config_path='config_cytonucs.json'):
     dice_scores_nucleus = []
     dice_scores_cytoplasm = []
     jtpr_scores = []
+    jtpr_counts = []
 
     # Predict on validation set
     print("Computing predictions...")
@@ -1269,8 +1293,11 @@ def main(config_path='config_cytonucs.json'):
             jtpr, jtpr_details = compute_jtpr(
                 nuc_pred, cyto_pred,
                 val_nucleus_masks[i], val_cytoplasm_masks[i],
-                assignments_pred=dict(getattr(predictor, '_prompt_assignments', {}) or {}) or None)
+                assignments_pred=getattr(predictor, '_prompt_assignments', None),
+                assignments_gt=(val_assignments_gt[i]
+                                if i < len(val_assignments_gt) else None))
             jtpr_scores.append(jtpr)
+            jtpr_counts.append(jtpr_details)
             print(f"    JTPR details: {jtpr_details}")
         # Save predictions if requested
         if config_dict['evaluation']['save_predictions']:
@@ -1285,8 +1312,8 @@ def main(config_path='config_cytonucs.json'):
                 iou_thresh=0.5
             )
             if nuc_pred.ndim == 2:
-                imageio.imwrite(pred_dir / f'val_{i:03d}_nucleus.tif', nuc_pred.astype(np.uint16))
-                imageio.imwrite(pred_dir / f'val_{i:03d}_cytoplasm.tif', cyto_pred.astype(np.uint16))
+                write_instance_mask(pred_dir / f'val_{i:03d}_nucleus.tif', nuc_pred)
+                write_instance_mask(pred_dir / f'val_{i:03d}_cytoplasm.tif', cyto_pred)
                 imageio.imwrite(
                     pred_dir / f'val_{i:03d}_overlay_iou.png',
                     overlay.astype(np.uint8)
@@ -1323,9 +1350,11 @@ def main(config_path='config_cytonucs.json'):
                 plt.savefig(pred_dir / f'val_{i:03d}_comparison.png', dpi=150)
                 plt.close()
             else:
-                imageio.volwrite(pred_dir / f'val_{i:03d}_nucleus.tif', nuc_pred.astype(np.uint16))
-                imageio.volwrite(pred_dir / f'val_{i:03d}_cytoplasm.tif', cyto_pred.astype(np.uint16))
+                write_instance_mask(pred_dir / f'val_{i:03d}_nucleus.tif', nuc_pred)
+                write_instance_mask(pred_dir / f'val_{i:03d}_cytoplasm.tif', cyto_pred)
 
+    from cytonucs_runtime import aggregate_joint_counts
+    joint_summary = aggregate_joint_counts(jtpr_counts)
     # Print results
     print("\n" + "=" * 60)
     print("Final Validation Results:")
@@ -1333,7 +1362,9 @@ def main(config_path='config_cytonucs.json'):
     print(f"Nucleus Dice:    {np.mean(dice_scores_nucleus):.4f} ± {np.std(dice_scores_nucleus):.4f}")
     print(f"Cytoplasm Dice:  {np.mean(dice_scores_cytoplasm):.4f} ± {np.std(dice_scores_cytoplasm):.4f}")
     if config_dict['evaluation']['compute_jtpr']:
-        print(f"JTPR:            {np.mean(jtpr_scores):.4f} ± {np.std(jtpr_scores):.4f}")
+        print(f"JTPR global:     {joint_summary['jtpr_global']:.4f} "
+              f"({joint_summary['joint_tp']}/{joint_summary['total_pairs']})")
+        print(f"JTPR mean/volume:{np.mean(jtpr_scores):.4f} ± {np.std(jtpr_scores):.4f}")
     print("=" * 60)
 
     # Log to Comet
@@ -1348,6 +1379,7 @@ def main(config_path='config_cytonucs.json'):
             experiment.log_metrics({
                 'final_jtpr_mean': np.mean(jtpr_scores),
                 'final_jtpr_std': np.std(jtpr_scores),
+                'final_jtpr_global': joint_summary['jtpr_global'],
             })
         experiment.end()
 
@@ -1404,9 +1436,11 @@ def main(config_path='config_cytonucs.json'):
         results['jtpr_mean'] = float(np.mean(jtpr_scores))
         results['jtpr_std'] = float(np.std(jtpr_scores))
         results['jtpr_all'] = [float(x) for x in jtpr_scores]
+        results.update(joint_summary)
 
     if 'best_params' in locals():
         results['optimized_thresholds'] = best_params
+    results['mask_thresholds'] = mask_thresholds
 
     results_path = Path(config_dict['output']['basedir']) / config_dict['experiment']['name'] / 'final_results.json'
     with open(results_path, 'w') as f:
@@ -1455,9 +1489,12 @@ if __name__ == '__main__':
         sys.exit(1)
 
     try:
-        _out = main(args.config)
-        model, predictor, results = (_out if isinstance(_out, tuple) and len(_out) == 3
-                                     else (None, None, _out))
+        from cytonucs_runtime import run_logged
+        _out = run_logged(args.config, main)
+        if isinstance(_out, tuple) and len(_out) == 3:
+            model, predictor, results = _out
+        else:
+            model, predictor, results = None, None, _out
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user.")
         sys.exit(0)

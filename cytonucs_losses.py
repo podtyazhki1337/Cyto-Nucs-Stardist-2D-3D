@@ -32,13 +32,17 @@ class CytoNucsLoss:
         self.huber_delta = getattr(config, 'huber_delta', 1.0)
         self.wbr_warmup_epochs = getattr(config, 'wbr_warmup_epochs', 10)
         self.current_epoch = tf.Variable(0, dtype=tf.int32, trainable=False, name='current_epoch')
+        # Smallest object (voxels) kept in object-level probability losses, per head
+        # [nucleus, cytoplasm]; synced from the calibrated size gates by the trainer.
+        self.object_min_voxels = tf.Variable([0., 0.], dtype=tf.float32, trainable=False,
+                                             name='object_min_voxels')
 
         # Refinement heads weights
         self.lambda_cyto_mask = getattr(config, 'lambda_cyto_mask', 0.0)
 
 
         self.lambda_nuc_mask = getattr(config, 'lambda_nuc_mask', 0.0)
-
+        self.n_prompts = max(1, int(getattr(config, 'prompts_per_crop', config.train_batch_size)))
 
 
         # Anisotropy для анизотропных окон max-pool в лоссах (универсально 2D/3D)
@@ -46,20 +50,7 @@ class CytoNucsLoss:
         if len(self.anisotropy) != self.ndim:
             self.anisotropy = (1,) * self.ndim
     def _warmup_factor(self, current_epoch):
-        """
-        Общий warmup для вспомогательных лоссов (WBR, containment, refine).
-        Схема: hold(0) -> линейный ramp -> 1.0.
-          factor = clip((epoch - hold) / ramp, 0, 1),  hold = ramp = warmup_epochs
 
-        Кросс-головные лоссы (WBR, containment) связывают nucleus и cytoplasm
-        через градиент. Пока обе головы не сошлись независимо, они тянут prob
-        в стороны: WBR давит nucleus_prob вниз везде, где cyto_prob < 1, а
-        w_cyto_support тянет cyto_prob вверх на GT-ядрах. Поэтому держим их
-        в нуле, пока головы учатся, и вводим плавно.
-        Refine (mask/boundary) не трогает backbone (stop_gradient), но учиться
-        на несошедшихся фичах декодера ему тоже нечему -> тот же график.
-        Новых параметров нет: берётся существующий wbr_warmup_epochs.
-        """
         ramp = float(getattr(self.config, 'loss_warmup_epochs',
                              getattr(self.config, 'wbr_warmup_epochs', 20)))
         ramp = max(ramp, 1.0)
@@ -71,6 +62,11 @@ class CytoNucsLoss:
         Фактор из соотношения nucleus_grid/cytoplasm_grid (целочисленный)."""
         ng = self._get_nucleus_grid()
         cg = self._get_cytoplasm_grid()
+        for axis, (n, c) in enumerate(zip(ng, cg), 1):
+            if n > c:
+                if n % c:
+                    raise ValueError('Head grids must have integer ratios')
+                t = tf.repeat(t, n // c, axis=axis)
         factor = tuple(max(1, int(round(c / n))) for n, c in zip(ng, cg))
         if all(f == 1 for f in factor):
             return t
@@ -126,20 +122,47 @@ class CytoNucsLoss:
     def __call__(self, y_true_raw, y_pred, current_epoch=None):
         cfg = self.config
 
-        current_epoch_display = current_epoch          # для печати (1-based)
-        current_epoch = current_epoch - 1              # для warmup (0-based)
+        current_epoch = (self.current_epoch if current_epoch is None else current_epoch) - 1              # для warmup (0-based)
 
         y_true = self._create_gt_from_instances(y_true_raw)
+        # Objects cut by the training crop (generator masks: fewer voxels than in the
+        # source volume); older inputs carry only per-axis face flags.
+        crop_cut = {h: y_true_raw.get(h + '_crop_cut') for h in ('nucleus', 'cytoplasm')}
+        truncating_axes = y_true_raw.get('crop_truncation_axes')
+        if cfg.object_losses_include_crop_cut:
+            crop_cut = {h: None for h in crop_cut}
+            truncating_axes = None
 
         # === 1. StarDist Loss ===
+        # Objects cut by the crop would get full object weight from a sliver.
+        # Voxel BCE still supervises them; only the object mean skips them.
+        def object_labels(head):
+            if not (getattr(cfg, head + '_prob_object_weight') or cfg.prob_object_peak_weight):
+                return None
+            grid = getattr(cfg, head + '_grid')
+            labels = self._subsample(y_true_raw[head + '_instances'], grid)
+            if crop_cut[head] is not None:
+                keep = tf.cast(self._subsample(crop_cut[head], grid), labels.dtype) == 0
+                labels = tf.where(keep, labels, tf.zeros_like(labels))
+            elif truncating_axes is not None:
+                labels = without_truncated_objects(y_true_raw[head + '_instances'], labels,
+                                                   truncating_axes, self.ndim)
+            if cfg.object_losses_min_area_from_gate:
+                # Objects smaller than the calibrated size gate are removed at inference
+                # anyway; asking for a confident peak on them only teaches peaks on specks.
+                labels = without_small_objects(y_true_raw[head + '_instances'], labels,
+                                               self.object_min_voxels[0 if head == 'nucleus' else 1])
+            return labels
         loss_nucleus = self._stardist_loss(
             y_true['nucleus_prob'], y_pred['nucleus_prob'],
             y_true['nucleus_dist'], y_pred['nucleus_dist'],
-            name='nucleus', prob_logit=y_pred.get('nucleus_prob_logit'))
+            name='nucleus', prob_logit=y_pred.get('nucleus_prob_logit'),
+            instances=object_labels('nucleus'))
         loss_cytoplasm = self._stardist_loss(
             y_true['cytoplasm_prob'], y_pred['cytoplasm_prob'],
             y_true['cytoplasm_dist'], y_pred['cytoplasm_dist'],
-            name='cytoplasm', prob_logit=y_pred.get('cytoplasm_prob_logit'))
+            name='cytoplasm', prob_logit=y_pred.get('cytoplasm_prob_logit'),
+            instances=object_labels('cytoplasm'))
         warmup = self._warmup_factor(current_epoch)
 
         # Бинарный GT-контейнер клеток на цито-гриде — общий для WBR
@@ -183,36 +206,172 @@ class CytoNucsLoss:
                 y_pred['cytoplasm_prob'], y_true['cytoplasm_prob'], name='cytoplasm')
             loss_background = self.lambda_background_penalty * (loss_bg_nuc + loss_bg_cyto) / 2.0
 
+
         # === 6. Mask refinement — БЕЗ warmup.
-        # Ветка стоит за stop_gradient и контаминировать backbone не может,
-        # поэтому держать её выключенной 2*warmup эпох — чистая потеря времени,
-        # тем более что именно она производит инстансы на инференсе.
+        # Decoder gradient is controlled by refinement_gradient_scale.
+        # Refinement produces inference instances and trains from the first epoch.
+        def _tile_prompts(t):
+            """Батч B -> K*B в порядке k*B + b, как склеивает модель."""
+            if self.n_prompts == 1:
+                return t
+            return tf.tile(t, [self.n_prompts] + [1] * (self.ndim + 1))
+
         loss_cyto_mask = tf.constant(0.0, dtype=tf.float32)
         if self.lambda_cyto_mask > 0 and 'cytoplasm_mask' in y_pred:
             gt_mask_semantic = self._grid_subsample_cytoplasm(tf.expand_dims(
                 tf.cast(y_true_raw['cytoplasm_target'], tf.float32), axis=-1))
-            _cyto_any = tf.stop_gradient(self._grid_subsample_cytoplasm(
-                tf.expand_dims(tf.cast(y_true_raw['cytoplasm_instances'] > 0,
-                                       tf.float32), axis=-1)))
+            _cyto_any = tf.stop_gradient(_tile_prompts(
+                self._grid_subsample_cytoplasm(
+                    tf.expand_dims(tf.cast(y_true_raw['cytoplasm_instances'] > 0,
+                                           tf.float32), axis=-1))))
             loss_cyto_mask = self.lambda_cyto_mask * (
                     0.5 * self._refinement_ce_loss(
                 y_pred['cytoplasm_mask_logit'], gt_mask_semantic, _cyto_any) +
-                    0.5 * self._refinement_dice_loss(
+                    0.5 * self._refinement_overlap_loss(
                 y_pred['cytoplasm_mask'], gt_mask_semantic))
 
         loss_nuc_mask = tf.constant(0.0, dtype=tf.float32)
         if self.lambda_nuc_mask > 0 and 'nucleus_mask' in y_pred:
             gt_nuc_semantic = self._grid_subsample_nucleus(tf.expand_dims(
                 tf.cast(y_true_raw['nucleus_target'], tf.float32), axis=-1))
-            _nuc_any = tf.stop_gradient(self._grid_subsample_nucleus(
-                tf.expand_dims(tf.cast(y_true_raw['nucleus_instances'] > 0,
-                                       tf.float32), axis=-1)))
+            _nuc_any = tf.stop_gradient(_tile_prompts(
+                self._grid_subsample_nucleus(
+                    tf.expand_dims(tf.cast(y_true_raw['nucleus_instances'] > 0,
+                                           tf.float32), axis=-1))))
             loss_nuc_mask = self.lambda_nuc_mask * (
                     0.5 * self._refinement_ce_loss(
                 y_pred['nucleus_mask_logit'], gt_nuc_semantic, _nuc_any) +
-                    0.5 * self._refinement_dice_loss(
+                    0.5 * self._refinement_overlap_loss(
                 y_pred['nucleus_mask'], gt_nuc_semantic))
 
+        fine_mask = tf.constant(0., tf.float32)
+        fine_monitoring = {}
+        if cfg.refinement_full_resolution:
+            # Full-resolution head: the same CE + overlap as the coarse mask, on the window the
+            # model cropped around the prompt slot it picked (rows k*B..(k+1)*B of the K-major
+            # targets; full-resolution targets, no subsampling).
+            from cytonucs_fine_mask import crop
+            for head, weight in (('nucleus', self.lambda_nuc_mask), ('cytoplasm', self.lambda_cyto_mask)):
+                if not weight or head + '_fine_logit' not in y_pred:
+                    continue
+                logit = tf.cast(y_pred[head + '_fine_logit'], tf.float32)
+                begin = tf.cast(y_pred[head + '_fine_begin'], tf.int32)
+                size = tf.shape(logit)[1:1 + self.ndim]
+                first = tf.shape(logit)[0]
+                slot = tf.cast(tf.reshape(y_pred['fine_prompt_slot'], [-1])[0], tf.int32) \
+                    if 'fine_prompt_slot' in y_pred else 0
+                target = crop(tf.cast(y_true_raw[head + '_target'], tf.float32)[slot * first:(slot + 1) * first, ..., None],
+                              begin, size)
+                any_instance = crop(tf.cast(y_true_raw[head + '_instances'] > 0, tf.float32)[..., None], begin, size)
+                probability = tf.nn.softmax(logit, axis=-1)[..., 1:2]
+                head_loss = weight * (0.5 * self._refinement_ce_loss(logit, target, any_instance) +
+                                      0.5 * self._refinement_overlap_loss(probability, target))
+                fine_monitoring[head + '_fine_mask'] = head_loss
+                fine_mask += head_loss
+        consistency = tf.constant(0., tf.float32)
+        if self.lambda_consistency:
+            consistency = self.lambda_consistency * warmup * 0.5 * sum(
+                self._consistency_loss(y_pred[h + '_prob'], y_true[h + '_prob'])
+                for h in ('nucleus', 'cytoplasm'))
+        prompt_consistency = tf.constant(0., tf.float32)
+        if cfg.prompt_consistency_weight and self.n_prompts > 1:
+            for head in ('nucleus', 'cytoplasm'):
+                target = self._subsample(tf.cast(y_true_raw[head + '_target'][..., None], tf.float32),
+                                         getattr(cfg, head + '_grid'))
+                prompt_consistency += cfg.prompt_consistency_weight * 0.5 * self._prompt_consistency(
+                    y_pred[head + '_mask'], target)
+        cell_prompt_separation = tf.constant(0., tf.float32)
+        if cfg.cell_prompt_separation_weight and self.n_prompts > 1:
+            target = self._subsample(tf.cast(y_true_raw['cytoplasm_target'][..., None], tf.float32),
+                                     cfg.cytoplasm_grid)
+            cell_prompt_separation = cfg.cell_prompt_separation_weight * self._cell_prompt_separation(
+                y_pred['cytoplasm_mask_logit'], target)
+        cell_z_dice = tf.constant(0., tf.float32)
+        if cfg.cell_z_dice_weight:
+            target = self._subsample(tf.cast(y_true_raw['cytoplasm_target'][..., None], tf.float32),
+                                     cfg.cytoplasm_grid)
+            cell_z_dice = cfg.cell_z_dice_weight * self._cell_z_dice(y_pred['cytoplasm_mask'], target)
+        nucleus_z_dice = tf.constant(0., tf.float32)
+        if cfg.nucleus_z_dice_weight:
+            target = self._subsample(tf.cast(y_true_raw['nucleus_target'][..., None], tf.float32),
+                                     cfg.nucleus_grid)
+            nucleus_z_dice = cfg.nucleus_z_dice_weight * self._cell_z_dice(y_pred['nucleus_mask'], target)
+        semantic_foreground = tf.constant(0., tf.float32)
+        semantic_monitoring = {}
+        if cfg.semantic_foreground_weight:
+            # Voxel truth, so crop-cut objects count as foreground like any other.
+            for head in ('nucleus', 'cytoplasm'):
+                target = self._subsample(tf.cast(y_true_raw[head + '_instances'] > 0, tf.float32)[..., None],
+                                         getattr(cfg, head + '_grid'))
+                logit = tf.cast(y_pred[head + '_semantic_logit'], tf.float32)
+                probability = tf.sigmoid(logit)
+                bce = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=target, logits=logit))
+                overlap = self._refinement_overlap_loss(probability, target)
+                binary = tf.cast(probability > 0.5, tf.float32)
+                semantic_monitoring[head + '_semantic_bce'] = bce
+                semantic_monitoring[head + '_semantic_overlap'] = overlap
+                semantic_monitoring[head + '_semantic_dice'] = tf.math.divide_no_nan(
+                    2. * tf.reduce_sum(binary * target), tf.reduce_sum(binary) + tf.reduce_sum(target))
+                semantic_foreground += cfg.semantic_foreground_weight * 0.5 * (0.5 * bce + 0.5 * overlap)
+        mask_quality = tf.constant(0., tf.float32)
+        quality_monitoring = {}
+        if cfg.mask_quality_weight:
+            axes = list(range(1, self.ndim + 2))
+            for head in ('nucleus', 'cytoplasm'):
+                target = self._subsample(tf.cast(y_true_raw[head + '_target'][..., None], tf.float32),
+                                         getattr(cfg, head + '_grid'))
+                # 'auto' is calibrated after training; quality targets use the default threshold.
+                threshold = cfg.mask_threshold(head)
+                binary = tf.cast(y_pred[head + '_mask'] > threshold, tf.float32)
+                inter = tf.reduce_sum(binary * target, axis=axes)
+                union = tf.reduce_sum(tf.maximum(binary, target), axis=axes)
+                quality_target = tf.stop_gradient(tf.math.divide_no_nan(inter, union))
+                grid_quality_target = quality_target
+                if cfg.mask_quality_target == 'component':
+                    from cytonucs_mask_quality import component_quality_targets
+                    prompt_key = head + '_quality_prompt'
+                    if prompt_key not in y_true_raw:
+                        raise ValueError('component quality target requires actual prompts from trainer')
+                    grid = tuple(getattr(cfg, head + '_grid'))
+                    quality_target = tf.numpy_function(
+                        lambda p, t, pr, g=grid, th=threshold: component_quality_targets(p, t, pr, g, th),
+                        [tf.stop_gradient(y_pred[head + '_mask']), y_true_raw[head + '_target'],
+                         y_true_raw[prompt_key]], tf.float32, stateful=False)
+                    quality_target.set_shape([None])
+                quality_monitoring[head + '_quality_target_mean'] = tf.reduce_mean(quality_target)
+                quality_monitoring[head + '_quality_target_shift'] = tf.reduce_mean(
+                    tf.abs(quality_target - grid_quality_target))
+                error = tf.square(tf.reshape(y_pred[head + '_quality'], [-1]) - quality_target)
+                if cfg.mask_quality_ignore_boundary_targets:
+                    if crop_cut[head] is not None:
+                        # Targets are K-major (k*B + b): repeat the per-image masks K times.
+                        eligible, positive = quality_supervision_weights(
+                            y_true_raw[head + '_target'], self.ndim,
+                            crop_cut=tf.tile(crop_cut[head], [self.n_prompts] + [1] * self.ndim))
+                    elif cfg.object_losses_include_crop_cut:
+                        eligible, positive = quality_supervision_weights(
+                            y_true_raw[head + '_target'], self.ndim, crop_cut=tf.zeros_like(
+                                tf.cast(y_true_raw[head + '_target'], tf.uint8)))
+                    else:
+                        eligible, positive = quality_supervision_weights(
+                            y_true_raw[head + '_target'], self.ndim,
+                            None if truncating_axes is None else
+                            tf.tile(tf.cast(truncating_axes, tf.float32), [self.n_prompts, 1]))
+                    quality_monitoring[head + '_quality_supervised_fraction'] = tf.reduce_mean(eligible)
+                    quality_monitoring[head + '_quality_complete_positive_fraction'] = tf.reduce_mean(eligible * positive)
+                    error_mean = tf.math.divide_no_nan(tf.reduce_sum(error * eligible), tf.reduce_sum(eligible))
+                else:
+                    error_mean = tf.reduce_mean(error)
+                mask_quality += cfg.mask_quality_weight * .5 * error_mean
+                if cfg.mask_quality_rank_weight:
+                    # Order over every prompt: a crop-cut object looks like a volume-cut one at
+                    # inference, and background prompts (target 0) must rank below real masks.
+                    rank, pair_accuracy, pair_count = quality_rank_loss(
+                        tf.reshape(y_pred[head + '_quality'], [-1]), quality_target, tf.ones_like(error))
+                    quality_monitoring[head + '_quality_rank_loss'] = rank
+                    quality_monitoring[head + '_quality_pair_accuracy'] = pair_accuracy
+                    quality_monitoring[head + '_quality_rank_pairs'] = pair_count
+                    mask_quality += cfg.mask_quality_rank_weight * rank
         # === TOTAL ===
         total_loss = (
                 cfg.lambda_prob_nucleus * loss_nucleus['bce'] +
@@ -224,37 +383,39 @@ class CytoNucsLoss:
                 loss_fragmentation +
                 loss_background +
                 loss_cyto_mask +
-                loss_nuc_mask
+                loss_nuc_mask + consistency + prompt_consistency + cell_prompt_separation + cell_z_dice + nucleus_z_dice + mask_quality +
+                semantic_foreground + fine_mask
         )
 
-        def print_debug(epoch_val, nuc_bce, nuc_dist, cyto_bce, cyto_dist,
-                        wbr_val, wbr_f, cont_val, frag_val, bg_val,
-                        cyto_mask_val, nuc_mask_val, tot_val):
-            if self._loss_call_count % 5 == 0:
-                print(f"\n=== LOSS (epoch {int(epoch_val)}, global_step {self._loss_call_count}) ===")
-                print(f"  Nucleus BCE: {float(nuc_bce):.4f} | Dist: {float(nuc_dist):.2f}")
-                print(f"  Cytoplasm BCE: {float(cyto_bce):.4f} | Dist: {float(cyto_dist):.2f}")
-                print(f"  WBR: {float(wbr_val):.4f} | warmup factor: {float(wbr_f):.2f}")
-                print(f"  Containment: {float(cont_val):.4f} (raw, ×warmup в total)")
-                print(f"  Fragmentation: {float(frag_val):.4f}")
-                print(f"  Background: {float(bg_val):.4f}")
-                print(f"  CytoMask: {float(cyto_mask_val):.4f} ")
-                print(f"  NucMask: {float(nuc_mask_val):.4f} ")
+        self.last_components = {
+            'nucleus_bce': loss_nucleus['bce'], 'nucleus_distance': loss_nucleus['distance'],
+            'cytoplasm_bce': loss_cytoplasm['bce'], 'cytoplasm_distance': loss_cytoplasm['distance'],
+            'wbr': loss_wbr, 'containment': self.lambda_containment * warmup * loss_containment,
+            'nucleus_mask': loss_nuc_mask, 'cytoplasm_mask': loss_cyto_mask,
+            'consistency': consistency, 'prompt_consistency': prompt_consistency,
+            'mask_quality': mask_quality, 'cell_prompt_separation': cell_prompt_separation,
+            'cell_z_dice': cell_z_dice,
+            'nucleus_z_dice': nucleus_z_dice,
+        }
+        if cfg.semantic_foreground_weight:
+            self.last_components['semantic_foreground'] = semantic_foreground
+            self.last_components.update(semantic_monitoring)
+        self.last_components.update(fine_monitoring)
 
-                print(f"  TOTAL: {float(tot_val):.4f}")
-            self._loss_call_count += 1
-            return 0
-
-        tf.py_function(
-            print_debug,
-            [current_epoch_display, loss_nucleus['bce'], loss_nucleus['distance'],
-             loss_cytoplasm['bce'], loss_cytoplasm['distance'],
-             loss_wbr, warmup, loss_containment,
-             loss_fragmentation, loss_background,
-             loss_cyto_mask, loss_nuc_mask, total_loss],
-            [tf.int32]
-        )
-
+        for head in ('nucleus', 'cytoplasm'):
+            head_loss = loss_nucleus if head == 'nucleus' else loss_cytoplasm
+            for metric in ('bce_foreground', 'bce_background', 'prob_foreground_fraction'):
+                self.last_components[head + '_' + metric] = head_loss[metric]
+            flag = head + '_z_prompt_pair'
+            self.last_components[head + '_z_pair_fraction'] = (
+                tf.reduce_mean(tf.cast(y_true_raw[flag], tf.float32)) if flag in y_true_raw
+                else tf.constant(0., tf.float32))
+        self.last_components.update({'nucleus_' + k: v for k, v in loss_nucleus['probability_metrics'].items()})
+        self.last_components.update({'cytoplasm_' + k: v for k, v in loss_cytoplasm['probability_metrics'].items()})
+        if cfg.object_losses_min_area_from_gate:
+            self.last_components['nucleus_object_min_voxels'] = tf.identity(self.object_min_voxels[0])
+            self.last_components['cytoplasm_object_min_voxels'] = tf.identity(self.object_min_voxels[1])
+        self.last_components.update(quality_monitoring)
         return total_loss
 
     # ============================================================
@@ -308,7 +469,8 @@ class CytoNucsLoss:
         return self._star_dist_wrapper_internal(
             instances, expected_max_radius, self._get_nucleus_grid(),
             getattr(self.config, 'rays_nucleus', self.config.rays),
-            getattr(self.config, 'rays_anisotropy_nucleus', self.config.anisotropy))
+            getattr(self.config, 'rays_anisotropy_nucleus', self.config.anisotropy),
+            normalize_prob=self.config.nucleus_prob_grid_normalize)
 
     def _star_dist_wrapper_cytoplasm(self, instances):
         """Wrapper для cytoplasm: свой набор лучей и своя анизотропия."""
@@ -321,14 +483,14 @@ class CytoNucsLoss:
             getattr(self.config, 'rays_anisotropy_cytoplasm', self.config.anisotropy))
 
     def _star_dist_wrapper_internal(self, instances, expected_max_radius, grid,
-                                    rays, aniso):
+                                    rays, aniso, normalize_prob=False):
         """Фолбэк-путь, когда GT не пришёл из генератора. Логика вынесена в
         compute_stardist_gt, чтобы генератор и лосс считали одно и то же."""
         instances = instances.numpy()
         prob_list, dist_list = [], []
         for b in range(instances.shape[0]):
             p, d = compute_stardist_gt(instances[b], self.config, grid,
-                                       rays=rays, aniso=aniso)
+                                       rays=rays, aniso=aniso, normalize_prob=normalize_prob)
             prob_list.append(p)
             dist_list.append(d)
         return (np.stack(prob_list, axis=0).astype(np.float32),
@@ -339,20 +501,14 @@ class CytoNucsLoss:
     # ============================================================
 
     def _stardist_loss(self, prob_true, prob_pred, dist_true, dist_pred,
-                       name='object', prob_logit=None):
+                       name='object', prob_logit=None, instances=None):
 
         prob_true_squeeze = tf.squeeze(prob_true, axis=-1)
         prob_pred_squeeze = tf.squeeze(prob_pred, axis=-1)
         foreground_mask = tf.cast(prob_true_squeeze > 0.01, tf.float32)
         background_mask = 1.0 - foreground_mask
 
-        # Канонический StarDist (base.py:77): BCE минус энтропия таргета —
-        # prob_true мягкая EDT-карта, без вычитания лосс имеет ненулевой минимум.
-        # ПЛЮС адаптивный pos_weight: на 3D-патче доля fg порядка 0.5-1 %, и
-        # чистый BCE топит fg-градиент в фоне. Вес выводится из данных
-        # (num_bg/num_fg на текущем батче), потолок 50 — от вырождения на
-        # почти пустых патчах. Энтропия взвешивается тем же множителем, чтобы
-        # вычитаемая константа осталась согласованной с числителем.
+
         eps = 1e-7
         if prob_logit is not None:
             z = tf.squeeze(tf.cast(prob_logit, tf.float32), axis=-1)
@@ -364,6 +520,25 @@ class CytoNucsLoss:
             bce_raw = -(prob_true_squeeze * tf.math.log(p) +
                         (1.0 - prob_true_squeeze) * tf.math.log(1.0 - p))
         loss_bce = tf.reduce_mean(bce_raw)
+        probability_metrics = {}
+        object_weight = getattr(self.config, name + '_prob_object_weight', 0.0)
+        peak_weight = self.config.prob_object_peak_weight if name in ('nucleus', 'cytoplasm') else 0.0
+        if object_weight or peak_weight:
+            if instances is None:
+                raise ValueError('Object-level probability losses require sampled instance labels')
+            object_bce, probability_metrics = object_balanced_probability(
+                bce_raw, prob_pred_squeeze, instances)
+            probability_metrics['bce_voxel'] = loss_bce
+            if object_weight:
+                probability_metrics['bce_object'] = object_bce
+                probability_metrics['bce_object_weighted'] = object_weight * object_bce
+                loss_bce += probability_metrics['bce_object_weighted']
+            if peak_weight:
+                # Detection needs one confident peak per object, not only a good mean.
+                peak = object_peak_probability(prob_pred_squeeze, prob_true_squeeze, instances)
+                probability_metrics['bce_object_peak'] = peak
+                probability_metrics['bce_object_peak_weighted'] = peak_weight * peak
+                loss_bce += probability_metrics['bce_object_peak_weighted']
 
         num_fg = tf.reduce_sum(foreground_mask) + self.epsilon
         num_bg = tf.reduce_sum(background_mask) + self.epsilon
@@ -377,19 +552,17 @@ class CytoNucsLoss:
         # деление на dist_scale не выравнивает головы (они и так сбалансированы),
         # а лишь делит градиент на 15/60 — и требует раздутых lambda для компенсации.
         # dist_scale используем ТОЛЬКО чтобы напечатать относительную ошибку.
-        n_rays = tf.shape(dist_true)[-1]
-
         if name == 'nucleus':
-            dist_scale = float(getattr(self.config, 'median_max_dist_nucleus', 15.0))
+            dist_scale = float(getattr(self.config, 'median_max_dist_nucleus', None) or 15.0)
         else:
-            dist_scale = float(getattr(self.config, 'median_max_dist_cytoplasm', 60.0))
+            dist_scale = float(getattr(self.config, 'median_max_dist_cytoplasm', None) or 60.0)
         dist_scale = tf.cast(max(dist_scale, 1.0), tf.float32)
 
-        dist_mask = tf.cast(prob_true, tf.float32)  # канон: мягкая edt-маска
-        if self.ndim == 2:
-            dist_mask_exp = tf.tile(dist_mask, [1, 1, 1, n_rays])
-        else:
-            dist_mask_exp = tf.tile(dist_mask, [1, 1, 1, 1, n_rays])
+        dist_mask = tf.cast(prob_true, tf.float32)
+        stride = getattr(self.config, 'dist_target_stride', None)
+        if stride is not None:
+            dist_pred = self._subsample(dist_pred, tuple(int(s) for s in stride))
+            dist_mask = self._subsample(dist_mask, tuple(int(s) for s in stride))
 
         dist_diff = tf.cast(dist_true, tf.float32) - tf.cast(dist_pred, tf.float32)
 
@@ -412,9 +585,9 @@ class CytoNucsLoss:
         else:  # 'mae'
             dist_error_per_ray = tf.abs(dist_diff)
 
-        weighted_error = dist_mask_exp * dist_error_per_ray
+        weighted_error = dist_mask * dist_error_per_ray
         loss_distance = tf.reduce_mean(weighted_error) / (
-                tf.reduce_mean(dist_mask_exp) + self.epsilon)
+                tf.reduce_mean(dist_mask) + self.epsilon)
 
         bg_reg_weight = tf.cast(
             getattr(self.config, 'train_background_reg', 1e-4), tf.float32)
@@ -425,125 +598,10 @@ class CytoNucsLoss:
         # относительная ошибка — только для лога, в градиент не идёт
         loss_distance_rel = tf.stop_gradient(loss_distance / dist_scale)
 
-        # ============================================================
-        # === Debug ===
-        # ============================================================
-
-        if not hasattr(self, '_debug_count'):
-            self._debug_count = {}
-        if name not in self._debug_count:
-            self._debug_count[name] = 0
-        self._debug_count[name] += 1
-
-        if self._debug_count[name] < 5:
-            mean_pred_fg = tf.reduce_sum(prob_pred_squeeze * foreground_mask) / num_fg
-            mean_pred_bg = tf.reduce_sum(prob_pred_squeeze * background_mask) / num_bg
-            bg_probs_only = tf.where(background_mask > 0.5, prob_pred_squeeze, -1.0)
-            max_pred_bg = tf.reduce_max(bg_probs_only)
-            max_pred_fg = tf.reduce_max(prob_pred_squeeze * foreground_mask)
-            tf.print("\n  [STARDIST LOSS -", name, "]")
-            tf.print("    BCE :     ", loss_bce)
-            tf.print("      └─ fg component:  ", loss_bce_fg)
-            tf.print("      └─ bg component:  ", loss_bce_bg)
-            tf.print("    Mean prob (fg):     ", mean_pred_fg, " Max prob (fg):", max_pred_fg)
-            tf.print("    Mean prob (bg):     ", mean_pred_bg, " Max prob (bg):", max_pred_bg)
-            if z is not None:
-                # Кайма шириной b узлов против внутренней области. Если логит на
-                # кайме систематически выше, это отклик на zero-padding, а не на
-                # данные: там признаки после relu близки к нулю, и при суммарно
-                # отрицательных весах головы логит выходит максимальным.
-                _b = 8
-                _e = tf.zeros_like(z)
-                if self.ndim == 3:
-                    _inner = tf.pad(tf.ones_like(z[:, :, _b:-_b, _b:-_b]),
-                                    [[0, 0], [0, 0], [_b, _b], [_b, _b]])
-                else:
-                    _inner = tf.pad(tf.ones_like(z[:, _b:-_b, _b:-_b]),
-                                    [[0, 0], [_b, _b], [_b, _b]])
-                _rim = 1.0 - _inner
-                tf.print("    logit кайма/внутри (mean):",
-                         tf.reduce_sum(z * _rim) / (tf.reduce_sum(_rim) + self.epsilon),
-                         "/",
-                         tf.reduce_sum(z * _inner) / (tf.reduce_sum(_inner) + self.epsilon),
-                         " max кайма:", tf.reduce_max(tf.where(_rim > 0.5, z, -1e9)))
-                _big = tf.constant(1e9, tf.float32)
-                _has_fg = tf.reduce_sum(foreground_mask) > 0.5
-                tf.print("    logit bg  min/mean/max:",
-                         tf.reduce_min(tf.where(background_mask > 0.5, z, _big)),
-                         tf.reduce_sum(tf.where(background_mask > 0.5, z, 0.0)) / num_bg,
-                         tf.reduce_max(tf.where(background_mask > 0.5, z, -_big)))
-                tf.cond(_has_fg,
-                        lambda: tf.print("    logit fg  min/mean/max:",
-                                         tf.reduce_min(tf.where(foreground_mask > 0.5, z, _big)),
-                                         tf.reduce_sum(tf.where(foreground_mask > 0.5, z, 0.0)) / num_fg,
-                                         tf.reduce_max(tf.where(foreground_mask > 0.5, z, -_big)),
-                                         "  разрыв fg-bg:",
-                                         tf.reduce_sum(tf.where(foreground_mask > 0.5, z, 0.0)) / num_fg -
-                                         tf.reduce_sum(tf.where(background_mask > 0.5, z, 0.0)) / num_bg),
-                        lambda: tf.print("    logit fg: в патче НЕТ переднего плана"))
-            tf.print("    Dist loss (", name, "):", loss_distance, " | rel:", loss_distance_rel)
-            tf.print("    neg_ray frac:", tf.reduce_mean(tf.cast(dist_pred < 0, tf.float32)))
-            fg_binary = tf.cast(
-                tf.reduce_max(dist_true, axis=-1, keepdims=True) > 0, tf.float32
-            )
-            if self.ndim == 2:
-                fg_binary_exp = tf.tile(fg_binary, [1, 1, 1, n_rays])
-            else:
-                fg_binary_exp = tf.tile(fg_binary, [1, 1, 1, 1, n_rays])
-            fg_pixel_count = tf.reduce_sum(fg_binary) + self.epsilon
-            n_rays_f = tf.cast(n_rays, tf.float32)
-            fg_mask_nd = tf.squeeze(fg_binary, axis=-1)
-
-            mean_dist_fg = tf.reduce_sum(dist_pred * fg_binary_exp) / (
-                    tf.reduce_sum(fg_binary_exp) + self.epsilon)
-            tf.print("    Mean dist (fg):     ", mean_dist_fg, "px")
-
-            # --- SHAPE DIAG (для ОБЕИХ голов) ---
-            large_val = 1e6
-            pred_for_min = dist_pred + (1.0 - fg_binary_exp) * large_val
-            pred_min_ray = tf.reduce_min(pred_for_min, axis=-1)
-            pred_max_ray = tf.reduce_max(dist_pred * fg_binary_exp, axis=-1)
-            valid = fg_mask_nd * tf.cast(pred_min_ray < large_val * 0.5, tf.float32)
-            _floor = tf.cast(0.01 * dist_scale, tf.float32)
-            valid = valid * tf.cast(pred_min_ray > _floor, tf.float32)
-            n_valid = tf.reduce_sum(valid) + self.epsilon
-
-            gt_for_min = dist_true + (1.0 - fg_binary_exp) * large_val
-            gt_min_ray = tf.reduce_min(gt_for_min, axis=-1)
-            gt_max_ray = tf.reduce_max(dist_true * fg_binary_exp, axis=-1)
-            gt_valid = fg_mask_nd * tf.cast(gt_min_ray < large_val * 0.5, tf.float32)
-            gt_valid = gt_valid * tf.cast(gt_min_ray > 0.5, tf.float32)
-            n_gt_valid = tf.reduce_sum(gt_valid) + self.epsilon
-
-            tf.print("    --- SHAPE DIAG (", name, ") ---")
-            tf.print("    Pred min_ray:", tf.reduce_sum(pred_min_ray * valid) / n_valid,
-                     "px  max_ray:", tf.reduce_sum(pred_max_ray * valid) / n_valid, "px")
-            tf.print("    GT   min_ray:", tf.reduce_sum(gt_min_ray * gt_valid) / n_gt_valid,
-                     "px  max_ray:", tf.reduce_sum(gt_max_ray * gt_valid) / n_gt_valid, "px")
-
-            # --- ЛУЧИ В ЦЕНТРЕ (argmax GT prob) — ключевая диагностика формы ---
-            pt0 = prob_true_squeeze[0]
-            center_idx = tf.argmax(tf.reshape(pt0, [-1]))
-            dt0 = tf.reshape(tf.cast(dist_true[0], tf.float32), [-1, n_rays])
-            dp0 = tf.reshape(tf.cast(dist_pred[0], tf.float32), [-1, n_rays])
-            gt_rays = tf.gather(dt0, center_idx)
-            pr_rays = tf.gather(dp0, center_idx)
-            tf.print("    [CENTER] GT   min/mean/max:", tf.reduce_min(gt_rays),
-                     tf.reduce_mean(gt_rays), tf.reduce_max(gt_rays))
-            tf.print("    [CENTER] PRED min/mean/max:", tf.reduce_min(pr_rays),
-                     tf.reduce_mean(pr_rays), tf.reduce_max(pr_rays))
-            _pr = tf.reduce_sum(pred_max_ray * valid) / n_valid
-            _gr = tf.reduce_sum(gt_max_ray * gt_valid) / n_gt_valid
-            tf.print("    max_ray pred/GT:", _pr / (_gr + self.epsilon))
-
-            # prob В ИСТИННОМ ЦЕНТРЕ объекта. Max prob(fg) считается по маске
-            # prob_true > 0.01, куда не попадает внешняя оболочка объекта
-            # (edt_prob там ~0), поэтому высокий Max prob(bg) может быть как
-            # ложным пиком в пустоте, так и римом настоящего объекта. Значение
-            # в argmax GT prob различает эти два случая однозначно.
-            tf.print("    [CENTER] prob GT:", tf.gather(tf.reshape(pt0, [-1]), center_idx),
-                     " PRED:", tf.gather(tf.reshape(prob_pred_squeeze[0], [-1]), center_idx))
-        return {'bce': loss_bce, 'distance': loss_distance, 'distance_rel': loss_distance_rel}
+        return {'bce': loss_bce, 'distance': loss_distance, 'distance_rel': loss_distance_rel,
+                'bce_foreground': loss_bce_fg, 'bce_background': loss_bce_bg,
+                'prob_foreground_fraction': tf.stop_gradient(tf.reduce_mean(foreground_mask)),
+                'probability_metrics': probability_metrics}
 
     # ============================================================
     # === WBR LOSS ===
@@ -619,13 +677,17 @@ class CytoNucsLoss:
 
         # 2. DISTANCE FIELD CONTAINMENT (raw pixels)
         nuc_fg = tf.cast(nuc_prob_gt > 0.5, tf.float32)
-        n_rays = tf.shape(nuc_dist)[-1]
-        if self.ndim == 2:
-            nuc_fg_exp = tf.tile(nuc_fg, [1, 1, 1, n_rays])
+        w_distance = float(getattr(self.config, 'w_containment_distance', 0.0))
+        if w_distance:
+            nr = np.asarray(self.config.rays_nucleus.vertices)
+            cr = np.asarray(self.config.rays_cytoplasm.vertices)
+            if nr.shape != cr.shape or not np.allclose(nr, cr):
+                raise ValueError('Distance containment requires identical ray directions; set w_containment_distance=0')
+            shared_fg = nuc_fg * self._grid_subsample_cytoplasm(tf.expand_dims(
+                tf.cast(y_true_raw['cytoplasm_instances'] > 0, tf.float32), -1))
+            loss_distance_containment = tf.reduce_mean(tf.nn.relu(nuc_dist - cyto_dist) * shared_fg)
         else:
-            nuc_fg_exp = tf.tile(nuc_fg, [1, 1, 1, 1, n_rays])
-        distance_violation = tf.nn.relu(nuc_dist - cyto_dist) * nuc_fg_exp
-        loss_distance_containment = tf.reduce_mean(distance_violation)
+            loss_distance_containment = tf.constant(0.0, tf.float32)
 
         # 3. CYTOPLASM SUPPORT — односторонний hinge к СОБСТВЕННОМУ GT.
         # Прежнее (1 - cyto_prob) требовало cyto_prob = 1 на всей площади ядра,
@@ -644,9 +706,12 @@ class CytoNucsLoss:
                 median_radius = self.config.median_radius_train
             else:
                 nuc_dist_gt = self._match_to_cytoplasm(y_true['nucleus_dist'])
-                num_fg = tf.reduce_sum(nuc_fg_exp) + self.epsilon
+                # nuc_fg broadcast'ится по лучам; sum(tile(m)) = n_rays*sum(m),
+                # множитель сокращается в отношении, результат тот же.
+                num_fg = (tf.reduce_sum(nuc_fg) *
+                          tf.cast(tf.shape(nuc_dist)[-1], tf.float32) + self.epsilon)
                 median_radius = tf.maximum(
-                    tf.reduce_sum(nuc_dist_gt * nuc_fg_exp) / num_fg, 1.0)
+                    tf.reduce_sum(nuc_dist_gt * nuc_fg) / num_fg, 1.0)
             loss_separation = self._compute_center_separation(
                 nuc_prob=nuc_prob, cyto_prob_gt=cyto_prob_gt,
                 nuc_prob_gt=nuc_prob_gt, median_radius=median_radius)
@@ -654,7 +719,7 @@ class CytoNucsLoss:
             loss_separation = tf.constant(0.0, dtype=tf.float32)
 
         w_geometric = getattr(self.config, 'w_containment_geometric', 1.0)
-        w_distance = getattr(self.config, 'w_containment_distance', 0.5)
+        w_distance = getattr(self.config, 'w_containment_distance', 0.0)
         w_cyto_support = getattr(self.config, 'w_cyto_support', 0.1)
 
         return (w_geometric * loss_geometric +
@@ -734,11 +799,6 @@ class CytoNucsLoss:
         max_label = tf.maximum(max_label, 1)
 
         # Offset для каждого элемента батча
-        if self.ndim == 2:
-            spatial_dims = [1, 2]
-        else:
-            spatial_dims = [1, 2, 3]
-
         # batch_index broadcast по spatial dims
         batch_range = tf.range(batch_size, dtype=tf.int32)
         # reshape (B, 1, 1[, 1]) для broadcast
@@ -885,70 +945,103 @@ class CytoNucsLoss:
     # ============================================================
 
     def _consistency_loss(self, prob_pred, prob_gt):
+        """Variance of probability residual, not variance of the soft EDT target.
+
+        Zero at the correct prediction; does not force a flat foreground map.
+        This is a foreground regularizer, not instance/prompt consistency.
         """
-        Consistency within single GT object.
-        Penalizes high variance of predicted prob within GT foreground.
-        Предотвращает фрагментацию объектов.
+        axes = list(range(1, self.ndim + 2))
+        mask = tf.cast(prob_gt > 0.01, tf.float32)
+        residual = tf.cast(prob_pred, tf.float32) - tf.cast(prob_gt, tf.float32)
+        count = tf.reduce_sum(mask, axis=axes, keepdims=True)
+        mean = tf.math.divide_no_nan(tf.reduce_sum(residual * mask, axis=axes, keepdims=True), count)
+        var = tf.math.divide_no_nan(tf.reduce_sum(tf.square(residual - mean) * mask, axis=axes, keepdims=True), count)
+        valid = tf.cast(count > 1, tf.float32)
+        return tf.math.divide_no_nan(tf.reduce_sum(var * valid), tf.reduce_sum(valid))
+
+    def _prompt_consistency(self, pred, target):
+        """Same GT instance, different prompts, same image (K-major ordering)."""
+        ps, ts = tf.split(pred, self.n_prompts, axis=0), tf.split(target, self.n_prompts, axis=0)
+        axes = list(range(1, self.ndim + 2))
+        total = tf.constant(0., tf.float32)
+        count = tf.constant(0., tf.float32)
+        for i in range(self.n_prompts):
+            for j in range(i + 1, self.n_prompts):
+                same = tf.cast((tf.reduce_sum(tf.abs(ts[i]-ts[j]), axis=axes) < .5) &
+                               (tf.reduce_sum(ts[i], axis=axes) > .5), tf.float32)
+                weight = tf.stop_gradient(tf.maximum(ts[i], tf.maximum(ps[i], ps[j])))
+                error = tf.math.divide_no_nan(tf.reduce_sum(tf.square(ps[i]-ps[j])*weight, axis=axes),
+                                             tf.reduce_sum(weight, axis=axes))
+                total += tf.reduce_sum(error * same)
+                count += tf.reduce_sum(same)
+        return tf.math.divide_no_nan(total, count)
+
+    def _cell_z_dice(self, pred, target):
+        """Equal weight to every occupied Z plane, then to every positive prompt.
+
+        Full-volume Dice can underweight thin ends. No smoothing across Z and
+        no supervision to fill GT gaps: empty planes remain covered by CE and
+        volume Dice. This term supervises the selected instance only.
         """
-        if self.ndim == 2:
-            prob_pred_map = tf.squeeze(prob_pred, axis=-1)  # (B, H, W)
-            fg_mask = tf.squeeze(prob_gt, axis=-1)
-        else:
-            prob_pred_map = tf.squeeze(prob_pred, axis=-1)  # (B, H, W, D)
-            fg_mask = tf.squeeze(prob_gt, axis=-1)
+        p, t = tf.cast(pred, tf.float32), tf.cast(target, tf.float32)
+        axes = [2, 3, 4]  # B,Z,Y,X,C -> B,Z
+        area = tf.reduce_sum(t, axis=axes)
+        dice = (2 * tf.reduce_sum(p*t, axis=axes) + 1.) / (tf.reduce_sum(p, axis=axes) + area + 1.)
+        valid = tf.cast(area > .5, tf.float32)
+        n = tf.reduce_sum(valid, axis=1)
+        per_prompt = tf.math.divide_no_nan(tf.reduce_sum((1-dice)*valid, axis=1), n)
+        return tf.math.divide_no_nan(tf.reduce_sum(per_prompt), tf.reduce_sum(tf.cast(n > 0, tf.float32)))
 
-        fg_mask = tf.cast(fg_mask > 0.5, tf.float32)
+    def _cell_prompt_separation(self, logits, target):
+        """Different GT cells in the same image must prefer their own prompt.
 
-        # Masked predictions
-        prob_on_fg = prob_pred_map * fg_mask
+        Compare foreground log-odds across prompts on each GT cell, averaging
+        cells equally, not by volume. Ignore empty/repeated/overlapping targets.
+        K-major split keeps images separate when image_batch_size > 1.
+        Ordinary CE/Dice still supervise absolute foreground/background values.
+        """
+        z = tf.cast(logits, tf.float32)
+        odds = z[..., 1:2] - tf.reduce_logsumexp(tf.gather(z, [0, 2], axis=-1), axis=-1, keepdims=True)
+        ps = tf.split(odds, self.n_prompts, axis=0)
+        ts = tf.split(tf.cast(target > .5, tf.float32), self.n_prompts, axis=0)
+        axes = list(range(1, self.ndim + 2))
+        total = tf.constant(0., tf.float32)
+        count = tf.constant(0., tf.float32)
+        for i in range(self.n_prompts):
+            for j in range(i + 1, self.n_prompts):
+                ni, nj = (tf.reduce_sum(ts[k], axis=axes) for k in (i, j))
+                valid = tf.cast((ni > 0) & (nj > 0) &
+                                (tf.reduce_sum(ts[i] * ts[j], axis=axes) == 0), tf.float32)
+                li = tf.math.divide_no_nan(tf.reduce_sum(tf.nn.softplus(ps[j]-ps[i]) * ts[i], axis=axes), ni)
+                lj = tf.math.divide_no_nan(tf.reduce_sum(tf.nn.softplus(ps[i]-ps[j]) * ts[j], axis=axes), nj)
+                total += tf.reduce_sum(.5 * (li + lj) * valid)
+                count += tf.reduce_sum(valid)
+        return tf.math.divide_no_nan(total, count)
 
-        min_fg_pixels = 10.0 if self.ndim == 2 else 50.0
+    def _refinement_overlap_loss(self, pred, target):
+        """Per-prompt overlap term next to CE: soft Dice (legacy) or Lovász (IoU surrogate)."""
+        if self.config.mask_overlap_loss == 'lovasz':
+            return lovasz_jaccard_loss(pred, target)
+        return self._refinement_dice_loss(pred, target)
 
-        # Векторизованная версия
-        if self.ndim == 2:
-            num_fg = tf.reduce_sum(fg_mask, axis=[1, 2])  # (B,)
-            mean_prob = tf.reduce_sum(prob_on_fg, axis=[1, 2]) / (num_fg + self.epsilon)
-
-            prob_centered = (prob_pred_map - tf.expand_dims(tf.expand_dims(mean_prob, -1), -1)) * fg_mask
-            variance = tf.reduce_sum(tf.square(prob_centered), axis=[1, 2]) / (num_fg + self.epsilon)
-        else:  # 3D
-            num_fg = tf.reduce_sum(fg_mask, axis=[1, 2, 3])
-            mean_prob = tf.reduce_sum(prob_on_fg, axis=[1, 2, 3]) / (num_fg + self.epsilon)
-
-            prob_centered = (
-                prob_pred_map -
-                tf.expand_dims(tf.expand_dims(tf.expand_dims(mean_prob, -1), -1), -1)
-            ) * fg_mask
-            variance = tf.reduce_sum(tf.square(prob_centered), axis=[1, 2, 3]) / (num_fg + self.epsilon)
-
-        # Adaptive threshold по размеру объекта
-        size_factor = tf.minimum(num_fg / 200.0, 1.0)
-        adaptive_threshold = 0.15 - 0.05 * size_factor
-
-        # Penalty за высокую variance
-        penalty = tf.nn.relu(variance - adaptive_threshold)
-
-        # Маска для валидных объектов
-        valid_mask = tf.cast(num_fg >= min_fg_pixels, tf.float32)
-
-        weighted_penalty = penalty * valid_mask
-        num_valid = tf.reduce_sum(valid_mask) + self.epsilon
-
-        return tf.reduce_sum(weighted_penalty) / num_valid
-   # ============================================================
-    # === REFINEMENT BCE LOSS (NEW) ===
-    # ============================================================
     def _refinement_dice_loss(self, pred, target):
         """
-        Soft Dice loss для mask head.
-        Напрямую оптимизирует IoU pixel-wise, заставляет model выдавать
-        полное покрытие клеток (vs BCE которая может выучить только cores).
+        Soft Dice по классу 1 (целевой инстанс), с ОТБРОСОМ пустых сэмплов.
+
+        При target == 0 формула вырождается: dice = 1/(pred_sum+1), и минимум
+        достигается при pred_sum = 0, то есть лосс требует занулить маску по
+        ВСЕМУ патчу. Градиент на воксель мал, но размазан по всей карте и
+        всегда направлен вниз — маска систематически подавляется.
+
+        Пустой таргет возникает штатно: генератор выбирает клетку, у которой
+        в патче нет ядра (обрезана границей тайла), тогда nucleus_target нулевой.
+        На инференсе выход nucleus-рефайна для таких клеток не используется
+        (ветка «клетки без ядер» берёт только cytoplasm_mask), поэтому учить на
+        них нечему — сэмпл просто исключается из среднего.
         """
         pred_squeeze = tf.squeeze(pred, axis=-1)
         target_squeeze = tf.cast(tf.squeeze(target, axis=-1), tf.float32)
 
-        # Per-image Dice (averaging по batch)
-        # Расчёт по spatial dims, leaving batch dim
         spatial_dims = list(range(1, len(pred_squeeze.shape)))
 
         intersection = tf.reduce_sum(pred_squeeze * target_squeeze, axis=spatial_dims)
@@ -956,10 +1049,14 @@ class CytoNucsLoss:
         target_sum = tf.reduce_sum(target_squeeze, axis=spatial_dims)
 
         dice_per_image = (2.0 * intersection + 1.0) / (pred_sum + target_sum + 1.0)
-        loss = 1.0 - tf.reduce_mean(dice_per_image)
 
+        valid = tf.cast(target_sum > 0.5, tf.float32)  # (B,)
+        n_valid = tf.reduce_sum(valid)
+        loss = tf.where(
+            n_valid > 0.5,
+            1.0 - tf.reduce_sum(dice_per_image * valid) / (n_valid + self.epsilon),
+            tf.constant(0.0, tf.float32))
         return loss
-
 
     def _refinement_ce_loss(self, logit, target_fg, inst_any):
         """
@@ -970,41 +1067,41 @@ class CytoNucsLoss:
           class 2 = (*_instances > 0) И НЕ class 1
           class 0 = остальное
 
-        БЕЗ взвешивания классов. Обоснование: фон — лёгкий класс, его CE падает
-        почти до нуля за первые эпохи, после чего лосс определяется путаницей
-        1<->2 на стыке инстансов, то есть ровно тем, что нужно. Плюс рядом
-        стоит soft Dice по классу 1, который смотрит только на передний план и
-        не даёт ему утонуть. Подобранных множителей в схеме нет — это
-        стандартная многоклассовая постановка.
-
-        Возвращает CE. Диагностика долей классов печатается первые шаги: если
-        доля class 1 в предсказании уйдёт в ноль, значит фон всё-таки давит и
-        балансировку придётся вводить — но тогда уже по измерению, а не заранее.
+        mask_ce_class_balance=True усредняет CE внутри каждого присутствующего
+        класса и затем между классами; выбранный объект не теряет вес при
+        росте числа окружающих инстансов. False сохраняет старое усреднение
+        по всем вокселям. Пустые target получают mask_ce_empty_weight.
         """
-        z = tf.cast(logit, tf.float32)                      # (B, ..., 3)
+        z = tf.cast(logit, tf.float32)  # (B, ..., 3)
         c1 = tf.cast(tf.squeeze(target_fg, axis=-1) > 0.5, tf.float32)
         c2 = tf.cast(tf.squeeze(inst_any, axis=-1) > 0.5, tf.float32) * (1.0 - c1)
         c0 = 1.0 - c1 - c2
         labels = tf.stack([c0, c1, c2], axis=-1)
-        if self._debug_count.get('_refine', 0) < 5:
-            self._debug_count['_refine'] = self._debug_count.get('_refine', 0) + 1
-            _p = tf.nn.softmax(z, axis=-1)
-            _n = tf.cast(tf.size(c1), tf.float32)
-            tf.print("    [refine 3cls] GT доли 0/1/2:",
-                     tf.reduce_sum(c0) / _n, tf.reduce_sum(c1) / _n,
-                     tf.reduce_sum(c2) / _n,
-                     " PRED доли:", tf.reduce_mean(_p[..., 0]),
-                     tf.reduce_mean(_p[..., 1]), tf.reduce_mean(_p[..., 2]),
-                     " P(class1) на GT-цели:",
-                     tf.reduce_sum(_p[..., 1] * c1) / (tf.reduce_sum(c1) + self.epsilon),
-                     " на СОСЕДЯХ:",
-                     tf.reduce_sum(_p[..., 1] * c2) / (tf.reduce_sum(c2) + self.epsilon))
-        return tf.reduce_mean(
-            tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=z))
+
+        spatial_dims = list(range(1, len(c1.shape)))
+        valid = tf.cast(tf.reduce_sum(c1, axis=spatial_dims) > 0.5, tf.float32)  # (B,)
+        valid = tf.where(valid > 0, valid, float(getattr(self.config, 'mask_ce_empty_weight', 0.25)))
+        n_valid = tf.reduce_sum(valid)
+
+        ce_per_voxel = tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=z)
+        if self.config.mask_ce_class_balance:
+            # One selected instance must not lose its CE weight as ROI/density grows.
+            # Average within each present class, then across present classes per image.
+            class_count = tf.reduce_sum(labels, axis=spatial_dims)
+            class_loss = tf.math.divide_no_nan(
+                tf.reduce_sum(ce_per_voxel[..., None] * labels, axis=spatial_dims), class_count)
+            ce_per_image = tf.math.divide_no_nan(tf.reduce_sum(class_loss, axis=-1),
+                tf.reduce_sum(tf.cast(class_count > 0, tf.float32), axis=-1))
+        else:
+            ce_per_image = tf.reduce_mean(ce_per_voxel, axis=spatial_dims)
+        return tf.where(
+            n_valid > 0,
+            tf.reduce_sum(ce_per_image * valid) / (n_valid + self.epsilon),
+            tf.constant(0.0, tf.float32))
 
 
 
-def compute_stardist_gt(instances, config, grid, rays=None, aniso=None):
+def compute_stardist_gt(instances, config, grid, rays=None, aniso=None, normalize_prob=False):
     """
     GT prob/dist для ОДНОГО сэмпла. Канон StarDist 3D (model3d.py:86,91):
         prob = edt_prob(lbl, anisotropy=anisotropy)[ss_grid]
@@ -1036,14 +1133,28 @@ def compute_stardist_gt(instances, config, grid, rays=None, aniso=None):
 
     lbl = fill_label_holes(np.asarray(instances).astype(np.int32))
 
+    # Ray targets dominate the CPU cost of a batch; dist_target_stride computes them on every
+    # stride-th node of the head grid (the loss reads the prediction at the same nodes).
+    stride = getattr(config, 'dist_target_stride', None) or (1,) * ndim
+    dist_grid = tuple(g * int(s) for g, s in zip(grid, stride))
     if ndim == 3:
-        dist = star_dist3D(lbl, rays, mode='cpp', grid=grid)
+        dist = star_dist3D(lbl, rays, mode='cpp', grid=dist_grid)
     else:
-        dist = star_dist(lbl, config.n_rays, mode='cpp', grid=grid)
-    dist = np.clip(dist, 1e-3, max_clip).astype(np.float32)
+        dist = star_dist(lbl, config.n_rays, mode='cpp', grid=dist_grid)
+    dist = np.clip(dist, 1e-3, max_clip).astype(np.float16)
 
     ss = tuple(slice(None, None, g) for g in grid)
     prob = edt_prob(lbl, anisotropy=aniso)[ss][..., np.newaxis].astype(np.float32)
+    if normalize_prob:
+        # Full-resolution EDT maxima may fall between grid points. Normalize
+        # per sampled instance, retaining background and relative EDT shape.
+        from scipy.ndimage import maximum
+        sampled = lbl[ss]
+        ids, inverse = np.unique(sampled, return_inverse=True)
+        peaks = np.asarray(maximum(prob[..., 0], labels=sampled, index=ids))
+        peaks[ids == 0] = 1.
+        scales = peaks[inverse].reshape(sampled.shape)
+        prob[..., 0] = np.divide(prob[..., 0], scales, out=np.zeros_like(scales, dtype=np.float32), where=scales > 0)
 
     return prob, dist
 # ============================================================
@@ -1137,3 +1248,185 @@ def compute_nucleus_cell_assignments(nucleus_instances, cytoplasm_instances, max
     assert len(assignments) <= len(nuc_props), f"Assignments overflow!"
 
     return assignments, unassigned, stats
+
+
+def quality_supervision_weights(target, ndim, truncating_axes=None, crop_cut=None):
+    """Exclude potentially truncated positive masks from quality regression only.
+
+    A target touching a crop face that cut its object (the object continues in
+    the source volume) is not evidence of a complete instance. truncating_axes
+    (rows aligned with target, one flag per spatial axis) marks such faces;
+    faces equal to volume faces truncate image and GT identically at inference
+    and stay supervised. None keeps the conservative every-face rule. When no
+    complete positive exists, skip this head's quality update, including
+    negatives, to avoid a negative-only calibration bias. Mask CE/Dice stay active.
+    crop_cut (rows aligned with target) marks voxels of objects the crop cut; when
+    given it replaces the face rule: a target overlapping it is not complete.
+    """
+    target = tf.cast(target > .5, tf.bool)
+    positive = tf.reduce_any(target, axis=list(range(1, ndim+1)))
+    if crop_cut is not None:
+        boundary = tf.reduce_any(target & (tf.cast(crop_cut, tf.int32) > 0), axis=list(range(1, ndim+1)))
+        complete = positive & ~boundary
+        eligible = ~boundary & tf.reduce_any(complete)
+        return tf.cast(eligible, tf.float32), tf.cast(positive, tf.float32)
+    boundary = tf.zeros_like(positive)
+    for axis in range(1, ndim+1):
+        for face in (0, -1):
+            edge = tf.gather(target, face if face == 0 else tf.shape(target)[axis]-1, axis=axis)
+            touches = tf.reduce_any(edge, axis=list(range(1, ndim)))
+            if truncating_axes is not None:
+                touches &= tf.cast(truncating_axes, tf.float32)[:, axis-1] > .5
+            boundary = boundary | touches
+    complete = positive & ~boundary
+    eligible = ~boundary & tf.reduce_any(complete)
+    return tf.cast(eligible, tf.float32), tf.cast(positive, tf.float32)
+
+
+def without_truncated_objects(full_labels, grid_labels, truncating_axes, ndim):
+    """Drop objects cut by an artificial crop face from sampled labels.
+
+    Faces are checked at full resolution (the grid may skip the last row);
+    volume faces (flag 0) keep their objects: inference sees them identically.
+    """
+    def per_image(args):
+        full, sampled, flags = args
+        face = tf.zeros(tf.shape(full), tf.bool)
+        for axis in range(ndim):
+            n = tf.shape(full)[axis]
+            index = tf.reshape(tf.range(n), [-1 if a == axis else 1 for a in range(ndim)])
+            face |= ((index == 0) | (index == n - 1)) & (flags[axis] > .5)
+        cut = tf.unique(tf.boolean_mask(full, face & (full > 0)))[0]
+        drop = tf.reduce_any(tf.equal(sampled[..., None], cut), axis=-1)
+        return tf.where(drop, tf.zeros_like(sampled), sampled)
+    return tf.map_fn(per_image, (tf.cast(full_labels, tf.int32), tf.cast(grid_labels, tf.int32),
+                                 tf.cast(truncating_axes, tf.float32)),
+                     fn_output_signature=tf.int32)
+
+
+def lovasz_jaccard_loss(probability, target):
+    """Lovász-Softmax loss for the target class (Berman et al., 2018), per prompt.
+
+    A convex surrogate of 1 - IoU of the thresholded mask: the sorted absolute errors
+    |target - p| are weighted by the Lovász gradient of the Jaccard index. For a binary
+    prediction it equals 1 - IoU exactly. Like the Dice term, prompts with an empty
+    target are excluded (their CE term still applies); mean over the remaining prompts.
+    """
+    batch = tf.shape(probability)[0]
+    p = tf.reshape(tf.cast(probability, tf.float32), [batch, -1])
+    t = tf.reshape(tf.cast(target > .5, tf.float32), [batch, -1])
+
+    def per_prompt(args):
+        prob, fg = args
+        errors = tf.abs(fg - prob)
+        order = tf.argsort(errors, direction='DESCENDING')
+        errors = tf.gather(errors, order)
+        fg = tf.gather(fg, order)
+        total = tf.reduce_sum(fg)
+        intersection = total - tf.cumsum(fg)
+        union = total + tf.cumsum(1. - fg)
+        jaccard = 1. - intersection / tf.maximum(union, 1e-6)
+        grad = tf.concat([jaccard[:1], jaccard[1:] - jaccard[:-1]], 0)
+        return tf.tensordot(errors, tf.stop_gradient(grad), 1)
+
+    losses = tf.map_fn(per_prompt, (p, t), fn_output_signature=tf.float32)
+    valid = tf.cast(tf.reduce_sum(t, axis=1) > .5, tf.float32)
+    return tf.math.divide_no_nan(tf.reduce_sum(losses * valid), tf.reduce_sum(valid))
+
+
+def without_small_objects(full_labels, grid_labels, min_voxels):
+    """Drop from sampled labels the objects with fewer than min_voxels voxels in the crop.
+
+    Counts are taken at full resolution, the unit of the calibrated inference size gate.
+    """
+    def per_image(args):
+        full, sampled = args
+        ids, index = tf.unique(tf.reshape(full, [-1]))
+        counts = tf.math.unsorted_segment_sum(tf.ones_like(index, tf.float32), index, tf.size(ids))
+        small = tf.boolean_mask(ids, (ids > 0) & (counts < min_voxels))
+        drop = tf.reduce_any(tf.equal(sampled[..., None], small), axis=-1)
+        return tf.where(drop, tf.zeros_like(sampled), sampled)
+    return tf.map_fn(per_image, (tf.cast(full_labels, tf.int32), tf.cast(grid_labels, tf.int32)),
+                     fn_output_signature=tf.int32)
+
+
+def object_peak_probability(probability, target, instances):
+    """BCE of each object's maximum probability against its maximum target, mean over objects.
+
+    Proposals are local maxima: an object is detected only if its peak clears the
+    threshold, while voxel/object-mean BCE can stay low with a flat, subthreshold
+    interior. The target is the object's own maximum soft EDT value (1 with grid
+    normalization), so the soft-target optimum is unchanged. Gradient reaches only
+    the arg-max voxel of each object; background keeps the voxel BCE.
+    """
+    eps = 1e-7
+    def per_image(args):
+        prob, tgt, labels = args
+        ids, segment = tf.unique(tf.reshape(labels, [-1]))
+        n = tf.size(ids)
+        peak = tf.math.unsorted_segment_max(tf.reshape(prob, [-1]), segment, n)
+        wanted = tf.stop_gradient(tf.math.unsorted_segment_max(tf.reshape(tgt, [-1]), segment, n))
+        keep = ids > 0
+        peak = tf.clip_by_value(tf.boolean_mask(peak, keep), eps, 1. - eps)
+        wanted = tf.boolean_mask(wanted, keep)
+        error = -(wanted * tf.math.log(peak) + (1. - wanted) * tf.math.log(1. - peak))
+        return tf.stack([tf.reduce_sum(error), tf.cast(tf.size(error), tf.float32)])
+    rows = tf.map_fn(per_image, (tf.cast(probability, tf.float32), tf.cast(target, tf.float32),
+                                 tf.cast(instances, tf.int32)),
+                     fn_output_signature=tf.TensorSpec([2], tf.float32))
+    totals = tf.reduce_sum(rows, axis=0)
+    return tf.math.divide_no_nan(totals[0], totals[1])
+
+
+def quality_rank_loss(predicted, target, eligible):
+    """Order-consistency of predicted mask quality over all supervised prompts of a batch.
+
+    Object assembly commits masks by predicted quality, so the order matters, not only
+    the absolute value. For every pair with target_i > target_j the predicted gap should
+    be at least the true gap: hinge max(0, (t_i - t_j) - (q_i - q_j)). The margin is
+    the measured quality difference itself, so there is no scale constant. Returns the
+    mean over ordered pairs, the fraction of such pairs already in the right order and
+    the number of pairs (0 pairs: loss and fraction are 0).
+    """
+    q = tf.reshape(tf.cast(predicted, tf.float32), [-1])
+    t = tf.stop_gradient(tf.reshape(tf.cast(target, tf.float32), [-1]))
+    w = tf.reshape(tf.cast(eligible, tf.float32), [-1])
+    gap_t = t[:, None] - t[None, :]
+    gap_q = q[:, None] - q[None, :]
+    pairs = tf.cast(gap_t > 0, tf.float32) * w[:, None] * w[None, :]
+    count = tf.reduce_sum(pairs)
+    loss = tf.math.divide_no_nan(tf.reduce_sum(tf.nn.relu(gap_t - gap_q) * pairs), count)
+    accuracy = tf.math.divide_no_nan(tf.reduce_sum(tf.cast(gap_q > 0, tf.float32) * pairs), count)
+    return loss, tf.stop_gradient(accuracy), tf.stop_gradient(count)
+
+
+def object_balanced_probability(bce, probability, instances):
+    """Mean BCE per sampled GT object, then across objects (not across voxels).
+
+    IDs are local to each image. Sparse IDs never allocate max(label) segments.
+    Background remains supervised by the original voxel BCE. Diagnostics are
+    GT-interior maxima, not local-peak recall or instance matching.
+    """
+    tf.debugging.assert_equal(tf.shape(bce), tf.shape(instances))
+    tf.debugging.assert_equal(tf.shape(probability), tf.shape(instances))
+    def per_image(args):
+        error, prob, labels = args
+        ids, segment = tf.unique(tf.reshape(labels, [-1]))
+        n = tf.size(ids)
+        total = tf.math.unsorted_segment_sum(tf.reshape(error, [-1]), segment, n)
+        count = tf.math.unsorted_segment_sum(tf.ones_like(tf.reshape(error, [-1])), segment, n)
+        foreground = ids > 0
+        means = tf.boolean_mask(tf.math.divide_no_nan(total, count), foreground)
+        maxima = tf.boolean_mask(tf.math.unsorted_segment_max(
+            tf.reshape(tf.stop_gradient(prob), [-1]), segment, n), foreground)
+        return tf.stack([tf.reduce_sum(means), tf.cast(tf.size(means), tf.float32),
+                         tf.reduce_sum(maxima)] + [tf.reduce_sum(tf.cast(maxima > threshold, tf.float32))
+                                                  for threshold in (.2, .3, .4, .5)])
+    rows = tf.map_fn(per_image, (bce, probability, instances),
+                     fn_output_signature=tf.TensorSpec([7], tf.float32))
+    totals = tf.reduce_sum(rows, axis=0)
+    means = tf.math.divide_no_nan(totals, totals[1])
+    monitoring = {'prob_sampled_object_count': totals[1], 'prob_gt_max_mean': means[2]}
+    monitoring.update({'prob_gt_max_above_' + key: means[i+3]
+                       for i, key in enumerate(('020', '030', '040', '050'))})
+    return means[0], {k: tf.stop_gradient(v) for k, v in monitoring.items()}

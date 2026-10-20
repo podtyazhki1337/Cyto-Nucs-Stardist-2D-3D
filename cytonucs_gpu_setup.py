@@ -39,7 +39,7 @@ def setup_gpu(memory_limit=None, allow_growth=True, visible_devices=None):
     try:
         # Configure each GPU
         for gpu in gpus:
-            if allow_growth:
+            if allow_growth and memory_limit is None:
                 # Allow dynamic memory allocation
                 tf.config.experimental.set_memory_growth(gpu, True)
                 print(f"   ✓ Enabled memory growth for {gpu.name}")

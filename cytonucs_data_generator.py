@@ -17,6 +17,67 @@ import random
 import shutil
 from cytonucs_losses import compute_nucleus_cell_assignments, compute_stardist_gt
 
+
+def axial_prompt_centers(owner):
+    """Two interior points on separated occupied Z planes; None for a thin mask."""
+    if owner.ndim != 3:
+        return None
+    zs = np.flatnonzero(np.any(owner, axis=(1, 2)))
+    if len(zs) < 2:
+        return None
+    # Quantiles of occupied planes, not voxel count: thick middle must not
+    # collapse both prompts onto the same plane. For two planes use both.
+    planes = (zs[int(np.floor(.25 * (len(zs)-1)))], zs[int(np.ceil(.75 * (len(zs)-1)))])
+    centers = []
+    for z in planes:
+        points = np.argwhere(owner[z])
+        xy = points[np.argmin(np.sum((points - points.mean(0)) ** 2, axis=1))]
+        centers.append(np.array([z, *xy], np.float32))
+    return centers
+
+
+def nearest_cell_neighbors(labels, anchor, anisotropy):
+    """Distinct cells ordered by physical centroid distance, stable on label ties."""
+    from scipy.ndimage import center_of_mass
+    ids = np.unique(labels)
+    ids = ids[ids > 0]
+    if anchor not in ids:
+        return []
+    centers = np.asarray(center_of_mass(labels > 0, labels, ids))
+    origin = centers[np.flatnonzero(ids == anchor)[0]]
+    distance = np.sum(((centers - origin) * np.asarray(anisotropy)) ** 2, axis=1)
+    return [int(ids[i]) for i in np.lexsort((ids, distance)) if ids[i] != anchor]
+
+
+def project_prompt_center(center, owner, extent):
+    """Keep the positive prompt on its labelled instance, including concave GT."""
+    center = np.asarray(center, np.float32)
+    rounded = np.round(center).astype(int)
+    if np.all(rounded >= 0) and np.all(rounded < owner.shape) and owner[tuple(rounded)]:
+        return center
+    points = np.argwhere(owner)
+    if not len(points):
+        raise ValueError('Positive prompt requires a nonempty owner')
+    distance = np.sum(((points - center) / np.maximum(extent, 1)) ** 2, axis=1)
+    return points[np.argmin(distance)].astype(np.float32)
+
+
+def label_counts(labels):
+    """Voxel count of every label ID (sparse IDs allowed)."""
+    labels = np.asarray(labels)
+    if labels.size and labels.min() >= 0 and labels.max() < 1 << 20:
+        counts = np.bincount(labels.ravel())
+        ids = np.flatnonzero(counts)
+        return dict(zip(ids.tolist(), counts[ids].tolist()))
+    ids, counts = np.unique(labels, return_counts=True)
+    return dict(zip(ids.tolist(), counts.tolist()))
+
+
+def partial_labels(crop, reference):
+    """IDs present in `crop` with fewer voxels than in `reference` (a label_counts dict)."""
+    return {k for k, n in label_counts(crop).items() if k and n < reference.get(k, n)}
+
+
 class CytoNucsDataGenerator(Sequence):
     """
     Data generator for CytoNucs StarDist training.
@@ -68,6 +129,8 @@ class CytoNucsDataGenerator(Sequence):
         self.shuffle = shuffle
         self.subset = subset
         self.counter = 0
+        self.epoch = 0
+        self.seed = int(getattr(config, 'seed', 42))
         self.r = random.Random(42)
 
         def _rd(nm):
@@ -92,11 +155,13 @@ class CytoNucsDataGenerator(Sequence):
             # КРИТИЧНО: добавить все варианты написания расширений
             for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
                 files.extend(list(path.glob(ext)))
-            return sorted(files)
+            return sorted(set(files))
 
         self.image_files = find_all_images(self.dataset_dir / 'images')
         self.nucleus_files = find_all_images(self.dataset_dir / 'nucleus_masks')
         self.cytoplasm_files = find_all_images(self.dataset_dir / 'cytoplasm_masks')
+        if not self.image_files:
+            raise ValueError(f'No images found in {self.dataset_dir / "images"}')
 
         assert len(self.image_files) == len(self.nucleus_files) == len(self.cytoplasm_files), \
             "Mismatch in number of images, nucleus masks, and cytoplasm masks"
@@ -118,17 +183,18 @@ class CytoNucsDataGenerator(Sequence):
                 self.meta = json.load(f)
 
         # Pooling setup (like StarDistSequence)
-        assert pool_size != 0 and repool_freq != 0, "pool_size and repool_freq should not be 0!"
-
-        if pool_size is None:
+        if pool_size is None or pool_size == -1:
             self.pool_size = len(self.image_files)
         else:
-            self.pool_size = pool_size
+            if isinstance(pool_size, bool) or not isinstance(pool_size, (int, np.integer)) or pool_size < 1:
+                raise ValueError('pool_size must be null, -1, or a positive integer')
+            self.pool_size = min(int(pool_size), len(self.image_files))
 
         if repool_freq is None:
-            self.repool_freq = self.pool_size
-        else:
-            self.repool_freq = self.pool_size * repool_freq
+            repool_freq = getattr(config, 'repool_freq', 10)
+        if isinstance(repool_freq, bool) or not isinstance(repool_freq, (int, np.integer)) or repool_freq < 1:
+            raise ValueError('repool_freq must be a positive number of epochs')
+        self.repool_freq = int(repool_freq)
 
         self.data_pool = None
 
@@ -157,9 +223,10 @@ class CytoNucsDataGenerator(Sequence):
         nd = int(self.config.ndim)
         self.data_pool = []
         for idx in pool_ids:
-            img = imageio.volread(self.image_files[idx])
+            from cytonucs_runtime import read_model_image
+            img = read_model_image(self.image_files[idx], nd, self.config.n_channel_in)
             # 3D RGB-стек сохранён как (Z, C, H, W) -> канал в конец (Z, H, W, C)
-            if nd == 3 and img.ndim == 4 and img.shape[1] in (3, 4):
+            if nd == 3 and img.ndim == 4 and img.shape[-1] != self.config.n_channel_in and img.shape[1] == self.config.n_channel_in:
                 img = np.moveaxis(img, 1, -1)
             nucleus_mask = np.asarray(imageio.volread(self.nucleus_files[idx]))
             cytoplasm_mask = np.asarray(imageio.volread(self.cytoplasm_files[idx]))
@@ -217,6 +284,7 @@ class CytoNucsDataGenerator(Sequence):
 
         print(f'  Loaded {len(self.data_pool)} samples into pool '
               f'(нормализовано и проиндексировано один раз)')
+        self._pool_seed = seed
 
     def get_cell_properties(self, prop='cells_median_extent_p'):
         """
@@ -245,34 +313,51 @@ class CytoNucsDataGenerator(Sequence):
         """
         if self.subset == 'train':
             return max(1, int(getattr(self.config, 'train_steps_per_epoch', 1)))
-        return max(1, int(np.ceil(len(self.data_pool) / self.config.train_batch_size)))
+        return max(1, len(self.data_pool))
 
     def __getitem__(self, idx):
         """Кроп СНАЧАЛА, аугментация ПОТОМ — по патчу, а не по полному тому.
-        Изображение приходит из пула уже нормализованным."""
+        Изображение приходит из пула уже нормализованным.
+
+        K ПРОМПТОВ УХОДЯТ В КАНАЛЫ ОДНОГО КРОПА, А НЕ В КОПИИ БАТЧА.
+        Прежняя схема размножала кроп bs раз, то есть платила ПОЛНЫМ форвардом
+        backbone за каждый промпт — именно это не влезало в память, из-за чего
+        bs=1 и рефайн видел один промпт на шаг ("валидных сэмплов: 1 / 1" в
+        логе). Рефайн стоит за stop_gradient по всем входам, поэтому backbone
+        считается один раз, а ветка применяется K раз общими весами.
+
+        K = train_batch_size, ровно как читает модель. Порядок каналов
+        [img..., prompt_nuc_0, prompt_cyto_0, prompt_nuc_1, ...] обязан
+        совпадать с Lambda-срезами в _build_model.
+
+        *_target складываются в батч K*B в порядке k*B + b — так же, как
+        модель склеивает K выходов рефайна.
+        """
         bs = int(self.config.train_batch_size)
         nd = int(self.config.ndim)
         patch = tuple(int(p) for p in self.config.train_patch_size)
         zoom_axes = (1, 2) if nd == 3 else (0, 1)
+        is_train = (self.subset == 'train')
+        n_pr = max(1, int(getattr(self.config, 'prompts_per_crop', bs)))
 
-        # локальный rng и для выбора элементов пула: __getitem__ теперь
-        # вызывается из НЕСКОЛЬКИХ потоков префетчера, глобальный np.random
-        # между ними шарится
-        pick = np.random.default_rng(None if self.subset == 'train' else int(idx))
-        if self.subset == 'train':
-            batch_indices = pick.choice(
-                len(self.data_pool), bs, replace=len(self.data_pool) < bs)
+        # локальный rng: __getitem__ вызывается из НЕСКОЛЬКИХ потоков
+        # префетчера, глобальный np.random между ними шарится
+        pick = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch if is_train else 0, int(idx)]))
+        if is_train:
+            crop_indices = [int(pick.choice(len(self.data_pool))) for _ in range(int(getattr(self.config, 'image_batch_size', 1)))]
         else:
-            batch_indices = self.indices[idx * bs:(idx + 1) * bs]
+            crop_indices = [int(self.indices[int(idx) % max(1, len(self.indices))])]
 
         X_batch = []
         y_batch = {'nucleus_instances': [], 'cytoplasm_instances': []}
+        # k-major: tg_n_k[k][b]
+        tg_n_k = [[] for _ in range(n_pr)]
+        tg_c_k = [[] for _ in range(n_pr)]
 
-        for _pos, i in enumerate(batch_indices):
+        for _ci, i in enumerate(crop_indices):
             # ДЕТЕРМИНИРОВАННЫЙ val: иначе каждая эпоха валидируется на другом
             # кропе с другим промптом, и val_loss мерит дисперсию выборки.
-            rng = (np.random.default_rng() if self.subset == 'train'
-                   else np.random.default_rng(1000 * int(idx) + int(_pos)))
+            rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch if is_train else 0, int(idx), int(_ci), 1]))
 
             sample = self.data_pool[i]
             img_full = sample['image']
@@ -284,13 +369,19 @@ class CytoNucsDataGenerator(Sequence):
             # масштабирования даст patch. Внутри аугментера зум отключён.
             zr = getattr(self.config, 'zoom_range', (0.75, 1.35))
             f = 1.0
-            if (self.subset == 'train' and self.augmenter is not None
+            if (is_train and self.augmenter is not None
                     and zr is not None and rng.random() < 0.5):
                 f = float(rng.uniform(*zr))
+                # Never invent reflected foreground with background labels.
+                f = max(f, max(patch[a] / spatial[a] for a in zoom_axes))
 
             need = list(patch)
-            for a in zoom_axes:
-                need[a] = int(np.ceil(patch[a] / f)) + 2      # запас на округление
+            if f != 1.0:
+                # Rounding margin only for a real zoom: without zoom the +2 margin was
+                # trimmed back by the central crop, so crops at the volume face lost its
+                # outer XY row and objects there were always cut by one voxel in training.
+                for a in zoom_axes:
+                    need[a] = int(np.ceil(patch[a] / f)) + 2
             need = [min(need[a], spatial[a]) for a in range(nd)]
 
             # центр кропа: с вероятностью p_fg на случайном объекте
@@ -309,19 +400,21 @@ class CytoNucsDataGenerator(Sequence):
                     # center — валидный ЦЕНТР патча (канон), не воксель объекта
                     starts.append(max(0, min(int(center[a]) - p // 2, sh - p)))
                 else:
-                    starts.append(
-                        int(
-                            rng.integers(
-                                0,
-                                sh - p + 1
-                            )
-                        )
-                    )
+                    starts.append(int(rng.integers(0, sh - p + 1)))
             sl = tuple(slice(s, s + n) for s, n in zip(starts, need))
 
             img = np.ascontiguousarray(img_full[sl])
             nucleus_mask = np.ascontiguousarray(nuc_full[sl])
             cytoplasm_mask = np.ascontiguousarray(cyto_full[sl])
+            # Objects cut by this crop: fewer voxels than in the source volume. A crop
+            # face lying on the volume face cuts nothing more than inference sees.
+            # IDs survive zoom (order 0), flips and rotations, unlike face positions.
+            counts = sample.setdefault('_label_counts', {})
+            for key, full in (('nucleus_mask', nuc_full), ('cytoplasm_mask', cyto_full)):
+                if key not in counts:
+                    counts[key] = label_counts(full)
+            crop_cut = {'nucleus': partial_labels(nucleus_mask, counts['nucleus_mask']),
+                        'cytoplasm': partial_labels(cytoplasm_mask, counts['cytoplasm_mask'])}
 
             # ZOOM по патчу
             if f != 1.0:
@@ -336,96 +429,205 @@ class CytoNucsDataGenerator(Sequence):
 
             # Аугментация (флипы, транспоз, интенсивность) — уже по патчу
             if self.augmenter is not None:
-                img, nucleus_mask, cytoplasm_mask = self.augmenter(
-                    img, nucleus_mask, cytoplasm_mask)
+                if self.augmenter in (cytonucs_augmenter_3d, cytonucs_augmenter_2d):
+                    img, nucleus_mask, cytoplasm_mask = self.augmenter(
+                        img, nucleus_mask, cytoplasm_mask, rng=rng, config=self.config)
+                else:
+                    img, nucleus_mask, cytoplasm_mask = self.augmenter(img, nucleus_mask, cytoplasm_mask)
 
             # Центральный кроп / паддинг ровно до patch
             cur = img.shape[:nd]
+            # Axes whose patch faces cut objects that continue in the source volume.
+            # A face equal to the volume face (e.g. full Z) truncates GT and image
+            # identically at inference, so it is not artificial. rot90 may swap
+            # the zoom axes, hence one shared flag for them.
+            cut = [need[a] < spatial[a] or cur[a] > patch[a] for a in range(nd)]
+            if any(cut[a] for a in zoom_axes):
+                for a in zoom_axes:
+                    cut[a] = True
             beg = [max(0, (cur[a] - patch[a]) // 2) for a in range(nd)]
-            sl2 = tuple(slice(beg[a], beg[a] + min(cur[a], patch[a])) for a in range(nd))
+            sl2 = tuple(slice(beg[a], beg[a] + min(cur[a], patch[a]))
+                        for a in range(nd))
             img = img[sl2]
+            central = any(cur[a] > patch[a] for a in range(nd))
+            if central:
+                before_central = (label_counts(nucleus_mask), label_counts(cytoplasm_mask))
             nucleus_mask = nucleus_mask[sl2]
             cytoplasm_mask = cytoplasm_mask[sl2]
+            if central:
+                crop_cut['nucleus'] |= partial_labels(nucleus_mask, before_central[0])
+                crop_cut['cytoplasm'] |= partial_labels(cytoplasm_mask, before_central[1])
 
             if any(img.shape[a] < patch[a] for a in range(nd)):
                 pw = [(0, patch[a] - img.shape[a]) for a in range(nd)]
                 pw_img = pw + [(0, 0)] if img.ndim > nd else pw
-                img = np.pad(img, pw_img, mode='reflect')
+                img = np.pad(img, pw_img, mode='constant')
                 nucleus_mask = np.pad(nucleus_mask, pw, mode='constant')
                 cytoplasm_mask = np.pad(cytoplasm_mask, pw, mode='constant')
 
-            def _prompt_at(shape, c, extent, rng=rng):
+            # StarDist GT зависит ТОЛЬКО от масок -> считается один раз на кроп
+            _pn, _dn = compute_stardist_gt(nucleus_mask, self.config,
+                                           self._nuc_grid, rays=self._nuc_rays,
+                                           aniso=self._nuc_aniso,
+                                           normalize_prob=self.config.nucleus_prob_grid_normalize)
+            _pc, _dc = compute_stardist_gt(cytoplasm_mask, self.config,
+                                           self._cyto_grid, rays=self._cyto_rays,
+                                           aniso=self._cyto_aniso)
+
+            img_ch_base = img[..., np.newaxis] if img.ndim == nd else img
+
+            def _prompt_at(shape, c, extent, rng_=rng, augment=True, owner=None):
                 # PROMPT AUGMENTATION. На обучении промпт строится по ТОЧНОМУ
                 # центроиду и bbox GT-инстанса, а на инференсе — по пику NMS с
                 # сигмой из ПРЕДСКАЗАННЫХ лучей. Рефайн, обученный на идеальном
                 # промпте, к этому сдвигу не готов. Шум задаётся в долях размера
                 # объекта, поэтому не зависит от масштаба данных.
-                # Изображение и StarDist-таргеты НЕ трогаются.
                 ext = np.asarray(extent, np.float32)
                 shift = float(getattr(self.config, 'prompt_center_jitter', 0.1))
                 sscale = float(getattr(self.config, 'prompt_sigma_jitter', 0.1))
                 c = np.asarray(c, np.float32)
-                if self.subset == 'train' and shift > 0:
-                    c = c + rng.normal(0.0, shift, size=c.shape).astype(np.float32) * ext
+                if is_train and augment and shift > 0:
+                    c = c + rng_.normal(0.0, shift,
+                                        size=c.shape).astype(np.float32) * ext
+                if self.config.prompt_inside_target and owner is not None:
+                    c = project_prompt_center(c, owner, ext)
                 sig = np.maximum(ext / 4.0, 1.0)
-                if self.subset == 'train' and sscale > 0:
-                    sig = sig * float(rng.uniform(1.0 - sscale, 1.0 + sscale))
-                grids = np.meshgrid(*[np.arange(s, dtype=np.float32) for s in shape],
-                                    indexing='ij')
+                if is_train and augment and sscale > 0:
+                    sig = sig * float(rng_.uniform(1.0 - sscale, 1.0 + sscale))
+                # Open axes: identical values to a full meshgrid, broadcast in the sum.
+                grids = np.ix_(*[np.arange(s, dtype=np.float32) for s in shape])
                 d2 = sum(((g - c[a]) / sig[a]) ** 2 for a, g in enumerate(grids))
                 return np.exp(-0.5 * d2).astype(np.float32)
 
-            # СОГЛАСОВАННАЯ ПАРА: клетка -> одно из ЕЁ ядер
+            # Повторы одной клетки управляются repeat_cell_prompt_prob и дают
+            # пары разных промптов для same-instance consistency.
             _asg = sample.get('assignments') or {}
             cyto_ids = np.unique(cytoplasm_mask)
-            cyto_ids = cyto_ids[cyto_ids > 0]
-            chosen_cyto = int(rng.choice(cyto_ids)) if len(cyto_ids) else 0
-
+            cyto_ids = list(cyto_ids[cyto_ids > 0])
+            if len(cyto_ids) > 1:
+                rng.shuffle(cyto_ids)
             nuc_present = {int(v) for v in np.unique(nucleus_mask) if v > 0}
-            if chosen_cyto:
-                # ядра, НАЗНАЧЕННЫЕ этой клетке и присутствующие в патче
-                nuc_ids = [n for n, c in _asg.items()
-                           if int(c) == chosen_cyto and int(n) in nuc_present]
-                if not nuc_ids:  # фолбэк: перекрытие, как раньше
-                    nuc_ids = [int(v) for v in
-                               np.unique(nucleus_mask[cytoplasm_mask == chosen_cyto])
-                               if v > 0]
-            else:
-                nuc_ids = sorted(nuc_present)
-            chosen_nuc = int(rng.choice(nuc_ids)) if nuc_ids else 0
 
-            tg_n = np.zeros(nucleus_mask.shape, np.float32)
-            tg_c = np.zeros(cytoplasm_mask.shape, np.float32)
-            pr = np.zeros(nucleus_mask.shape, np.float32)
+            # Compute only when enabled; preserve the old RNG sequence at zero.
+            neighbor_ids = []
+            if self.config.neighbor_cell_prompt_prob and len(cyto_ids) > 1:
+                neighbor_ids = nearest_cell_neighbors(cytoplasm_mask, cyto_ids[0],
+                                                       self.config.anisotropy)
+            prompts = []
+            for _pi in range(n_pr):
+                if cyto_ids:
+                    repeat = _pi > 0 and rng.random() < self.config.repeat_cell_prompt_prob
+                    chosen_cyto = int(cyto_ids[0 if repeat else _pi % len(cyto_ids)])
+                    if (_pi > 0 and not repeat and neighbor_ids and
+                            rng.random() < self.config.neighbor_cell_prompt_prob):
+                        chosen_cyto = int(neighbor_ids[(_pi - 1) % len(neighbor_ids)])
+                else:
+                    chosen_cyto = 0
 
-            if chosen_nuc:
-                mn = nucleus_mask == chosen_nuc
-                tg_n[mn] = 1.0
-                pts = np.argwhere(mn)
-                pr = _prompt_at(nucleus_mask.shape, pts.mean(axis=0),
-                                pts.max(axis=0) - pts.min(axis=0) + 1)
-            elif chosen_cyto:
-                pts = np.argwhere(cytoplasm_mask == chosen_cyto)
-                pr = _prompt_at(cytoplasm_mask.shape, pts.mean(axis=0),
-                                pts.max(axis=0) - pts.min(axis=0) + 1)
+                if chosen_cyto:
+                    # ядра, НАЗНАЧЕННЫЕ этой клетке и присутствующие в патче
+                    nuc_ids = [n for n, c in _asg.items()
+                               if int(c) == chosen_cyto and int(n) in nuc_present]
+                    if not nuc_ids:  # фолбэк: перекрытие, как раньше
+                        nuc_ids = [int(v) for v in
+                                   np.unique(nucleus_mask[cytoplasm_mask == chosen_cyto])
+                                   if v > 0]
+                else:
+                    nuc_ids = sorted(nuc_present)
+                chosen_nuc = int(rng.choice(nuc_ids)) if nuc_ids else 0
 
-            if chosen_cyto:
-                tg_c[cytoplasm_mask == chosen_cyto] = 1.0
+                tg_n = np.zeros(nucleus_mask.shape, np.float32)
+                tg_c = np.zeros(cytoplasm_mask.shape, np.float32)
+                pr = np.zeros(nucleus_mask.shape, np.float32)
 
-            img_ch = img[..., np.newaxis] if img.ndim == nd else img
+                if chosen_nuc:
+                    mn = nucleus_mask == chosen_nuc
+                    tg_n[mn] = 1.0
+                    pts = np.argwhere(mn)
+                    pr = _prompt_at(nucleus_mask.shape, pts.mean(axis=0),
+                                    pts.max(axis=0) - pts.min(axis=0) + 1, owner=mn)
+                elif chosen_cyto:
+                    pts = np.argwhere(cytoplasm_mask == chosen_cyto)
+                    pr = _prompt_at(cytoplasm_mask.shape, pts.mean(axis=0),
+                                    pts.max(axis=0) - pts.min(axis=0) + 1, owner=cytoplasm_mask == chosen_cyto)
+
+                if chosen_cyto:
+                    tg_c[cytoplasm_mask == chosen_cyto] = 1.0
+
+                pr_c = pr
+                if chosen_cyto and rng.random() < float(getattr(self.config, 'cyto_center_prompt_prob', 0.25)):
+                    pts = np.argwhere(cytoplasm_mask == chosen_cyto)
+                    pr_c = _prompt_at(cytoplasm_mask.shape, pts.mean(axis=0),
+                                      pts.max(axis=0)-pts.min(axis=0)+1, owner=cytoplasm_mask == chosen_cyto)
+                if is_train and rng.random() < self.config.negative_prompt_prob:
+                    # Like false detector peaks at inference: any non-nuclear voxel
+                    # (background or cytoplasm), nucleus-sized. The nuclear target is
+                    # empty; the cell head still owns the cell containing the prompt.
+                    for _attempt in range(64):
+                        center_neg = tuple(int(rng.integers(s)) for s in nucleus_mask.shape)
+                        if nucleus_mask[center_neg] == 0:
+                            if nuc_present:
+                                sized = np.argwhere(nucleus_mask == int(rng.choice(sorted(nuc_present))))
+                                extent = sized.max(0) - sized.min(0) + 1
+                            else:
+                                extent = np.maximum(np.array(patch) / 8, 1)
+                            pr = _prompt_at(nucleus_mask.shape, center_neg, extent, augment=False)
+                            pr_c = pr
+                            tg_n.fill(0)
+                            cell = int(cytoplasm_mask[center_neg])
+                            tg_c[:] = cytoplasm_mask == cell if cell else 0
+                            break
+                prompts.append((pr, pr_c))
+                tg_n_k[_pi].append(tg_n)
+                tg_c_k[_pi].append(tg_c)
+
+            # Explicit axial pair: both cell prompts supervise the SAME entire
+            # GT object. Keep nuclear prompts/targets independent and intact.
+            z_pair = False
+            if (self.config.cell_z_pair_prob and nd == 3 and n_pr >= 2 and cyto_ids
+                    and rng.random() < self.config.cell_z_pair_prob):
+                owner = cytoplasm_mask == cyto_ids[0]
+                centers = axial_prompt_centers(owner)
+                if centers is not None:
+                    points = np.argwhere(owner)
+                    extent = points.max(0) - points.min(0) + 1
+                    for k, center in enumerate(centers):
+                        prompts[k] = (prompts[k][0], _prompt_at(owner.shape, center, extent,
+                                                               augment=False, owner=owner))
+                        tg_c_k[k][-1] = owner.astype(np.float32)
+                    z_pair = True
+            # The trainer must not replace these paired cell prompts by peaks.
+            y_batch.setdefault('cytoplasm_z_prompt_pair', []).append(z_pair)
+
+            nuclear_z_pair = False
+            if (self.config.nucleus_z_pair_prob and nd == 3 and n_pr >= 2 and nuc_present
+                    and rng.random() < self.config.nucleus_z_pair_prob):
+                # One GT nucleus, never the union of nuclei belonging to a cell.
+                lab = int(rng.choice(sorted(nuc_present)))
+                owner = nucleus_mask == lab
+                centers = axial_prompt_centers(owner)
+                if centers is not None:
+                    points = np.argwhere(owner)
+                    extent = points.max(0) - points.min(0) + 1
+                    for k, center in enumerate(centers):
+                        prompts[k] = (_prompt_at(owner.shape, center, extent,
+                                                 augment=False, owner=owner), prompts[k][1])
+                        tg_n_k[k][-1] = owner.astype(np.float32)
+                    nuclear_z_pair = True
+            y_batch.setdefault('nucleus_z_prompt_pair', []).append(nuclear_z_pair)
+
+            # [img..., pr_nuc_0, pr_cyto_0, pr_nuc_1, pr_cyto_1, ...]
             img_ch = np.concatenate(
-                [img_ch, pr[..., np.newaxis], pr[..., np.newaxis]], axis=-1)
+                [img_ch_base] + [p[..., np.newaxis] for pair in prompts for p in pair],
+                axis=-1)
 
             X_batch.append(img_ch)
             y_batch['nucleus_instances'].append(nucleus_mask)
             y_batch['cytoplasm_instances'].append(cytoplasm_mask)
-            y_batch.setdefault('nucleus_target', []).append(tg_n)
-            y_batch.setdefault('cytoplasm_target', []).append(tg_c)
-
-            _pn, _dn = compute_stardist_gt(nucleus_mask, self.config, self._nuc_grid,
-                                           rays=self._nuc_rays, aniso=self._nuc_aniso)
-            _pc, _dc = compute_stardist_gt(cytoplasm_mask, self.config, self._cyto_grid,
-                                           rays=self._cyto_rays, aniso=self._cyto_aniso)
+            y_batch.setdefault('crop_truncation_axes', []).append(np.asarray(cut, np.float32))
+            for head, labels in (('nucleus', nucleus_mask), ('cytoplasm', cytoplasm_mask)):
+                y_batch.setdefault(head + '_crop_cut', []).append(
+                    np.isin(labels, sorted(crop_cut[head])).astype(np.uint8))
             y_batch.setdefault('nucleus_prob', []).append(_pn)
             y_batch.setdefault('nucleus_dist', []).append(_dn)
             y_batch.setdefault('cytoplasm_prob', []).append(_pc)
@@ -433,9 +635,15 @@ class CytoNucsDataGenerator(Sequence):
 
         X_batch = np.stack(X_batch)
         for _k in ('nucleus_instances', 'cytoplasm_instances',
-                   'nucleus_target', 'cytoplasm_target',
-                   'nucleus_prob', 'nucleus_dist', 'cytoplasm_prob', 'cytoplasm_dist'):
+                   'nucleus_prob', 'nucleus_dist', 'cytoplasm_prob', 'cytoplasm_dist',
+                   'cytoplasm_z_prompt_pair', 'nucleus_z_prompt_pair', 'crop_truncation_axes',
+                   'nucleus_crop_cut', 'cytoplasm_crop_cut'):
             y_batch[_k] = np.stack(y_batch[_k])
+        # k*B + b — порядок, в котором модель склеивает K выходов рефайна
+        y_batch['nucleus_target'] = np.concatenate(
+            [np.stack(v) for v in tg_n_k], axis=0)
+        y_batch['cytoplasm_target'] = np.concatenate(
+            [np.stack(v) for v in tg_c_k], axis=0)
         return X_batch, y_batch
 
     def _visualize_gt_comparison(self, img, nucleus_mask_original, cytoplasm_mask_original,
@@ -609,7 +817,6 @@ class CytoNucsDataGenerator(Sequence):
 
         # Distance distribution comparison
         valid_nuc_orig = nucleus_dist_raw[nucleus_mask_original > 0].flatten()
-        valid_cyto_orig = cytoplasm_dist_raw[cytoplasm_mask_original > 0].flatten()
         valid_cyto_final = cytoplasm_dist_raw[cytoplasm_mask_final > 0].flatten()
 
         axes[2, 3].hist(valid_nuc_orig, bins=50, alpha=0.5, label='Nucleus', color='red')
@@ -632,149 +839,56 @@ class CytoNucsDataGenerator(Sequence):
 
 
     def on_epoch_end(self):
-        """Shuffle data after each epoch"""
-        if self.shuffle:
-            np.random.shuffle(self.indices)
+        # Trainer sets the epoch before creating its prefetch workers.
+        pass
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+        if self.subset == 'train' and self.pool_size < len(self.image_files):
+            # Resume within a pool period must reconstruct the same subset as
+            # uninterrupted training, even when no repool boundary is crossed.
+            pool_epoch = (self.epoch // self.repool_freq) * self.repool_freq
+            pool_seed = self.seed + pool_epoch
+            if getattr(self, '_pool_seed', None) != pool_seed:
+                self.repool(seed=pool_seed)
+                self.indices = np.arange(len(self.data_pool))
 
 
-def cytonucs_augmenter_3d(img, nucleus_mask, cytoplasm_mask):
+def cytonucs_augmenter_3d(img, nucleus_mask, cytoplasm_mask, rng=None, config=None):
+    """Shape-preserving XY and intensity augmentation. Zoom belongs to the cropper."""
+    rng = np.random.default_rng() if rng is None else rng
+    if getattr(config, 'rotation_yx', True) and img.shape[1] == img.shape[2]:
+        k = int(rng.integers(4))
+        img, nucleus_mask, cytoplasm_mask = [np.rot90(a, k, axes=(1, 2))
+                                            for a in (img, nucleus_mask, cytoplasm_mask)]
+    for ax in (1, 2):
+        if rng.random() < float(getattr(config, 'flip_prob', 0.5)):
+            img, nucleus_mask, cytoplasm_mask = [np.flip(a, axis=ax)
+                                                for a in (img, nucleus_mask, cytoplasm_mask)]
+    img = img * rng.uniform(*getattr(config, 'intensity_range', (0.8, 1.2)))
+    img = img + rng.uniform(*getattr(config, 'intensity_offset', (-0.1, 0.1)))
+    gamma = rng.uniform(*getattr(config, 'gamma_range', (0.9, 1.1)))
+    img = np.sign(img) * np.abs(img) ** gamma
+    sigma = float(getattr(config, 'noise_sigma', 0.01))
+    if sigma > 0:
+        img = img + rng.normal(0, sigma, img.shape)
+    blur = getattr(config, 'blur_sigma_range', None)
+    if blur is not None:
+        from scipy.ndimage import gaussian_filter
+        sigma = float(rng.uniform(*blur))
+        img = gaussian_filter(img, (0, sigma, sigma) + ((0,) if img.ndim == 4 else ()))
+    return (np.ascontiguousarray(img, dtype=np.float32),
+            np.ascontiguousarray(nucleus_mask), np.ascontiguousarray(cytoplasm_mask))
+
+
+def cytonucs_augmenter_2d(img, nucleus_mask, cytoplasm_mask, rng=None, config=None):
+    """Use the same local RNG and synchronized augmentation contract as 3D.
+
+    Zoom/crop/padding is performed once by the generator, not a second time here.
     """
-    3D augmentation for CytoNucs training.
-    Applies same spatial transformations to image and both masks.
-    Supports image with optional channel dimension, e.g.:
-        img: (Z, Y, X) or (Z, Y, X, C)
-        masks: (Z, Y, X)
-    """
-    import numpy as np
-
-    # Spatial axes: Z=0, Y=1, X=2
-    axis = (1, 2)  # Y, X axes only
-
-    def transpose_spatial(arr, perm):
-        transpose_axis = list(range(arr.ndim))
-
-        for a, p in zip(axis, perm):
-            if a < arr.ndim and p < arr.ndim:
-                transpose_axis[a] = p
-
-        return arr.transpose(transpose_axis)
-
-    # 1. Random permutation of Y/X axes
-    if np.random.rand() > 0.5:
-        perm = np.random.permutation(axis)
-
-        img = transpose_spatial(img, perm)
-        nucleus_mask = transpose_spatial(nucleus_mask, perm)
-        cytoplasm_mask = transpose_spatial(cytoplasm_mask, perm)
-
-    # 2. Random flips in Y/X
-    for ax in axis:
-        if np.random.rand() > 0.5:
-            img = np.flip(img, axis=ax)
-            nucleus_mask = np.flip(nucleus_mask, axis=ax)
-            cytoplasm_mask = np.flip(cytoplasm_mask, axis=ax)
-    # 2b. Масштабная аугментация в плоскости XY.
-    # Объекты между томами различаются в ~1.4 раза (median_max_ray 29.5 vs 42.2),
-    # и модель, обученная на одном масштабе, на другом промахивается по dist.
-    # Z НЕ масштабируем: при 8-17 срезах интерполяция по Z разрушает объект,
-    # а анизотропия [5,1,1] делает Z-шаг физически крупным.
-    zr = getattr(cytonucs_augmenter_3d, 'zoom_range', (0.75, 1.35))
-    if zr is not None and np.random.rand() < 0.5:
-        from scipy.ndimage import zoom as ndzoom
-        f = float(np.random.uniform(*zr))
-        zf_img = (1.0, f, f) + ((1.0,) if img.ndim == 4 else ())
-        img = ndzoom(img, zf_img, order=1)
-        nucleus_mask = ndzoom(nucleus_mask, (1.0, f, f), order=0)  # nearest: id не мешать
-        cytoplasm_mask = ndzoom(cytoplasm_mask, (1.0, f, f), order=0)
-    # 3. Intensity augmentation only for image
-    img = img * np.random.uniform(0.6, 2.0) + np.random.uniform(-0.2, 0.2)
-
-    # 4. Gamma correction
-    gamma = np.random.uniform(0.9, 1.1)
-    img = np.sign(img) * (np.abs(img) ** gamma)
-
-    # 5. Gaussian noise
-    img = img + np.random.normal(loc=0.0, scale=0.01, size=img.shape)
-
-    # Important after np.flip / transpose: avoid negative strides for torch
-    img = np.ascontiguousarray(img)
-    nucleus_mask = np.ascontiguousarray(nucleus_mask)
-    cytoplasm_mask = np.ascontiguousarray(cytoplasm_mask)
-
-    return img, nucleus_mask, cytoplasm_mask
-
-
-def cytonucs_augmenter_2d(img, nucleus_mask, cytoplasm_mask):
-    """
-    2D augmentation for CytoNucs training.
-    """
-    from skimage.transform import rotate, rescale
-    import numpy as np
-
-    # 1. Random flip
-    if np.random.rand() > 0.5:
-        img = np.fliplr(img)
-        nucleus_mask = np.fliplr(nucleus_mask)
-        cytoplasm_mask = np.fliplr(cytoplasm_mask)
-    if np.random.rand() > 0.5:
-        img = np.flipud(img)
-        nucleus_mask = np.flipud(nucleus_mask)
-        cytoplasm_mask = np.flipud(cytoplasm_mask)
-
-    # 2. Random rotation
-    angle = np.random.uniform(-180, 180)
-    # ИСПРАВЛЕНО: принудительно приводим маски к int после ротации
-    img = rotate(img, angle, order=1, preserve_range=True, resize=False)
-    nucleus_mask = rotate(nucleus_mask, angle, order=0, preserve_range=True, resize=False).astype(nucleus_mask.dtype)
-    cytoplasm_mask = rotate(cytoplasm_mask, angle, order=0, preserve_range=True, resize=False).astype(
-        cytoplasm_mask.dtype)
-
-    # 3. Intensity augmentation
-    img = img * np.random.uniform(0.6, 2.0) + np.random.uniform(-0.2, 0.2)
-
-    # 4. Gamma
-    gamma = np.random.uniform(0.9, 1.1)
-    img = np.clip(img, 0, None) ** gamma
-
-    # 5. Noise
-    noise = np.random.normal(0, 0.01, img.shape)
-    img = np.clip(img + noise, 0, None)
-
-    # 6. Zoom
-    if np.random.rand() > 0.5:
-        scale_factor = np.random.uniform(0.9, 1.1)
-
-        img_scaled = rescale(img, scale_factor, order=1, preserve_range=True, anti_aliasing=True,
-                             channel_axis=-1 if img.ndim == 3 else None)
-        # ИСПРАВЛЕНО: принудительно приводим маски к int после масштабирования
-        nucleus_scaled = rescale(nucleus_mask, scale_factor, order=0, preserve_range=True, anti_aliasing=False).astype(
-            nucleus_mask.dtype)
-        cytoplasm_scaled = rescale(cytoplasm_mask, scale_factor, order=0, preserve_range=True,
-                                   anti_aliasing=False).astype(cytoplasm_mask.dtype)
-
-        # Crop or pad to original size
-        h, w = img.shape[:2]
-        h_s, w_s = img_scaled.shape[:2]
-
-        if h_s >= h and w_s >= w:
-            start_h, start_w = (h_s - h) // 2, (w_s - w) // 2
-            img, nucleus_mask, cytoplasm_mask = img_scaled[start_h:start_h + h, start_w:start_w + w], nucleus_scaled[
-                                                                                                      start_h:start_h + h,
-                                                                                                      start_w:start_w + w], cytoplasm_scaled[
-                                                                                                                            start_h:start_h + h,
-                                                                                                                            start_w:start_w + w]
-        else:
-            pad_h, pad_w = (h - h_s) // 2, (w - w_s) // 2
-            pad_h_rem, pad_w_rem = h - h_s - pad_h, w - w_s - pad_w
-            padding_mask = ((pad_h, pad_h_rem), (pad_w, pad_w_rem))
-            padding_img = padding_mask + ((0, 0),) if img.ndim == 3 else padding_mask
-
-            img = np.pad(img_scaled, padding_img, mode='reflect')
-            nucleus_mask = np.pad(nucleus_scaled, padding_mask, mode='constant')
-            cytoplasm_mask = np.pad(cytoplasm_scaled, padding_mask, mode='constant')
-
-
-    return img, nucleus_mask.astype(np.int32), cytoplasm_mask.astype(np.int32)
+    result = cytonucs_augmenter_3d(img[None], nucleus_mask[None], cytoplasm_mask[None],
+                                 rng=rng, config=config)
+    return tuple(a[0] for a in result)
 
 
 def prepare_cytonucs_dataset(
@@ -846,48 +960,30 @@ def prepare_cytonucs_dataset(
 
         return img
 
-    def save_image_smart(img, filepath):
-        """
-        Умное сохранение: определяет тип и использует правильный метод.
-        Типы:
-        - 2D grayscale: (H, W)            → imwrite uint16
-        - 2D RGB:       (H, W, 3)         → imwrite uint8
-        - 3D grayscale: (Z, H, W)         → tifffile ZYX uint16
-        - 3D RGB-стек:  (Z, H, W, 3)      → tifffile ZYXC, каналы сохраняются
+    def save_image_smart(img, filepath, is_mask=False):
+        """Пишем тем же форматом, что и исходники: обычный многостраничный
+        TIFF без ImageJ-заголовка. Исходные стеки — (Z,Y,X,3) uint8,
+        photometric=RGB, is_imagej=False; Fiji читает их без проблем.
+        Ни metadata={'axes':...}, ни imagej=True тут не нужны: первое
+        подменяет ImageDescription своим JSON, второе перекладывает RGB
+        в ZCYX-гиперстек и меняет глубину на 16 бит.
         """
         import tifffile
         filepath = str(filepath)
+        img = np.asarray(img)
+
+        if is_mask:
+            tifffile.imwrite(filepath, img, photometric='minisblack')
+            return
 
         if img.ndim == 2:
-            # 2D grayscale
-            imageio.imwrite(filepath, img.astype(np.uint16))
-
+            tifffile.imwrite(filepath, img)
         elif img.ndim == 3 and img.shape[-1] in (3, 4):
-            # 2D RGB/RGBA
-            imageio.imwrite(filepath, img[..., :3].astype(np.uint8))
-
-
+            tifffile.imwrite(filepath, img[..., :3])
         elif img.ndim == 3:
-
-            # 3D grayscale (Z, H, W)
-
-            tifffile.imwrite(filepath, img.astype(np.uint16),
-
-                             metadata={'axes': 'ZYX'})
-
-
+            tifffile.imwrite(filepath, img)
         elif img.ndim == 4 and img.shape[-1] in (3, 4):
-
-            # 3D RGB/RGBA стек (Z, H, W, C). ImageJ требует канал перед YX (TZCYXS),
-
-            # поэтому пишем без imagej-режима, оси ZCYX (канал отдельным измерением).
-
-            c = min(img.shape[-1], 3)
-
-            arr = np.moveaxis(img[..., :c], -1, 1).astype(np.uint16)  # (Z,H,W,C) -> (Z,C,H,W)
-
-            tifffile.imwrite(filepath, arr, metadata={'axes': 'ZCYX'})
-
+            tifffile.imwrite(filepath, img[..., :3])
         else:
             raise ValueError(f"Unexpected image shape: {img.shape}")
 
@@ -920,7 +1016,7 @@ def prepare_cytonucs_dataset(
             files = []
             for ext in extensions:
                 files.extend(list(directory.glob(ext)))
-            return sorted(files)
+            return sorted(set(files))
 
     # ========== Поиск и валидация ==========
 
@@ -995,7 +1091,7 @@ def prepare_cytonucs_dataset(
             if img.ndim == 3 and img.shape[-1] == 3:
                 ndim = 2  # 2D RGB
             else:
-                ndim = img.ndim
+                ndim = img.ndim - (1 if img.ndim == 4 and img.shape[-1] in (3,4) else 0)
 
             print(f"    Detected: {ndim}D, img shape {img.shape}")
 
@@ -1069,11 +1165,11 @@ def prepare_cytonucs_dataset(
             )
             save_image_smart(
                 nucleus_mask,
-                output_dir / subset_name / 'nucleus_masks' / output_filename
+                output_dir / subset_name / 'nucleus_masks' / output_filename, is_mask=True
             )
             save_image_smart(
                 cytoplasm_mask,
-                output_dir / subset_name / 'cytoplasm_masks' / output_filename
+                output_dir / subset_name / 'cytoplasm_masks' / output_filename, is_mask=True
             )
 
             # Assignments
