@@ -147,7 +147,8 @@
     "nms_border_exclude_xy": 2,
     "residual_proposals": false,
     "refinement_roi_snap": false,
-    "tta_flips": false
+    "tta_flips": false,
+    "refinement_batch": 0
   },
   "loss_weights": {
     "lambda_prob_nucleus": 1.0,

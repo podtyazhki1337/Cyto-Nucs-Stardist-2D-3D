@@ -58,7 +58,7 @@ class CytoNucsConfig:
                           mask_overlap_cytoplasm=0.0, mask_assembly_nucleus='voxel',
                           mask_assembly_cytoplasm='voxel', mask_min_remaining_fraction=0.5,
                           nms_candidate_spacing=0.12, nms_border_exclude_xy=2,
-                          residual_proposals=False, refinement_roi_snap=False, tta_flips=False),
+                          residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -487,6 +487,8 @@ class CytoNucsConfig:
                     raise ValueError(f'train patch/head grid must be divisible by the refiner pooling {factors}')
         from cytonucs_geometry import architecture_plan
         architecture_plan(self)
+        if isinstance(self.refinement_batch, bool) or not isinstance(self.refinement_batch, (int, np.integer)) or self.refinement_batch < 0:
+            raise ValueError(f'refinement_batch must be a nonnegative integer, got {self.refinement_batch!r}')
         for key in ('image_batch_size', 'prompts_per_crop', 'log_every_steps',
                     'prefetch_workers', 'prefetch_depth', 'refine_feature_cache_windows', 'predicted_prompt_start_epoch'):
             value = getattr(self, key)
