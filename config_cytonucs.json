@@ -151,7 +151,9 @@
     "tta_flips": false,
     "refinement_batch": 0,
     "refinement_windows": false,
-    "max_prompts_per_head": 0
+    "max_prompts_per_head": 0,
+    "skip_covered_prompts": false,
+    "refinement_roi_stride": 0
   },
   "loss_weights": {
     "lambda_prob_nucleus": 1.0,

@@ -3,7 +3,7 @@ import contextlib
 import io
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 import tensorflow as tf
 from test_fixes import config
@@ -208,10 +208,82 @@ class BatchedRefinementTests(unittest.TestCase):
         self.assertEqual(kept, sorted(tuple(int(v) for v in self.nuclei[i]) for i in (0, 2)))
         self.assertEqual(model.last_refinement_diagnostics['nucleus']['prompts_capped'], 2)
 
+    def test_skipping_covered_prompts_drops_a_second_peak_on_an_object(self):
+        # A second, weaker peak next to the first nucleus: its centre lies inside the first one's polygon and mask.
+        # Refined, it is a duplicate object; skipped, the result is that of the image without it.
+        cfg = config(**BASE)
+
+        def run(nuclei, skip):
+            cfg.refinement_batch, cfg.skip_covered_prompts = 4, skip
+            model, sink = SimpleNamespace(), {}
+            runners = self.coarse_runners()
+            with patch.object(inference, '_refinement_runners', return_value=runners[:2]), \
+                    patch.object(inference, '_cytoplasm_refinement_runner', return_value=runners[3]):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    out = inference.predict_instances_prompted(
+                        model, cfg, np.zeros(SHAPE + (1,), np.float32), nuclei, np.linspace(.9, .5, len(nuclei)),
+                        self.cells, np.ones(len(self.cells)), nuc_dists=np.full((len(nuclei), 12), 2.5),
+                        nuc_labels=point_labels(nuclei), cyto_labels=point_labels(self.cells), verbose=False,
+                        candidate_sink=sink, mask_thresh=.45)
+            return out, model.last_refinement_diagnostics
+
+        with_peak = np.vstack([self.nuclei, [[4, 9, 9]]])
+        (n0, c0, p0), d0 = run(self.nuclei, False)
+        (n1, _, _), d1 = run(with_peak, False)
+        (n2, c2, p2), d2 = run(with_peak, True)
+        self.assertEqual(len(np.unique(n1)), len(self.nuclei) + 2)               # the duplicate
+        np.testing.assert_array_equal(n0, n2); np.testing.assert_array_equal(c0, c2)
+        self.assertEqual(p0, p2)
+        self.assertEqual((d1['nucleus']['prompts_skipped'], d2['nucleus']['prompts_skipped']), (0, 1))
+        self.assertEqual(d2['nucleus']['attempted'], d0['nucleus']['attempted'])
+
+    def test_first_round_leaves_out_prompts_inside_a_polygon(self):
+        rays = SimpleNamespace(vertices=np.array([[0., 1.], [1., 0.], [0., -1.], [-1., 0.]]))
+        jobs = [('nucleus', (10, 10), np.full(4, 5.)), ('nucleus', (10, 13), np.full(4, 5.)),
+                ('nucleus', (10, 30), np.full(4, 5.)), ('cytoplasm', (10, 11), np.full(4, 5.))]
+        first = inference._first_round_prompts(jobs, [.9, .8, .7, .6], lambda head: rays)
+        self.assertEqual(first, [0, 2, 3])            # 1 lies in 0's polygon; 3 is another head
+        self.assertEqual(inference._first_round_prompts(jobs, [.5, .8, .7, .6], lambda head: rays), [1, 2, 3])
+
+    def test_roi_stride_shares_rois_on_a_grid(self):
+        cfg = config(**BASE)
+        nuclei = np.array([[4, 6, 6], [4, 6, 11], [4, 11, 6], [4, 30, 30], [4, 30, 34]])      # two grid ROIs
+
+        def run(stride):
+            cfg.refinement_batch, cfg.refinement_roi_stride = 4, stride
+            model, audit, inputs = SimpleNamespace(), {h: MagicMock() for h in ('nucleus', 'cytoplasm')}, []
+            runners = self.coarse_runners()
+            features = lambda x: (inputs.append(tuple(x.shape)), [x] * 7)[1]
+            with patch.object(inference, '_refinement_runners', return_value=(features, runners[1])), \
+                    patch.object(inference, '_cytoplasm_refinement_runner', return_value=runners[3]):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    out = inference.predict_instances_prompted(
+                        model, cfg, np.zeros(SHAPE + (1,), np.float32), nuclei, np.ones(len(nuclei)),
+                        nuc_dists=np.full((len(nuclei), 12), 2.5), nuc_labels=point_labels(nuclei),
+                        verbose=False, stage_audit=audit, mask_thresh=.45)
+            origins = [tuple(c.args[0]) for c in audit['nucleus'].record_roi.call_args_list]
+            return out, origins, len(inputs)
+
+        (n0, _, _), origins0, forwards0 = run(0)
+        (n1, _, _), origins1, forwards1 = run([8, 8, 8])
+        # Same objects (the toy masks differ in size: the head grid sits at other ROI offsets).
+        for n in (n0, n1):
+            self.assertEqual(len(np.unique(n)), len(nuclei) + 1)
+            self.assertEqual(len({int(n[tuple(c)]) for c in nuclei} - {0}), len(nuclei))
+        self.assertTrue(all(o[1] % 8 == 0 and o[2] % 8 == 0 for o in origins1))
+        self.assertEqual(len(set(origins1)), 2)                    # prompts share grid ROIs
+        self.assertEqual(len(set(origins0)), len(nuclei))
+        self.assertLess(forwards1, forwards0)
+        for bad in (-8, True, 8.5, [8, 8], [8, 0, 8]):
+            with self.assertRaises(ValueError):
+                config(refinement_roi_stride=bad, **BASE)
+
     def test_setting_is_validated(self):
         for bad in (-1, True, 1.5):
             with self.assertRaises(ValueError):
                 config(refinement_batch=bad, **BASE)
+        with self.assertRaises(ValueError):
+            config(skip_covered_prompts=1, **BASE)
 
 
 if __name__ == '__main__':

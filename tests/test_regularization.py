@@ -20,7 +20,7 @@ from test_levels import dataset, tensors
 
 NEW = {('training', 'init_weights'): None, ('training', 'weight_decay'): 0.0, ('augmentation', 'elastic_prob'): 0.0,
        ('augmentation', 'elastic_alpha'): 0.0, ('augmentation', 'elastic_sigma'): 8.0, ('training', 'ema_decay'): 0.0,
-       ('training', 'extra_train_dirs'): [], ('training', 'extra_train_share'): 0.0, ('inference', 'tta_flips'): False, ('inference', 'refinement_batch'): 0, ('inference', 'refinement_windows'): False, ('inference', 'max_prompts_per_head'): 0,
+       ('training', 'extra_train_dirs'): [], ('training', 'extra_train_share'): 0.0, ('inference', 'tta_flips'): False, ('inference', 'refinement_batch'): 0, ('inference', 'refinement_windows'): False, ('inference', 'max_prompts_per_head'): 0, ('inference', 'skip_covered_prompts'): False, ('inference', 'refinement_roi_stride'): 0,
        ('training', 'val_loss_every_n_epochs'): 1,
        ('augmentation', 'prompt_uniform_prob'): 0.0, ('loss_params', 'dist_polar_iou_weight'): 0.0, ('loss_params', 'prob_iou_aware'): 0.0,
        ('augmentation', 'zoom_z_range'): None, ('augmentation', 'flip_z_prob'): 0.0, ('augmentation', 'saturation_prob'): 0.0}
@@ -39,7 +39,7 @@ class SettingTests(unittest.TestCase):
         for key, bad in (('init_weights', ''), ('init_weights', 3), ('weight_decay', -1.), ('elastic_prob', 1.5),
                          ('elastic_alpha', -2.), ('elastic_sigma', 0.), ('elastic_sigma', True), ('ema_decay', 1.),
                          ('ema_decay', -.1), ('extra_train_dirs', 'data'), ('extra_train_dirs', [3]),
-                         ('extra_train_share', 1.5), ('extra_train_share', .5), ('tta_flips', 1), ('refinement_batch', -1), ('refinement_batch', True), ('refinement_windows', 1), ('max_prompts_per_head', -1), ('max_prompts_per_head', True),
+                         ('extra_train_share', 1.5), ('extra_train_share', .5), ('tta_flips', 1), ('refinement_batch', -1), ('refinement_batch', True), ('refinement_windows', 1), ('max_prompts_per_head', -1), ('max_prompts_per_head', True), ('skip_covered_prompts', 1),
                          ('val_loss_every_n_epochs', 0), ('val_loss_every_n_epochs', True),
                          ('prompt_uniform_prob', 1.5), ('prompt_uniform_prob', -.1), ('dist_polar_iou_weight', -1.), ('prob_iou_aware', -1.),
                          ('zoom_z_range', [1.2, .8]), ('zoom_z_range', [0, 1]), ('zoom_z_range', 1.1),

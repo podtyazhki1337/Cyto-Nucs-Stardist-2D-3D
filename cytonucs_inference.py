@@ -24,6 +24,29 @@ def _refinement_runners(model):
     return model._compiled_refinement_runners
 
 
+def _first_round_prompts(jobs, scores, rays_of):
+    """First refinement round of inference.skip_covered_prompts: in order of detection score, a prompt
+    (head, centre, distances) joins unless its centre lies inside the StarDist polygon of a prompt of
+    the same head that joined before (ray nearest in direction to the centre). Indices, sorted."""
+    first, centres, offsets = [], {}, {}
+    for i in sorted(range(len(jobs)), key=lambda i: -float(scores[i])):
+        head, ctr, d = jobs[i]
+        ctr = np.asarray(ctr, np.float64)
+        if head in centres:
+            v = ctr - np.asarray(centres[head])                                    # (K, nd)
+            rays = np.asarray(offsets[head])                                       # (K, R, nd)
+            length = np.linalg.norm(rays, axis=-1)
+            cosine = np.einsum('krd,kd->kr', rays, v) / np.maximum(length, 1e-9)
+            nearest = np.take_along_axis(length, np.argmax(cosine, axis=1)[:, None], 1)[:, 0]
+            if np.any(np.linalg.norm(v, axis=1) <= nearest):
+                continue
+        first.append(i)
+        if d is not None:
+            centres.setdefault(head, []).append(ctr)
+            offsets.setdefault(head, []).append(np.asarray(rays_of(head).vertices) * np.maximum(d, 1e-3)[:, None])
+    return sorted(first)
+
+
 def _fine_refinement_runners(model):
     """Runners of the full-resolution variant: backbone features, full-resolution features,
     refinement with projected features, cell refinement, and the fine head per head."""
@@ -319,13 +342,16 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     multiple = architecture_plan(config)['input_multiple']
     feature_cache = OrderedDict()
     cache_limit = max(1, int(getattr(config, 'refine_feature_cache_windows', 1)))
+    roi_stride = getattr(config, 'refinement_roi_stride', None)
+    roi_stride = (None if not roi_stride else
+                  np.array([max(1, int(round(t))) for t in (roi_stride if np.ndim(roi_stride) else [roi_stride] * nd)]))
     runs = feature_runs = 0
     nuc_candidates, cell_candidates, evidence = [], [], []
     diagnostics = {h: dict(attempted=0, empty_threshold=0, missing_component=0,
                           nonfinite=0, quality_nonfinite=0, quality_rejected=0, accepted=0, quality=[],
                           roi_expansions=0, roi_boundary_remaining=0,
                           residual_peaks=0, residual_prompts=0, area_gate_removed=0,
-                          windowed=0, window_fallbacks=0, prompts_capped=0)
+                          windowed=0, window_fallbacks=0, prompts_capped=0, prompts_skipped=0)
                    for h in ('nucleus', 'cytoplasm')}
     if config.mask_quality_min == 'auto':
         quality_min = {h: float((quality_gates or {}).get(h, 0.0)) for h in ('nucleus', 'cytoplasm')}
@@ -368,9 +394,17 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             vertices = np.asarray(rays.vertices) * np.maximum(distances, 1e-3)[:, None]
             # Centre the ROI on the prompt and include both extreme sides with margin.
             extent = np.ceil(3 * np.max(np.abs(vertices), axis=0)).astype(int)
+            if roi_stride is not None:
+                extent = -(-extent // roi_stride) * roi_stride        # a few ROI shapes
             run_shape = tuple(min(s, max(b, int(e))) for s, b, e in zip(shape, base_shape, extent))
         origin = tuple(max(0, min(int(c)-s//2, n-s)) for c, s, n in zip(center, run_shape, shape))
-        if config.refinement_roi_snap:
+        if roi_stride is not None:
+            # inference.refinement_roi_stride: origins on a fixed grid, the prompt at most half a stride off the
+            # ROI centre; prompts then share overlapping ROIs of the training crop size (backbone features
+            # computed once per ROI, GroupNorm statistics as in training).
+            origin = tuple(max(0, min(int(round((c - s / 2) / t)) * t, n - s))
+                           for c, s, t, n in zip(center, run_shape, roi_stride, shape))
+        elif config.refinement_roi_snap:
             # Snap to the network input multiple: prompts of one volume then share a few
             # windows, so backbone features are reused; the prompt moves off the ROI centre
             # by at most half a step.
@@ -873,9 +907,32 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     jobs = [job[:3] for job in anchored]
     results = [None] * len(jobs)
     if batched:
-        for index, ((head, ctr, d), (n, c)) in enumerate(zip(jobs, run_batched([(head, ctr, d, None, None, 0)
-                                                                                  for head, ctr, d in jobs]))):
-            results[index] = (n if head == 'nucleus' else None, c)
+        rounds = [list(range(len(jobs)))]
+        if getattr(config, 'skip_covered_prompts', False):
+            # Two rounds: the second skips prompts whose centre a first-round candidate of the same head already
+            # covers (it passed the quality gate), i.e. a second prompt on a found object.
+            first = _first_round_prompts(jobs, [job[3] for job in anchored],
+                                         lambda head: getattr(config, f'rays_{head}', config.rays))
+            rounds = [first, sorted(set(rounds[0]) - set(first))]
+        for r, ids in enumerate(rounds):
+            if r:
+                covered = {h: np.zeros(shape, bool) for h in ('nucleus', 'cytoplasm')}
+                for i in rounds[0]:
+                    for h, candidate in zip(('nucleus', 'cytoplasm'), results[i]):
+                        if candidate is not None:
+                            sl = tuple(slice(int(a), int(a) + m) for a, m in zip(candidate['lo'], candidate['mask'].shape))
+                            covered[h][sl] |= candidate['mask']
+                kept = []
+                for i in ids:
+                    head, ctr = jobs[i][:2]
+                    if covered[head][tuple(np.clip(np.round(ctr).astype(int), 0, np.array(shape) - 1))]:
+                        results[i] = (None, None)
+                        diagnostics[head]['prompts_skipped'] += 1
+                    else:
+                        kept.append(i)
+                ids = kept
+            for i, (n, c) in zip(ids, run_batched([(*jobs[i], None, None, 0) for i in ids])):
+                results[i] = (n if jobs[i][0] == 'nucleus' else None, c)
     else:
         # Group by full ROI (origin AND shape), retaining original candidate indices.
         roi_jobs = [(head, roi_for(ctr, d, head), (ctr, d)) for head, ctr, d in jobs]
