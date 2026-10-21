@@ -93,6 +93,7 @@ class PipelineReviewTests(unittest.TestCase):
         self.assertEqual(h['fullval_metric'], [.2, .4])
         self.assertEqual(h['fullval_new'], [7, None])
         self.assertEqual(align_training_history({}, 4)['lr'], [None] * 4)
+        self.assertEqual(align_training_history({'trainable_parameters': 7, 'lr': [1.]}, 2)['trainable_parameters'], 7)
         self.assertEqual(restored_best_metric(h, .7), .7)
         self.assertEqual(restored_best_metric({'fullval_metric': [None, .8]}, .7), .8)
 

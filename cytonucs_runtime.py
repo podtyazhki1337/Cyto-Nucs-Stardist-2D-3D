@@ -19,7 +19,9 @@ def align_training_history(history, completed_epochs):
     full_epochs = history.get('fullval_epoch', [])
     keep = [i for i, e in enumerate(full_epochs) if e is not None and e <= n]
     for key, values in history.items():
-        if key.startswith('fullval_'):
+        if not isinstance(values, list):                 # run facts (e.g. trainable_parameters), not per epoch
+            result[key] = values
+        elif key.startswith('fullval_'):
             result[key] = [values[i] if i < len(values) else None for i in keep]
         else:
             result[key] = list(values[:n]) + [None] * max(0, n - len(values))

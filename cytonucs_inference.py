@@ -100,14 +100,20 @@ def _place_window(start, stop, size, net_shape, grid):
 
 
 def _window_size(extent, net_shape, grid):
-    """Window size of a fine-head call: per axis the smallest 16 * g * 2^k covering the extent, at most the
-    network input. Few distinct static shapes keep the compiled calls (and cuDNN's choices) reusable."""
+    """Window size of a fine-head call: per axis the smallest of 16 g * (1, 1.5, 2, 3, 4, 6, ...) covering the
+    extent, at most the network input. Few distinct static shapes keep the compiled calls (and cuDNN's
+    choices) reusable; when that more than doubles the window's volume (large 3D windows: memory), each axis
+    is only rounded up to a multiple of 8 g."""
     size = []
     for e, n, g in zip(extent, net_shape, grid):
-        w = 16 * g
+        w, step = 16 * g, 0
         while w < e:
-            w *= 2
-        size.append(min(int(n), w))
+            w = 16 * g * (2 ** ((step + 1) // 2)) * (1.5 if step % 2 == 0 else 1)
+            w = int(-(-w // g) * g)
+            step += 1
+        size.append(min(int(n), int(w)))
+    if np.prod(size) > 2 * np.prod([max(int(e), 1) for e in extent]):
+        size = [min(int(n), int(-(-int(e) // (8 * g)) * 8 * g)) for e, n, g in zip(extent, net_shape, grid)]
     return tuple(size)
 
 
