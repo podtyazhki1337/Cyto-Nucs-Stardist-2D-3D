@@ -71,12 +71,14 @@ class HostMemoryTests(unittest.TestCase):
                          ('04_small.sh', {}))
         self.assertEqual(choose(['04_small.sh'], NEEDS, [held('1', 1)] * 6, {}, '1', 'light', ram_needs=ram), (None, {}))
 
-    def test_a_job_starved_of_host_memory_is_the_only_one_that_may_start(self):
+    def test_a_job_starved_of_host_memory_keeps_a_gpu_it_fits(self):
         ram = {'01_big.sh': 40, '02_mid.sh': 20, '03_small.sh': 30, '04_small.sh': 5}
-        held_ram = [dict(gpu='1', gb=4, ram=45)]
+        held_ram = [dict(gpu='1', gb=4, ram=45, slot='heavy')]             # 25 GB host memory left
         waited = {'01_big.sh': 25.0}
+        # GPU 0 could take 01 but host memory cannot: GPU 0 waits for it
         self.assertEqual(choose(JOBS, NEEDS, held_ram, {}, '0', 'heavy', waited, ram_needs=ram), (None, {}))
-        self.assertEqual(choose(JOBS, NEEDS, held_ram, {}, '1', 'light', waited, ram_needs=ram), (None, {}))
+        # 01 does not fit GPU 1 (4 + 23 GB): GPU 1 goes on with work that fits
+        self.assertEqual(choose(JOBS, NEEDS, held_ram, {}, '1', 'light', waited, ram_needs=ram), ('04_small.sh', {}))
         self.assertEqual(choose(JOBS, NEEDS, [], {}, '0', 'heavy', waited, ram_needs=ram), ('01_big.sh', {}))
 
     def test_declaration_pick_and_setram(self):

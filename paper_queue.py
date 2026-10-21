@@ -10,8 +10,8 @@ Slots (queue_slot.sh) ask this module for work; every GPU has a heavy and a ligh
   - a heavy job that has waited more than 24 h and fits nowhere makes one GPU empty for it ('drain'): nothing new
     starts there until it does, so the jobs sharing the GPUs cannot starve it;
   - host memory: a job starts only while the host memory reserved by all queue jobs plus its need stays within
-    70 GB (of 93; the rest is the system's and interactive work's); a job that has waited more than 24 h for host
-    memory is the only one that may start until it does;
+    70 GB (of 93; the rest is the system's and interactive work's); a job that has waited more than 24 h, fits a
+    GPU and lacks only host memory is the only one that may start on that GPU until it does;
   - a reservation names the slot's process; reservations of dead processes are dropped, so a killed slot frees its
     memory; reservations of jobs started outside the slots can be added with 'reserve'.
 State: <queue>/state.json, guarded by an exclusive lock on <queue>/.lock.
@@ -76,15 +76,17 @@ def choose(jobs, needs, reservations, drains, gpu, kind, waited=None, budget=BUD
         heavy job that fits while the heavy slot is idle, to the heavy slot, and starts nothing on a GPU that
         empties for a heavy job. Reservations made by a slot name it (slot: heavy / light).
     ram_needs: name -> host GB (DEFAULT_RAM_GB if missing); every job needs that much of the host memory left by
-    all reservations (their 'ram', DEFAULT_RAM_GB if missing). A job that has waited longer than drain_after_h and
-    does not fit the host memory is the only one that may start."""
+    all reservations (their 'ram', DEFAULT_RAM_GB if missing). A job that has waited longer than drain_after_h, fits
+    this GPU and does not fit the host memory is the only one that may start here."""
     waited = waited or {}
     ram_needs = ram_needs or {}
     drains = {g: j for g, j in drains.items() if j in jobs}
     on_gpu = [r for r in reservations if r['gpu'] == gpu]
     free = budget - sum(r['gb'] for r in on_gpu)
     ram_free = ram_budget - sum(r.get('ram', DEFAULT_RAM_GB) for r in reservations)
-    starved = [j for j in jobs if waited.get(j, 0.0) > drain_after_h and ram_needs.get(j, DEFAULT_RAM_GB) > ram_free]
+    # Waiting for host memory only: the job fits this GPU, so the GPU is kept for it until memory frees.
+    starved = [j for j in jobs if waited.get(j, 0.0) > drain_after_h and ram_needs.get(j, DEFAULT_RAM_GB) > ram_free
+               and needs[j] <= free]
 
     def startable(job):
         return ram_needs.get(job, DEFAULT_RAM_GB) <= ram_free and (not starved or job == starved[0])
