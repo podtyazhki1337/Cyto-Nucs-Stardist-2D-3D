@@ -247,7 +247,8 @@
     "mask_overlap_loss": "lovasz",
     "object_losses_min_area_from_gate": true,
     "semantic_foreground_weight": 1.0,
-    "dist_polar_iou_weight": 0.0
+    "dist_polar_iou_weight": 0.0,
+    "prob_iou_aware": 0.0
   },
   "augmentation": {
     "enable": true,

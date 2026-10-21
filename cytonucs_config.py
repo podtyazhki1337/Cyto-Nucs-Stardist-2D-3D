@@ -74,7 +74,7 @@ class CytoNucsConfig:
                             mask_quality_target='grid', mask_quality_ignore_boundary_targets=False,
                             mask_ce_class_balance=False, cell_prompt_separation_weight=0.0,
                             cell_z_dice_weight=0.0, nucleus_z_dice_weight=0.0,
-                            semantic_foreground_weight=0.0, dist_polar_iou_weight=0.0),
+                            semantic_foreground_weight=0.0, dist_polar_iou_weight=0.0, prob_iou_aware=0.0),
     }
 
     def __init__(
@@ -553,7 +553,7 @@ class CytoNucsConfig:
             raise ValueError(f'mask_quality_min must be a number in [0, 1] or "auto", got {self.mask_quality_min!r}')
         for key in ('nucleus_prob_object_weight', 'cytoplasm_prob_object_weight', 'prob_object_peak_weight',
                     'mask_quality_rank_weight', 'gradient_clip_norm', 'prompt_center_jitter', 'prompt_sigma_jitter', 'prompt_consistency_weight', 'mask_quality_weight', 'cell_prompt_separation_weight', 'cell_z_dice_weight', 'nucleus_z_dice_weight',
-                    'semantic_foreground_weight', 'dist_polar_iou_weight'):
+                    'semantic_foreground_weight', 'dist_polar_iou_weight', 'prob_iou_aware'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
                 raise ValueError(f'{key} must be finite and nonnegative')

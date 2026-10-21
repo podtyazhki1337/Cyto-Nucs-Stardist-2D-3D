@@ -1,5 +1,5 @@
-"""Training prompts anywhere inside the object (augmentation.prompt_uniform_prob) and the Polar IoU ray loss
-(loss_params.dist_polar_iou_weight)."""
+"""Training prompts anywhere inside the object (augmentation.prompt_uniform_prob), the Polar IoU ray loss
+(loss_params.dist_polar_iou_weight) and the IoU-aware probability target (loss_params.prob_iou_aware)."""
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,6 +57,32 @@ class PolarIoUTests(unittest.TestCase):
         self.assertGreater(polar, plain)
         self.assertTrue(np.all(np.isfinite(gradient.numpy())))
         self.assertLess(float(tf.reduce_sum(gradient)), 0.)        # too short rays: the loss pushes them out
+
+
+class IoUAwareProbabilityTests(unittest.TestCase):
+    def run_loss(self, power, pred_scale, ramp):
+        cfg = quiet(config, prob_iou_aware=power)
+        loss = CytoNucsLoss(cfg)
+        prob = np.zeros((1, 4, 8, 8, 1), np.float32); prob[:, 1:3, 2:6, 2:6] = 1.
+        rays = np.random.default_rng(0).uniform(2, 6, (1, 4, 8, 8, 12)).astype(np.float32)
+        pred = tf.Variable(np.full_like(prob, .7))
+        with tf.GradientTape() as tape:
+            out = loss._stardist_loss(tf.constant(prob), pred, tf.constant(rays), tf.constant(rays * pred_scale),
+                                      name='object', quality_ramp=tf.constant(ramp))
+        quality = loss._ray_quality(tf.constant(rays), tf.constant(rays * pred_scale), tf.constant(prob[..., 0]),
+                                    power, ramp)
+        return float(out['bce']), tape.gradient(out['bce'], pred).numpy(), quality.numpy()
+
+    def test_target_follows_the_polygon_fit(self):
+        off, grad_off, _ = self.run_loss(0., .5, 1.)
+        exact, _, quality = self.run_loss(1., 1., 1.)
+        self.assertAlmostEqual(exact, self.run_loss(0., 1., 1.)[0], places=6)      # rays fit: target unchanged
+        self.assertTrue(np.allclose(quality, 1.))
+        poor, grad_poor, quality = self.run_loss(1., .5, 1.)
+        self.assertTrue(np.all((quality > .45) & (quality < .6)))                # half-length rays: IoU about 0.5
+        inside = np.zeros((1, 4, 8, 8, 1), bool); inside[:, 1:3, 2:6, 2:6] = True
+        self.assertTrue(np.all(grad_poor[inside] > grad_off[inside]))            # a lower target pulls p=0.7 down
+        self.assertAlmostEqual(self.run_loss(1., .5, 0.)[0], off, places=6)        # before the ramp: no change
 
 
 if __name__ == '__main__':
