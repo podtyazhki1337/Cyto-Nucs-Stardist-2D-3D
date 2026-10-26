@@ -21,7 +21,7 @@ class CytoNucsConfig:
     """
 
     # Public fixes_v1 settings: canonical JSON section and effective default.
-    # Keep config_cytonucs.json and the loader regression test in sync.
+    # Keep config_cytonucs.json in sync.
     # The network has two roles for nested objects: the inner one ('nucleus') and the outer one
     # ('cytoplasm'). model.levels names the object levels of a run, inner first; each takes a role
     # (level_roles) and its masks are read from '<level>_masks'. Three or more levels are a chain
