@@ -106,6 +106,20 @@ def sync_object_min_area(loss_fn, gates):
     return values
 
 
+def _prune_epoch_checkpoints(folder, keep):
+    """training.keep_epoch_checkpoints: only the `keep` latest weights_epoch_NNN checkpoints (all their files)
+    stay; best and best-val-loss checkpoints have other names and are untouched."""
+    import re
+    epochs = {}
+    for f in Path(folder).glob('weights_epoch_*'):
+        m = re.fullmatch(r'weights_epoch_(\d+)\..*', f.name)
+        if m:
+            epochs.setdefault(int(m.group(1)), []).append(f)
+    for epoch in sorted(epochs)[:-keep]:
+        for f in epochs[epoch]:
+            f.unlink()
+
+
 def _write_epoch_calibration(model, state_epoch, path):
     """Attach quality gates calibrated by this epoch's full validation, never older ones.
 
@@ -889,6 +903,9 @@ class CytoNucsTrainer:
                 for path in epoch_checkpoint_paths:
                     _write_epoch_calibration(self.model, self.state_epoch, path)
                     self.checkpoint.write(str(path) + '.state')
+                keep = int(getattr(self.config, 'keep_epoch_checkpoints', 0) or 0)
+                if keep and (epoch + 1) % save_every == 0:
+                    _prune_epoch_checkpoints(self.checkpoint_dir, keep)
 
                 if hasattr(train_generator, 'on_epoch_end'):
                     train_generator.on_epoch_end()

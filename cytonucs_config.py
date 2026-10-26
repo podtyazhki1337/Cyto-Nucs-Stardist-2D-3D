@@ -44,7 +44,7 @@ class CytoNucsConfig:
                          dist_target_stride=None, tile_sampling_by_objects=0.0, train_region_crops=False,
                          partial_annotation=False, unknown_label=None, annotated_anchor_share=0.0,
                          init_weights=None, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0,
-                         val_loss_every_n_epochs=1),
+                         val_loss_every_n_epochs=1, keep_epoch_checkpoints=1),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25,
@@ -509,6 +509,9 @@ class CytoNucsConfig:
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
                 raise ValueError(f'{key} must be a positive integer, got {value!r}')
+        keep = self.keep_epoch_checkpoints
+        if isinstance(keep, bool) or not isinstance(keep, (int, np.integer)) or keep < 0:
+            raise ValueError(f'keep_epoch_checkpoints must be 0 (all) or a positive integer, got {keep!r}')
         if isinstance(self.seed, bool) or not isinstance(self.seed, (int, np.integer)) or self.seed < 0:
             raise ValueError('seed must be a nonnegative integer')
         # training.unknown_label: this value in a training mask marks voxels whose annotation of that

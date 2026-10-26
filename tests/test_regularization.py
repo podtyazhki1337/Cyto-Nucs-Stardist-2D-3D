@@ -21,7 +21,7 @@ from test_levels import dataset, tensors
 NEW = {('training', 'init_weights'): None, ('training', 'weight_decay'): 0.0, ('augmentation', 'elastic_prob'): 0.0,
        ('augmentation', 'elastic_alpha'): 0.0, ('augmentation', 'elastic_sigma'): 8.0, ('training', 'ema_decay'): 0.0,
        ('training', 'extra_train_dirs'): [], ('training', 'extra_train_share'): 0.0, ('inference', 'tta_flips'): False, ('inference', 'refinement_batch'): 0, ('inference', 'refinement_windows'): False, ('inference', 'max_prompts_per_head'): 0, ('inference', 'skip_covered_prompts'): False, ('inference', 'refinement_roi_stride'): 0,
-       ('training', 'val_loss_every_n_epochs'): 1,
+       ('training', 'val_loss_every_n_epochs'): 1, ('training', 'keep_epoch_checkpoints'): 1,
        ('augmentation', 'prompt_uniform_prob'): 0.0, ('loss_params', 'dist_polar_iou_weight'): 0.0, ('loss_params', 'prob_iou_aware'): 0.0,
        ('augmentation', 'zoom_z_range'): None, ('augmentation', 'flip_z_prob'): 0.0, ('augmentation', 'saturation_prob'): 0.0}
 
@@ -40,7 +40,7 @@ class SettingTests(unittest.TestCase):
                          ('elastic_alpha', -2.), ('elastic_sigma', 0.), ('elastic_sigma', True), ('ema_decay', 1.),
                          ('ema_decay', -.1), ('extra_train_dirs', 'data'), ('extra_train_dirs', [3]),
                          ('extra_train_share', 1.5), ('extra_train_share', .5), ('tta_flips', 1), ('refinement_batch', -1), ('refinement_batch', True), ('refinement_windows', 1), ('max_prompts_per_head', -1), ('max_prompts_per_head', True), ('skip_covered_prompts', 1),
-                         ('val_loss_every_n_epochs', 0), ('val_loss_every_n_epochs', True),
+                         ('val_loss_every_n_epochs', 0), ('val_loss_every_n_epochs', True), ('keep_epoch_checkpoints', -1), ('keep_epoch_checkpoints', True),
                          ('prompt_uniform_prob', 1.5), ('prompt_uniform_prob', -.1), ('dist_polar_iou_weight', -1.), ('prob_iou_aware', -1.),
                          ('zoom_z_range', [1.2, .8]), ('zoom_z_range', [0, 1]), ('zoom_z_range', 1.1),
                          ('flip_z_prob', 2.), ('saturation_prob', -.5)):
@@ -290,6 +290,24 @@ class InitWeightsTests(unittest.TestCase):
             mixed_dataset(root / 'extra', (('train', (BOTH,) * 2),))
             history = run('third', ema_decay=.9, extra_train_dirs=[str(root / 'extra')], extra_train_share=.5)
             self.assertTrue(np.isfinite(history['train_loss'][0]) and np.isfinite(history['val_loss'][0]))
+
+
+class EpochCheckpointTests(unittest.TestCase):
+    def test_only_the_latest_epoch_checkpoints_stay(self):
+        from cytonucs_trainer import _prune_epoch_checkpoints
+        suffixes = ('.weights.h5', '.weights.h5.architecture.json', '.weights.h5.state.index',
+                    '.weights.h5.state.data-00000-of-00001')
+        with tempfile.TemporaryDirectory(dir=ROOT / '.cache') as tmp:
+            for name in [f'weights_epoch_{e:03d}{x}' for e in (50, 100, 150) for x in suffixes] + \
+                        [f'weights_best{x}' for x in suffixes] + ['weights_best_val_loss.weights.h5']:
+                (Path(tmp) / name).write_text('x')
+            _prune_epoch_checkpoints(tmp, 1)
+            left = sorted(f.name for f in Path(tmp).iterdir())
+            self.assertEqual([f for f in left if f.startswith('weights_epoch_')],
+                             sorted(f'weights_epoch_150{x}' for x in suffixes))
+            self.assertEqual(len(left), 2 * len(suffixes) + 1)
+            _prune_epoch_checkpoints(tmp, 2)                        # nothing older than the two latest
+            self.assertEqual(len(list(Path(tmp).iterdir())), len(left))
 
 
 if __name__ == '__main__':
