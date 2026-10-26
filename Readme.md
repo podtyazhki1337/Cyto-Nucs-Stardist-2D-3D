@@ -1,191 +1,143 @@
-# CytoNucs StarDist: Multi-Nuclear Cell Segmentation
+# CytoNucs: nested instance segmentation with StarDist and prompted mask refinement
 
-Dual-decoder StarDist for simultaneous nucleus and cytoplasm segmentation in 2D/3D microscopy images. Supports both single-nucleus and multi-nucleus cells.
+CytoNucs segments objects that lie inside other objects: nuclei inside cells, tumours inside kidneys, or longer
+chains of nested levels. It works on 2D and 3D images, including anisotropic volumes. Every object of every
+level gets an instance mask, and every child object is linked to its parent (a cell may hold several nuclei).
 
-## Features
+The method keeps StarDist at its core:
 
-- 🔬 **Dual segmentation**: Nuclei + Cytoplasm simultaneously
-- 🧬 **Multi-nuclear support**: Handles cells with multiple nuclei
-- 📐 **2D/3D unified**: Same codebase for both dimensions
-- ⚙️ **JSON configuration**: All parameters in one file
-- 🎯 **Advanced losses**: Containment, WBR, optional consistency
-- 📊 **Auto-assignment**: Automatic nucleus-cell pairing
-- 🔄 **Auto-split**: Automatic train/val/test splitting
+- A shared U-Net predicts, for every level, a StarDist object probability and star-convex ray distances.
+  Peaks of the probability are the object proposals.
+- Each proposal becomes a prompt: a Gaussian placed at the peak and sized by its rays. A light refinement network
+  reads the decoder features gated by the prompt and predicts the mask of that one object. A full-resolution
+  head sharpens the mask, and a quality head scores it. The mask is not limited to a star-convex shape.
+- A nucleus prompt yields the nucleus and the cell that contains it. Cell prompts find the remaining cells.
+  Masks are written in order of quality, and a child stays inside its parent.
+- Three or more levels are run as a chain of adjacent pairs through the same network.
+- Levels may be annotated only in parts of the data (partial annotation, unknown labels).
+
+Training adds to the StarDist losses (probability BCE, ray MAE):
+
+- a Polar IoU loss on the rays;
+- an IoU-aware probability target (the StarDist target times the Polar IoU of the predicted rays);
+- mask losses (cross-entropy and Lovász) and a quality loss for the refinement;
+- containment and within-boundary terms that tie the levels together.
+
+> Status: research code of a paper in preparation. Results and the exact training recipes of the paper will be
+> added here.
+
+## Repository layout
+
+```
+train_cytonucs.py            training entry point (one JSON configuration)
+config_cytonucs.json         configuration with every option and its default
+cytonucs_config.py           configuration loading, validation, ray sets and grids from the object geometry
+cytonucs_model.py            U-Net, StarDist heads, prompted refinement and full-resolution heads
+cytonucs_losses.py           losses and the StarDist targets
+cytonucs_data_generator.py   tile / region sampling, augmentation, prompts and targets
+cytonucs_trainer.py          training loop, checkpoints, in-training full validation
+cytonucs_inference.py        proposals, batched / windowed prompt refinement, tiling
+cytonucs_postprocess.py      mask candidates and their assembly into label images
+cytonucs_hierarchy.py        hierarchies of three or more levels
+cytonucs_fine_mask.py, cytonucs_mask_quality.py, cytonucs_geometry.py, cytonucs_containment_helper.py,
+cytonucs_refinement_audit.py, cytonucs_runtime.py, cytonucs_gpu_setup.py      helpers
+
+score_hierarchy.py           AP, JTPR and the HydraStarDist-paper metrics of a trained model on a split
+score_predictions.py         the same scores for saved label images of any method
+evaluate_blocks.py           scores on whole held-out blocks of a spatially split 3D volume
+score_native_resolution.py   scores of a model trained on a downscaled copy, against the native annotation
+run_inference.py             predictions of a trained model on image files
+gpu_monitor.py               GPU and host memory log of a run (resource tables)
+
+baselines/                   StarDist (2D/3D), HydraStarDist and Cellpose baselines on the same splits
+dataset_prep/                converters of public datasets and split / sparse-annotation tools
+```
 
 ## Installation
+
+Tested with Python 3.10, TensorFlow 2.18 (Keras 3.12), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1.26, SciPy 1.15,
+scikit-image 0.25, tifffile, imageio and tqdm, on NVIDIA RTX A5000 GPUs (24 GB).
+
 ```bash
-pip install tensorflow>=2.8.0 stardist scikit-image scipy numpy imageio tqdm
-pip install comet-ml  # optional, for experiment tracking
+pip install "tensorflow[and-cuda]==2.18.*" "numpy<2.1" stardist csbdeep scikit-image scipy tifffile imageio tqdm
+pip install --no-deps edt      # optional: fast EDT for the StarDist targets (several times faster batches)
 ```
 
-## Quick Start
+Install the Cellpose baseline in its own environment (Cellpose 3, PyTorch).
 
-### 1. Prepare Dataset
+## Data layout
 
-Organize your data:
+One folder per split. Each holds the images and, for every level of `model.levels` (inner level first), its
+instance label images under the same file names:
+
 ```
-raw_data/
-├── images/            # Raw microscopy images (.tif)
-├── nucleus_masks/     # Nucleus instance labels (.tif)
-└── cytoplasm_masks/   # Cytoplasm instance labels (.tif)
-```
-
-### 2. Configure
-
-Edit `config_cytonucs.json`:
-```json
-{
-  "experiment": {
-    "name": "my_experiment"
-  },
-  "preprocessing": {
-    "run_preprocessing": true,
-    "raw_images_dir": "raw_data/images",
-    "raw_nucleus_masks_dir": "raw_data/nucleus_masks",
-    "raw_cytoplasm_masks_dir": "raw_data/cytoplasm_masks",
-    "output_dir": "processed_data/",
-    "test_split": 0.1,
-    "val_split": 0.1
-  },
-  "data": {
-    "dataset_dir": "processed_data/"
-  },
-  "model": {
-    "ndim": 3,
-    "n_rays": 128
-  },
-  "training": {
-    "train_patch_size": [12, 96, 96],
-    "train_batch_size": 4,
-    "train_epochs": 400
-  }
-}
+dataset/
+├── train/
+│   ├── images/                    2D: YX or YXC; 3D: ZYX or ZYXC (TIFF)
+│   ├── nucleus_masks/             one instance label image per image
+│   ├── cytoplasm_masks/
+│   └── assignments/               optional: {nucleus id: cell id} per image (JSON); derived by overlap if missing
+├── val/
+└── test/
 ```
 
-### 3. Train
+Other level names work the same way, for example `model.levels: ["mass", "kidney"]` reads `mass_masks/`,
+`kidney_masks/` and `assignments_mass_kidney/`. `dataset_prep/` writes this layout for TissueNet, HeLaCytoNuc,
+BBBC020 and KiTS23, and builds spatially disjoint splits, train regions and sparse-annotation copies of 3D
+volumes.
+
+## Training
+
+Copy `config_cytonucs.json`, set `data.dataset_dir`, `model.ndim`, `model.levels` and the patch size, then run:
+
 ```bash
-python train_cytonucs.py config_cytonucs.json
+python train_cytonucs.py my_config.json
 ```
 
-That's it! The script will:
-- ✅ Preprocess data (if enabled)
-- ✅ Auto-compute nucleus-cell assignments
-- ✅ Split into train/val/test
-- ✅ Train the model
-- ✅ Optimize thresholds
-- ✅ Evaluate and save results
+Main options:
 
-## File Structure
-```
-cytonucs_stardist/
-├── config_cytonucs.json          # Configuration
-├── cytonucs_config.py             # Config classes
-├── cytonucs_model.py              # Dual-decoder model
-├── cytonucs_losses.py             # Loss functions
-├── cytonucs_data_generator.py     # Data loading
-├── cytonucs_trainer.py            # Training loop
-├── cytonucs_inference.py          # Inference
-└── train_cytonucs.py              # Main script
-```
+| Section | Option | Meaning |
+|---|---|---|
+| model | `ndim`, `levels`, `n_rays` | dimensionality, nested levels (inner first), rays per object |
+| model | `unet_n_filter_base`, `unet_n_depth` | width and depth of the shared U-Net |
+| training | `train_patch_size`, `image_batch_size`, `prompts_per_crop` | crop size, crops per step, prompts per crop |
+| training | `train_epochs`, `steps_per_epoch`, `initial_learning_rate`, `weight_decay`, `ema_decay` | schedule and optimiser |
+| training | `keep_epoch_checkpoints` | how many latest epoch checkpoints to keep (best checkpoints are kept apart) |
+| loss_params | `dist_polar_iou_weight`, `prob_iou_aware` | Polar IoU on the rays, IoU-aware probability target |
+| inference | `refinement_batch`, `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride` | speed of the prompt refinement |
 
-## Key Configuration Options
+The ray geometry and grids are measured on the training labels at the start of a run and saved next to the
+weights. The run folder (`output.basedir/experiment.name`) holds the best checkpoints by full validation and by
+validation loss, the last epoch checkpoint, the calibrated quality gates and mask thresholds, and the history.
 
-### Model
-- `ndim`: 2 or 3 (dimensionality)
-- `n_rays`: Number of rays for star-convex (default: 128)
-- `shared_encoder`: Share encoder between decoders (default: true)
+## Evaluation
 
-### Loss Weights
-- `lambda_containment`: 0.3-0.7 (nuclei inside cells)
-- `lambda_wbr`: 0.2-0.5 (within-boundary regularization)
-- `lambda_consistency`: 0.0-0.3 (cell center near nuclei, optional)
-- `enable_consistency`: false (disable by default)
-
-### Training
-- `train_patch_size`: e.g., [12, 96, 96] for 3D
-- `train_batch_size`: 2-8 depending on GPU
-- `pool_size`: null (all data) or N samples in memory
-- `repool_freq`: 10 (reload data every N batches)
-
-## Inference
-```python
-from cytonucs_config import CytoNucsConfig
-from cytonucs_model import build_cytonucs_model
-from cytonucs_inference import CytoNucsPredictor
-import imageio
-
-# Load model
-config = CytoNucsConfig.from_json('config_cytonucs.json')
-model = build_cytonucs_model(config, name='my_experiment')
-model.load_weights('models/my_experiment/weights_best.h5')
-
-# Predict
-predictor = CytoNucsPredictor(model, config)
-img = imageio.volread('test_image.tif')
-nucleus_pred, cytoplasm_pred, details = predictor.predict_instances(img)
-
-# Save
-imageio.volwrite('nucleus_result.tif', nucleus_pred)
-imageio.volwrite('cytoplasm_result.tif', cytoplasm_pred)
+```bash
+python score_hierarchy.py --config my_config.json --weights RUN/weights_best.weights.h5 --split test \
+    --output RUN/hierarchy_test.json --predictions RUN/predictions_test
+python score_predictions.py --data dataset --predictions OTHER_METHOD/predictions --split test
+python evaluate_blocks.py --config my_config.json --weights RUN/weights_best.weights.h5 --splits test val
 ```
 
-## Output Structure
-```
-models/my_experiment/
-├── weights_best.h5               # Best model (by val loss)
-├── weights_best_dice_0.85.h5     # Best model (by Dice)
-├── weights_epoch_*.h5            # Checkpoints
-├── history.json                  # Training history
-├── optimized_thresholds.json     # Optimal thresholds
-├── final_results.json            # Final metrics
-└── predictions/                  # Validation predictions
-```
+- **AP**: the mean over IoU 0.5–0.95 of TP / (TP + FP + FN), for every level.
+- **JTPR**: for every adjacent pair of levels, the share of annotated child–parent pairs whose two objects are
+  both found (IoU ≥ 0.5) and linked to each other in the prediction.
+- **HydraStarDist-paper metrics**: IoUR, AP and the joint TP rates over children and over parents at
+  τ = 0.1–0.9, so that results can be compared with that paper.
 
-## Advanced Features
+Scores are kept per image, so bootstrap intervals and breakdowns can be computed again without predicting.
 
-### Automatic Assignment Creation
+## Baselines
 
-If assignments are missing, they're computed on-the-fly using 3-stage strategy:
-1. Containment (nucleus center inside cell)
-2. Overlap (maximum IoU)
-3. Proximity (nearest cell within threshold)
-
-### Automatic Train/Val/Test Split
-
-Two modes:
-```json
-// Mode 1: Automatic split
-"preprocessing": {
-  "validation_images": null,
-  "test_split": 0.1,
-  "val_split": 0.1
-}
-
-// Mode 2: Manual validation set
-"preprocessing": {
-  "validation_images": ["sample_007.tif"],
-  "test_split": 0.1
-}
-```
-
-### Repooling
-
-For large datasets that don't fit in memory:
-```json
-"data": {
-  "pool_size": 5,       // Keep 5 samples in RAM
-  "repool_freq": 10     // Change pool every 50 batches
-}
-```
-
-## Metrics
-
-- **Dice**: Standard overlap metric
-- **JTPR** (Joint True Positive Rate): Nucleus-cell pair correctness
+- `baselines/stardist3d/`: StarDist with one model per level (2D or 3D, files or spatial splits, full resolution).
+- `baselines/hydrastardist/`: HydraStarDist (De, Urbanski and Yakimovich, 2025), the authors' code, vendored
+  with its BSD licence.
+- `baselines/cellpose/`: Cellpose 3, fine-tuned from the pretrained models and as pretrained.
 
 ## Citation
 
-Based on StarDist:
+The paper is in preparation. CytoNucs builds on StarDist:
+
 ```
 @inproceedings{schmidt2018,
   title={Cell Detection with Star-Convex Polygons},
@@ -193,24 +145,13 @@ Based on StarDist:
   booktitle={MICCAI},
   year={2018}
 }
+@inproceedings{weigert2020,
+  title={Star-convex Polyhedra for 3D Object Detection and Segmentation in Microscopy},
+  author={Weigert, Martin and Schmidt, Uwe and Haase, Robert and Sugawara, Ko and Myers, Gene},
+  booktitle={WACV},
+  year={2020}
+}
 ```
-
-
-
-## Troubleshooting
-
-**Out of memory?**
-- Reduce `train_batch_size`
-- Reduce `train_patch_size`
-- Use `pool_size` parameter
-
-**Poor containment?**
-- Increase `lambda_containment`
-- Check nucleus-cell assignments
-
-**FOV warning?**
-- Increase `train_patch_size`
-- Or use smaller `grid`
 
 ## Contact
 

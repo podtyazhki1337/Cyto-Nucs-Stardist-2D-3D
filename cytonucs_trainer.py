@@ -106,6 +106,20 @@ def sync_object_min_area(loss_fn, gates):
     return values
 
 
+def _prune_epoch_checkpoints(folder, keep):
+    """training.keep_epoch_checkpoints: only the `keep` latest weights_epoch_NNN checkpoints (all their files)
+    stay; best and best-val-loss checkpoints have other names and are untouched."""
+    import re
+    epochs = {}
+    for f in Path(folder).glob('weights_epoch_*'):
+        m = re.fullmatch(r'weights_epoch_(\d+)\..*', f.name)
+        if m:
+            epochs.setdefault(int(m.group(1)), []).append(f)
+    for epoch in sorted(epochs)[:-keep]:
+        for f in epochs[epoch]:
+            f.unlink()
+
+
 def _write_epoch_calibration(model, state_epoch, path):
     """Attach quality gates calibrated by this epoch's full validation, never older ones.
 
@@ -800,8 +814,15 @@ class CytoNucsTrainer:
                     experiment.log_metric("train_loss", train_loss, epoch=epoch + 1)
                     experiment.log_metric("learning_rate", self.optimizer.learning_rate.numpy(), epoch=epoch + 1)
 
-                # Validation loop
-                if val_generator is not None:
+                # Validation loop: patch losses are a training diagnostic (checkpoints are chosen by full
+                # validation), computed every val_loss_every_n_epochs epochs and at the last one.
+                val_every = int(getattr(self.config, 'val_loss_every_n_epochs', 1) or 1)
+                val_now = (epoch + 1) % val_every == 0 or epoch + 1 == epochs
+                if val_generator is not None and not val_now:
+                    for key, values in self.history.items():          # keep one entry per epoch
+                        if key.startswith('val_') and isinstance(values, list) and len(values) == epoch:
+                            values.append(None)
+                if val_generator is not None and val_now:
                     val_sums = {}
                     val_pbar = tqdm(range(len(val_generator)), desc='Validation')
                     for step in val_pbar:
@@ -882,6 +903,9 @@ class CytoNucsTrainer:
                 for path in epoch_checkpoint_paths:
                     _write_epoch_calibration(self.model, self.state_epoch, path)
                     self.checkpoint.write(str(path) + '.state')
+                keep = int(getattr(self.config, 'keep_epoch_checkpoints', 0) or 0)
+                if keep and (epoch + 1) % save_every == 0:
+                    _prune_epoch_checkpoints(self.checkpoint_dir, keep)
 
                 if hasattr(train_generator, 'on_epoch_end'):
                     train_generator.on_epoch_end()

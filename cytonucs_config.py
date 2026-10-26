@@ -21,7 +21,7 @@ class CytoNucsConfig:
     """
 
     # Public fixes_v1 settings: canonical JSON section and effective default.
-    # Keep config_cytonucs.json and the loader regression test in sync.
+    # Keep config_cytonucs.json in sync.
     # The network has two roles for nested objects: the inner one ('nucleus') and the outer one
     # ('cytoplasm'). model.levels names the object levels of a run, inner first; each takes a role
     # (level_roles) and its masks are read from '<level>_masks'. Three or more levels are a chain
@@ -43,7 +43,8 @@ class CytoNucsConfig:
                          predicted_prompt_sample_peaks=False, reset_best_on_resume=False,
                          dist_target_stride=None, tile_sampling_by_objects=0.0, train_region_crops=False,
                          partial_annotation=False, unknown_label=None, annotated_anchor_share=0.0,
-                         init_weights=None, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0),
+                         init_weights=None, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0,
+                         val_loss_every_n_epochs=1, keep_epoch_checkpoints=1),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25,
@@ -58,13 +59,15 @@ class CytoNucsConfig:
                           mask_overlap_cytoplasm=0.0, mask_assembly_nucleus='voxel',
                           mask_assembly_cytoplasm='voxel', mask_min_remaining_fraction=0.5,
                           nms_candidate_spacing=0.12, nms_border_exclude_xy=2,
-                          residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0),
+                          residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
+                          refinement_windows=False, max_prompts_per_head=0,
+                          skip_covered_prompts=False, refinement_roi_stride=0),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
                              neighbor_cell_prompt_prob=0.0, cell_z_pair_prob=0.0,
                              nucleus_z_pair_prob=0.0, elastic_prob=0.0, elastic_alpha=0.0, elastic_sigma=8.0,
-                             zoom_z_range=None, flip_z_prob=0.0, saturation_prob=0.0),
+                             zoom_z_range=None, flip_z_prob=0.0, saturation_prob=0.0, prompt_uniform_prob=0.0),
         'loss_params': dict(nucleus_prob_object_weight=0.0, cytoplasm_prob_object_weight=0.0,
                             prob_object_peak_weight=0.0, mask_quality_rank_weight=0.0, object_losses_include_crop_cut=False,
                             mask_overlap_loss='dice', object_losses_min_area_from_gate=False,
@@ -72,7 +75,7 @@ class CytoNucsConfig:
                             mask_quality_target='grid', mask_quality_ignore_boundary_targets=False,
                             mask_ce_class_balance=False, cell_prompt_separation_weight=0.0,
                             cell_z_dice_weight=0.0, nucleus_z_dice_weight=0.0,
-                            semantic_foreground_weight=0.0),
+                            semantic_foreground_weight=0.0, dist_polar_iou_weight=0.0, prob_iou_aware=0.0),
     }
 
     def __init__(
@@ -489,11 +492,26 @@ class CytoNucsConfig:
         architecture_plan(self)
         if isinstance(self.refinement_batch, bool) or not isinstance(self.refinement_batch, (int, np.integer)) or self.refinement_batch < 0:
             raise ValueError(f'refinement_batch must be a nonnegative integer, got {self.refinement_batch!r}')
-        for key in ('image_batch_size', 'prompts_per_crop', 'log_every_steps',
+        if isinstance(self.max_prompts_per_head, bool) or not isinstance(self.max_prompts_per_head, (int, np.integer)) or self.max_prompts_per_head < 0:
+            raise ValueError(f'max_prompts_per_head must be a nonnegative integer (0: no limit), got {self.max_prompts_per_head!r}')
+        if not isinstance(self.refinement_windows, bool):
+            raise ValueError(f'refinement_windows must be true or false, got {self.refinement_windows!r}')
+        if not isinstance(self.skip_covered_prompts, bool):
+            raise ValueError(f'skip_covered_prompts must be true or false, got {self.skip_covered_prompts!r}')
+        stride = self.refinement_roi_stride
+        values = list(stride) if isinstance(stride, (list, tuple)) else [stride]
+        if (any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in values)
+                or (isinstance(stride, (list, tuple)) and (len(values) != self.ndim or min(values) < 1))):
+            raise ValueError('refinement_roi_stride must be 0 (off), a positive integer or one per spatial axis, '
+                             f'got {stride!r}')
+        for key in ('image_batch_size', 'prompts_per_crop', 'log_every_steps', 'val_loss_every_n_epochs',
                     'prefetch_workers', 'prefetch_depth', 'refine_feature_cache_windows', 'predicted_prompt_start_epoch'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1:
                 raise ValueError(f'{key} must be a positive integer, got {value!r}')
+        keep = self.keep_epoch_checkpoints
+        if isinstance(keep, bool) or not isinstance(keep, (int, np.integer)) or keep < 0:
+            raise ValueError(f'keep_epoch_checkpoints must be 0 (all) or a positive integer, got {keep!r}')
         if isinstance(self.seed, bool) or not isinstance(self.seed, (int, np.integer)) or self.seed < 0:
             raise ValueError('seed must be a nonnegative integer')
         # training.unknown_label: this value in a training mask marks voxels whose annotation of that
@@ -526,7 +544,7 @@ class CytoNucsConfig:
                     'refinement_gradient_scale', 'repeat_cell_prompt_prob', 'neighbor_cell_prompt_prob', 'cell_z_pair_prob', 'nucleus_z_pair_prob', 'mask_containment_threshold', 'predicted_prompt_fraction',
                     'mask_overlap_nucleus', 'mask_overlap_cytoplasm', 'mask_min_remaining_fraction',
                     'tile_sampling_by_objects', 'annotated_anchor_share', 'elastic_prob', 'extra_train_share',
-                    'flip_z_prob', 'saturation_prob'):
+                    'flip_z_prob', 'saturation_prob', 'prompt_uniform_prob'):
             value = getattr(self, key)
             if key.startswith('mask_thresh_') and (value is None or value == 'auto'):
                 continue
@@ -547,7 +565,7 @@ class CytoNucsConfig:
             raise ValueError(f'mask_quality_min must be a number in [0, 1] or "auto", got {self.mask_quality_min!r}')
         for key in ('nucleus_prob_object_weight', 'cytoplasm_prob_object_weight', 'prob_object_peak_weight',
                     'mask_quality_rank_weight', 'gradient_clip_norm', 'prompt_center_jitter', 'prompt_sigma_jitter', 'prompt_consistency_weight', 'mask_quality_weight', 'cell_prompt_separation_weight', 'cell_z_dice_weight', 'nucleus_z_dice_weight',
-                    'semantic_foreground_weight'):
+                    'semantic_foreground_weight', 'dist_polar_iou_weight', 'prob_iou_aware'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
                 raise ValueError(f'{key} must be finite and nonnegative')

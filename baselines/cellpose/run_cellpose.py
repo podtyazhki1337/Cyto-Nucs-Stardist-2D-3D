@@ -126,6 +126,11 @@ def main():
         path = None
         if not args.pretrained_only:
             files, flows = flow_files('train', level, model.device)
+            if len(files) < args.nimg_per_epoch:
+                # train_seg cuts each batch at the number of images, not at nimg_per_epoch: with fewer images
+                # (BBBC020: 12) every batch after the first images is empty. The repeated list samples the same.
+                repeat = -(-args.nimg_per_epoch // len(files))
+                files, flows = files * repeat, flows * repeat
             path = train.train_seg(model.net, train_files=files, train_labels_files=flows, load_files=False,
                                    channels=spec['channels'], normalize=True, n_epochs=args.epochs,
                                    nimg_per_epoch=args.nimg_per_epoch, batch_size=args.batch, learning_rate=0.1,

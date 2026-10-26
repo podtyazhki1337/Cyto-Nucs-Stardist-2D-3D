@@ -105,7 +105,9 @@
     "weight_decay": 0.0,
     "ema_decay": 0.0,
     "extra_train_dirs": [],
-    "extra_train_share": 0.0
+    "extra_train_share": 0.0,
+    "val_loss_every_n_epochs": 1,
+    "keep_epoch_checkpoints": 1
   },
   "inference": {
     "checkpoint_path": "/storage02/miroslavm/Multi-Nuclear-Stardist-2D-3D/models/cytonucs_emese_HK_3_stardist_3d_patches_fixes_v1/weights_best.weights.h5",
@@ -148,7 +150,11 @@
     "residual_proposals": false,
     "refinement_roi_snap": false,
     "tta_flips": false,
-    "refinement_batch": 0
+    "refinement_batch": 0,
+    "refinement_windows": false,
+    "max_prompts_per_head": 0,
+    "skip_covered_prompts": false,
+    "refinement_roi_stride": 0
   },
   "loss_weights": {
     "lambda_prob_nucleus": 1.0,
@@ -192,7 +198,9 @@
     "object_losses_include_crop_cut": false,
     "mask_overlap_loss": "dice",
     "object_losses_min_area_from_gate": false,
-    "semantic_foreground_weight": 0.0
+    "semantic_foreground_weight": 0.0,
+    "dist_polar_iou_weight": 0.0,
+    "prob_iou_aware": 0.0
   },
   "augmentation": {
     "enable": true,
@@ -227,7 +235,8 @@
     "elastic_sigma": 8.0,
     "zoom_z_range": null,
     "flip_z_prob": 0.0,
-    "saturation_prob": 0.0
+    "saturation_prob": 0.0,
+    "prompt_uniform_prob": 0.0
   },
   "evaluation": {
     "eval_dice_every": 5,

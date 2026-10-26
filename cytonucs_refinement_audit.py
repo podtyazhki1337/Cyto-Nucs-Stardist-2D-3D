@@ -90,7 +90,7 @@ class RefinementStageAudit:
         residual: grid coordinates of window-suppressed peaks offered to the second pass.
         """
         from scipy.ndimage import maximum, maximum_filter
-        from stardist.utils import edt_prob, fill_label_holes
+        from stardist.utils import edt_prob
         ss = tuple(slice(None,None,int(g)) for g in grid)
         sampled = self.gt[ss]
         if sampled.shape != prob.shape:
@@ -113,7 +113,7 @@ class RefinementStageAudit:
             pts = np.clip(np.round(np.asarray(residual)).astype(int), 0, np.array(prob.shape)-1)
             residual_ids = set(map(int, sampled[tuple(pts.T)])) - {0}
         present=set(map(int,np.unique(sampled)));border_present=set(map(int,np.unique(sampled[eligible])))
-        ideal = edt_prob(fill_label_holes(self.gt),anisotropy=aniso)[ss]
+        ideal = edt_prob(self.gt,anisotropy=aniso)[ss]                 # as the training targets: no hole filling
         ideal_max=maxima(ideal,np.ones_like(eligible))
         by_gt={};counts={k:0 for k in ('no_grid_voxel','border_only','border_suppressed','below_threshold','local_max_suppressed','plateau_or_cap_removed','selected')}
         for j,lab in enumerate(self.ids):

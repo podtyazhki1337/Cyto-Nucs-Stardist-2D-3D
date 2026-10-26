@@ -1,21 +1,16 @@
-# Only code is tracked. Models, data, run results, audit history and notes stay local.
+# Only the code of the method, its baselines and the dataset converters is tracked. Models, data, run results,
+# tests, audits, notes and old configuration versions stay local.
 /*
 !/.gitignore
 !/Readme.md
 !/*.py
-!/config_cytonucs*.json
+!/config_cytonucs.json
+/overfit.py
+/paper_queue.py
 
 !/dataset_prep/
 /dataset_prep/*
 !/dataset_prep/*.py
-
-!/tests/
-/tests/*
-!/tests/*.py
-
-!/audit/
-/audit/*
-!/audit/*.py
 
 # Baselines of the paper: their code (StarDist runs, the vendored HydraStarDist package with its BSD licence),
 # not their models or logs.

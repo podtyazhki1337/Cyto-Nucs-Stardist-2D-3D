@@ -172,17 +172,17 @@ class CytoNucsLoss:
                 labels = without_small_objects(y_true_raw[head + '_instances'], labels,
                                                self.object_min_voxels[0 if head == 'nucleus' else 1])
             return labels
+        warmup = self._warmup_factor(current_epoch)
         loss_nucleus = self._stardist_loss(
             y_true['nucleus_prob'], y_pred['nucleus_prob'],
             y_true['nucleus_dist'], y_pred['nucleus_dist'],
             name='nucleus', prob_logit=y_pred.get('nucleus_prob_logit'),
-            instances=object_labels('nucleus'), known=known['nucleus'])
+            instances=object_labels('nucleus'), known=known['nucleus'], quality_ramp=warmup)
         loss_cytoplasm = self._stardist_loss(
             y_true['cytoplasm_prob'], y_pred['cytoplasm_prob'],
             y_true['cytoplasm_dist'], y_pred['cytoplasm_dist'],
             name='cytoplasm', prob_logit=y_pred.get('cytoplasm_prob_logit'),
-            instances=object_labels('cytoplasm'), known=known['cytoplasm'])
-        warmup = self._warmup_factor(current_epoch)
+            instances=object_labels('cytoplasm'), known=known['cytoplasm'], quality_ramp=warmup)
 
         # Бинарный GT-контейнер клеток на цито-гриде — общий для WBR
         # Контейнер для WBR и containment: клетка ИЛИ ядро. Ядро по определению
@@ -541,12 +541,19 @@ class CytoNucsLoss:
     # ============================================================
 
     def _stardist_loss(self, prob_true, prob_pred, dist_true, dist_pred,
-                       name='object', prob_logit=None, instances=None, known=None):
+                       name='object', prob_logit=None, instances=None, known=None, quality_ramp=None):
 
         prob_true_squeeze = tf.squeeze(prob_true, axis=-1)
         prob_pred_squeeze = tf.squeeze(prob_pred, axis=-1)
         foreground_mask = tf.cast(prob_true_squeeze > 0.01, tf.float32)
         background_mask = 1.0 - foreground_mask
+        iou_power = float(getattr(self.config, 'prob_iou_aware', 0.0) or 0.0)
+        if iou_power and quality_ramp is not None:
+            # IoU-aware detection (VarifocalNet, Zhang et al. CVPR 2021): the probability target is
+            # the object-centre value times the Polar IoU of the rays predicted at the voxel, so
+            # peaks prefer voxels whose polygon fits. Ramped in like WBR: early rays fit nothing.
+            prob_true_squeeze = prob_true_squeeze * self._ray_quality(
+                dist_true, dist_pred, prob_true_squeeze, iou_power, quality_ramp)
 
 
         eps = 1e-7
@@ -635,6 +642,19 @@ class CytoNucsLoss:
         weighted_error = dist_mask * dist_error_per_ray
         loss_distance = tf.reduce_mean(weighted_error) / (
                 tf.reduce_mean(dist_mask) + self.epsilon)
+        polar_weight = float(getattr(self.config, 'dist_polar_iou_weight', 0.0) or 0.0)
+        if polar_weight:
+            # Polar IoU (PolarMask, Xie et al. CVPR 2020): all rays of a voxel as one shape,
+            # -log(sum_k min(d, d*) / sum_k max(d, d*)), weighted like the ray error. Scaled by the
+            # median object size so a weight of 1 is comparable to the ray error in pixels.
+            true_rays = tf.cast(dist_true, tf.float32)
+            pred_rays = tf.maximum(tf.cast(dist_pred, tf.float32), 0.)
+            overlap = tf.reduce_sum(tf.minimum(true_rays, pred_rays), axis=-1)
+            union = tf.reduce_sum(tf.maximum(true_rays, pred_rays), axis=-1)
+            polar = -tf.math.log((overlap + 1.) / (union + 1.))
+            weight = tf.squeeze(dist_mask, axis=-1)
+            loss_polar = tf.reduce_sum(weight * polar) / (tf.reduce_sum(weight) + self.epsilon)
+            loss_distance = loss_distance + polar_weight * dist_scale * loss_polar
 
         bg_reg_weight = tf.cast(
             getattr(self.config, 'train_background_reg', 1e-4), tf.float32)
@@ -649,6 +669,24 @@ class CytoNucsLoss:
                 'bce_foreground': loss_bce_fg, 'bce_background': loss_bce_bg,
                 'prob_foreground_fraction': tf.stop_gradient(tf.reduce_mean(foreground_mask)),
                 'probability_metrics': probability_metrics}
+
+    def _ray_quality(self, dist_true, dist_pred, like, power, ramp):
+        """Polar IoU of predicted and true rays per voxel of `like` (no gradient), as
+        1 - ramp + ramp * IoU**power; rays on the dist_target_stride grid are repeated back."""
+        stride = getattr(self.config, 'dist_target_stride', None)
+        stride = tuple(int(v) for v in stride) if stride is not None else (1,) * self.ndim
+        dist_pred = self._subsample(dist_pred, stride)
+        true_rays = tf.cast(dist_true, tf.float32)
+        pred_rays = tf.maximum(tf.cast(dist_pred, tf.float32), 0.)
+        iou = ((tf.reduce_sum(tf.minimum(true_rays, pred_rays), axis=-1) + 1.)
+               / (tf.reduce_sum(tf.maximum(true_rays, pred_rays), axis=-1) + 1.))
+        for axis, step in enumerate(stride):
+            if step > 1:
+                iou = tf.repeat(iou, step, axis=axis + 1)
+        size = tf.shape(like)
+        iou = iou[(slice(None),) + tuple(slice(0, size[a + 1]) for a in range(self.ndim))]
+        ramp = tf.cast(ramp, tf.float32)
+        return tf.stop_gradient(1. - ramp + ramp * tf.pow(iou, power))
 
     # ============================================================
     # === WBR LOSS ===
@@ -1177,7 +1215,7 @@ def compute_stardist_gt(instances, config, grid, rays=None, aniso=None, normaliz
     None -> config.rays / config.anisotropy, то есть прежнее поведение.
     """
     from stardist.geometry import star_dist, star_dist3D
-    from stardist.utils import fill_label_holes, edt_prob
+    from stardist.utils import edt_prob
 
     ndim = int(config.ndim)
     grid = tuple(int(g) for g in grid)
@@ -1195,7 +1233,9 @@ def compute_stardist_gt(instances, config, grid, rays=None, aniso=None, normaliz
     patch = np.asarray(config.train_patch_size, dtype=np.float64)
     max_clip = float(np.sqrt(np.sum(patch ** 2)))
 
-    lbl = fill_label_holes(np.asarray(instances).astype(np.int32))
+    # Labels as annotated: no fill_label_holes (a fix for holes in poorly annotated masks that cost a
+    # third of the batch time under the prefetch threads' GIL).
+    lbl = np.asarray(instances).astype(np.int32)
 
     # Ray targets dominate the CPU cost of a batch; dist_target_stride computes them on every
     # stride-th node of the head grid (the loss reads the prediction at the same nodes).

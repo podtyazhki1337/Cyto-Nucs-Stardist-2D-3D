@@ -16,9 +16,13 @@ Writes <output>/{train,val,test}/{images,nucleus_masks,cytoplasm_masks,assignmen
 split_info.json and tissuenet.json (source index, specimen, experiment, pixel size and object counts per image).
 The object arrays 'meta' of the npz files are read by an unpickler that only rebuilds numpy arrays.
 
+With --val-all only the val split is converted, all 3118 tiles, into <output>/val_all (same names; the tiles of
+<output>/val must come out identical, which is checked), listed in split_info.json as 'val_all' and described in
+tissuenet_val_all.json; nothing else is touched.
+
 Usage:
   python dataset_prep/tissuenet_to_cytonucs.py --raw /storage02/miroslavm/data/TissueNet/raw \\
-      --output /storage02/miroslavm/data/TissueNet/cytonucs [--val-count 256] [--seed 0]
+      --output /storage02/miroslavm/data/TissueNet/cytonucs [--val-count 256] [--seed 0] [--val-all]
 Licence: modified Apache 2.0, non-commercial (see raw/LICENSE); cite Greenwald, Miller et al., Nat. Biotechnol. 2022.
 """
 import argparse
@@ -107,20 +111,21 @@ def write_image(path, x):
     tifffile.imwrite(path, rgb(x), photometric='rgb', compression='zlib')
 
 
-def convert(raw, output, val_count=256, seed=0):
+def convert(raw, output, val_count=256, seed=0, val_all=False):
     raw, output = Path(raw), Path(output)
     summary = dict(source=str(raw), val_count=val_count, seed=seed, images={})
-    for split in ('train', 'val', 'test'):
+    for split in (('val',) if val_all else ('train', 'val', 'test')):
         archive = zipfile.ZipFile(raw / f'tissuenet_v1.1_{split}.npz')
         meta = metadata(archive)
         with archive.open('X.npy') as stream:
             count = header(stream)[0][0]
         if len(meta) != count:
             raise ValueError(f'{split}: {len(meta)} metadata rows for {count} images')
-        keep = (set(np.random.default_rng(seed).choice(count, val_count, replace=False).tolist()) if split == 'val'
-                else set(range(count)))
+        keep = (set(np.random.default_rng(seed).choice(count, val_count, replace=False).tolist())
+                if split == 'val' and not val_all else set(range(count)))
+        folder = output / ('val_all' if val_all else split)
         for sub in ('images', 'nucleus_masks', 'cytoplasm_masks', 'assignments'):
-            (output / split / sub).mkdir(parents=True, exist_ok=True)
+            (folder / sub).mkdir(parents=True, exist_ok=True)
         for (index, x), (_, y) in zip(images(archive, 'X.npy'), images(archive, 'y.npy')):
             if index not in keep:
                 continue
@@ -128,20 +133,42 @@ def convert(raw, output, val_count=256, seed=0):
             cells, n_cells = relabel(y[..., 0])
             nuclei, n_nuclei = relabel(y[..., 1])
             pairs = nucleus_cells(nuclei, cells)
-            tifffile.imwrite(output / split / 'nucleus_masks' / name, nuclei, photometric='minisblack', compression='zlib')
-            tifffile.imwrite(output / split / 'cytoplasm_masks' / name, cells, photometric='minisblack', compression='zlib')
-            (output / split / 'assignments' / f'{split}_{index:05d}.json').write_text(json.dumps(pairs))
-            write_image(output / split / 'images' / name, x)
+            tifffile.imwrite(folder / 'nucleus_masks' / name, nuclei, photometric='minisblack', compression='zlib')
+            tifffile.imwrite(folder / 'cytoplasm_masks' / name, cells, photometric='minisblack', compression='zlib')
+            (folder / 'assignments' / f'{split}_{index:05d}.json').write_text(json.dumps(pairs))
+            write_image(folder / 'images' / name, x)
             info = meta[index]
             summary['images'][name] = dict(split=split, index=index, specimen=str(info['specimen']),
                                            experiment=str(info['experiment']).split('/')[-1],
                                            pixel_size=float(info['pixel_size']), shape=list(x.shape[:2]),
                                            cells=n_cells, nuclei=n_nuclei, pairs=len(pairs))
         print(f'{split}: {len(keep)} of {count} images', flush=True)
+    if val_all:
+        return finish_val_all(output, summary)
     names = {s: sorted(n for n, v in summary['images'].items() if v['split'] == s) for s in ('train', 'val', 'test')}
     (output / 'split_info.json').write_text(json.dumps(dict(names, seed=seed, split='tissuenet_v1.1', rescale_factor=1.0,
                                                             levels=['nucleus', 'cytoplasm']), indent=1))
     (output / 'tissuenet.json').write_text(json.dumps(summary, indent=1))
+    return summary
+
+
+def finish_val_all(output, summary):
+    """Check that the tiles of val come out identical in val_all, then list val_all in split_info.json."""
+    names = sorted(summary['images'])
+    for name in sorted(p.name for p in (output / 'val' / 'images').iterdir()):
+        for sub in ('images', 'nucleus_masks', 'cytoplasm_masks'):
+            if not np.array_equal(tifffile.imread(output / 'val' / sub / name), tifffile.imread(output / 'val_all' / sub / name)):
+                raise ValueError(f'{name}: {sub} differs between val and val_all')
+        pairs = Path(name).stem + '.json'
+        if json.loads((output / 'val' / 'assignments' / pairs).read_text()) != json.loads((output / 'val_all' / 'assignments' / pairs).read_text()):
+            raise ValueError(f'{name}: assignments differ between val and val_all')
+    info = json.loads((output / 'split_info.json').read_text())
+    info['val_all'] = names
+    tmp = output / 'split_info.json.tmp'
+    tmp.write_text(json.dumps(info, indent=1))
+    tmp.replace(output / 'split_info.json')
+    (output / 'tissuenet_val_all.json').write_text(json.dumps(summary, indent=1))
+    print(f'val_all: {len(names)} images; the {len(list((output / "val" / "images").iterdir()))} val tiles are identical')
     return summary
 
 
@@ -151,8 +178,9 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--val-count', type=int, default=256)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--val-all', action='store_true', help='convert all val tiles into <output>/val_all only')
     args = parser.parse_args()
-    convert(args.raw, args.output, args.val_count, args.seed)
+    convert(args.raw, args.output, args.val_count, args.seed, args.val_all)
 
 
 if __name__ == '__main__':
