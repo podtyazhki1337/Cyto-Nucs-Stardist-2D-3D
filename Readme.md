@@ -4,13 +4,14 @@ CytoNucs segments objects that lie inside other objects: nuclei inside cells, tu
 chains of nested levels. It works on 2D and 3D images, including anisotropic volumes. Every object of every
 level gets an instance mask, and every child object is linked to its parent (a cell may hold several nuclei).
 
-The method keeps StarDist at its core:
+The method keeps StarDist [1, 2] at its core:
 
 - A shared U-Net predicts, for every level, a StarDist object probability and star-convex ray distances.
   Peaks of the probability are the object proposals.
 - Each proposal becomes a prompt: a Gaussian placed at the peak and sized by its rays. A light refinement network
-  reads the decoder features gated by the prompt and predicts the mask of that one object. A full-resolution
-  head sharpens the mask, and a quality head scores it. The mask is not limited to a star-convex shape.
+  reads the decoder features gated by the prompt and predicts the mask of that one object, as promptable
+  segmentation models do with a point prompt [3]. A full-resolution head sharpens the mask, and a quality head
+  scores it. The mask is not limited to a star-convex shape.
 - A nucleus prompt yields the nucleus and the cell that contains it. Cell prompts find the remaining cells.
   Masks are written in order of quality, and a child stays inside its parent.
 - Three or more levels are run as a chain of adjacent pairs through the same network.
@@ -18,10 +19,12 @@ The method keeps StarDist at its core:
 
 Training adds to the StarDist losses (probability BCE, ray MAE):
 
-- a Polar IoU loss on the rays;
-- an IoU-aware probability target (the StarDist target times the Polar IoU of the predicted rays);
-- mask losses (cross-entropy and Lovász) and a quality loss for the refinement;
-- containment and within-boundary terms that tie the levels together.
+- a Polar IoU loss on the rays, from PolarMask [4];
+- an IoU-aware probability target (the StarDist target times the Polar IoU of the predicted rays), after
+  VarifocalNet [5];
+- mask losses (cross-entropy and the Lovász loss [6]) and a quality loss for the refinement;
+- a containment term and the within-boundary regularisation (WBR) of HydraStarDist [7], which tie the levels
+  together.
 
 > Status: research code of a paper in preparation. Results and the exact training recipes of the paper will be
 > added here.
@@ -46,7 +49,6 @@ score_hierarchy.py           AP, JTPR and the HydraStarDist-paper metrics of a t
 score_predictions.py         the same scores for saved label images of any method
 evaluate_blocks.py           scores on whole held-out blocks of a spatially split 3D volume
 score_native_resolution.py   scores of a model trained on a downscaled copy, against the native annotation
-run_inference.py             predictions of a trained model on image files
 gpu_monitor.py               GPU and host memory log of a run (resource tables)
 
 baselines/                   StarDist (2D/3D), HydraStarDist and Cellpose baselines on the same splits
@@ -122,7 +124,7 @@ python evaluate_blocks.py --config my_config.json --weights RUN/weights_best.wei
 - **AP**: the mean over IoU 0.5–0.95 of TP / (TP + FP + FN), for every level.
 - **JTPR**: for every adjacent pair of levels, the share of annotated child–parent pairs whose two objects are
   both found (IoU ≥ 0.5) and linked to each other in the prediction.
-- **HydraStarDist-paper metrics**: IoUR, AP and the joint TP rates over children and over parents at
+- **HydraStarDist-paper metrics** [7]: IoUR, AP and the joint TP rates over children and over parents at
   τ = 0.1–0.9, so that results can be compared with that paper.
 
 Scores are kept per image, so bootstrap intervals and breakdowns can be computed again without predicting.
@@ -130,28 +132,30 @@ Scores are kept per image, so bootstrap intervals and breakdowns can be computed
 ## Baselines
 
 - `baselines/stardist3d/`: StarDist with one model per level (2D or 3D, files or spatial splits, full resolution).
-- `baselines/hydrastardist/`: HydraStarDist (De, Urbanski and Yakimovich, 2025), the authors' code, vendored
-  with its BSD licence.
-- `baselines/cellpose/`: Cellpose 3, fine-tuned from the pretrained models and as pretrained.
+- `baselines/hydrastardist/`: HydraStarDist [7], the authors' code, vendored with its BSD licence.
+- `baselines/cellpose/`: Cellpose [8] (version 3), fine-tuned from the pretrained models and as pretrained.
 
-## Citation
+## References
 
-The paper is in preparation. CytoNucs builds on StarDist:
+1. U. Schmidt, M. Weigert, C. Broaddus, G. Myers. Cell Detection with Star-Convex Polygons. MICCAI 2018.
+   [arXiv:1806.03535](https://arxiv.org/abs/1806.03535)
+2. M. Weigert, U. Schmidt, R. Haase, K. Sugawara, G. Myers. Star-convex Polyhedra for 3D Object Detection and
+   Segmentation in Microscopy. WACV 2020. [arXiv:1908.03636](https://arxiv.org/abs/1908.03636)
+3. A. Kirillov et al. Segment Anything. ICCV 2023. [arXiv:2304.02643](https://arxiv.org/abs/2304.02643)
+4. E. Xie et al. PolarMask: Single Shot Instance Segmentation with Polar Representation. CVPR 2020.
+   [arXiv:1909.13226](https://arxiv.org/abs/1909.13226)
+5. H. Zhang, Y. Wang, F. Dayoub, N. Sünderhauf. VarifocalNet: An IoU-aware Dense Object Detector. CVPR 2021.
+   [arXiv:2008.13367](https://arxiv.org/abs/2008.13367)
+6. M. Berman, A. Rannen Triki, M. B. Blaschko. The Lovász-Softmax loss: A tractable surrogate for the
+   optimization of the intersection-over-union measure in neural networks. CVPR 2018.
+   [arXiv:1705.08790](https://arxiv.org/abs/1705.08790)
+7. T. De, A. Urbanski, A. Yakimovich. Single-shot Star-convex Polygon-based Instance Segmentation for
+   Spatially-correlated Biomedical Objects (HydraStarDist). arXiv 2025.
+   [arXiv:2504.12078](https://arxiv.org/abs/2504.12078)
+8. C. Stringer, T. Wang, M. Michaelos, M. Pachitariu. Cellpose: a generalist algorithm for cellular
+   segmentation. Nature Methods 18, 100–106 (2021). [doi:10.1038/s41592-020-01018-x](https://doi.org/10.1038/s41592-020-01018-x)
 
-```
-@inproceedings{schmidt2018,
-  title={Cell Detection with Star-Convex Polygons},
-  author={Schmidt, Uwe and Weigert, Martin and Broaddus, Coleman and Myers, Gene},
-  booktitle={MICCAI},
-  year={2018}
-}
-@inproceedings{weigert2020,
-  title={Star-convex Polyhedra for 3D Object Detection and Segmentation in Microscopy},
-  author={Weigert, Martin and Schmidt, Uwe and Haase, Robert and Sugawara, Ko and Myers, Gene},
-  booktitle={WACV},
-  year={2020}
-}
-```
+The paper describing CytoNucs is in preparation.
 
 ## Contact
 
