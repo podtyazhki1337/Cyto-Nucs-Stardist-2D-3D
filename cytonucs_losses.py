@@ -1215,7 +1215,7 @@ def compute_stardist_gt(instances, config, grid, rays=None, aniso=None, normaliz
     None -> config.rays / config.anisotropy, то есть прежнее поведение.
     """
     from stardist.geometry import star_dist, star_dist3D
-    from stardist.utils import fill_label_holes, edt_prob
+    from stardist.utils import edt_prob
 
     ndim = int(config.ndim)
     grid = tuple(int(g) for g in grid)
@@ -1233,7 +1233,9 @@ def compute_stardist_gt(instances, config, grid, rays=None, aniso=None, normaliz
     patch = np.asarray(config.train_patch_size, dtype=np.float64)
     max_clip = float(np.sqrt(np.sum(patch ** 2)))
 
-    lbl = fill_label_holes(np.asarray(instances).astype(np.int32))
+    # Labels as annotated: no fill_label_holes (a fix for holes in poorly annotated masks that cost a
+    # third of the batch time under the prefetch threads' GIL).
+    lbl = np.asarray(instances).astype(np.int32)
 
     # Ray targets dominate the CPU cost of a batch; dist_target_stride computes them on every
     # stride-th node of the head grid (the loss reads the prediction at the same nodes).
