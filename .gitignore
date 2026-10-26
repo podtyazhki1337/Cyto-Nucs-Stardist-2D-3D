@@ -7,6 +7,7 @@
 !/config_cytonucs.json
 /overfit.py
 /paper_queue.py
+/run_inference.py
 
 !/dataset_prep/
 /dataset_prep/*
