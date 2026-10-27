@@ -8,6 +8,21 @@ import tensorflow as tf
 import os
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 
+def _total_memory_mb(visible_devices=None):
+    """Memory (MB) of the first visible GPU from nvidia-smi, or None when it cannot be read."""
+    import subprocess
+    visible = str(visible_devices if visible_devices is not None else os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
+    first = visible.split(',')[0].strip()
+    if not first or first.startswith('-'):
+        return None
+    try:
+        out = subprocess.run(['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits', '-i', first],
+                             capture_output=True, text=True, timeout=30)
+        return int(float(out.stdout.strip().splitlines()[0])) if out.returncode == 0 else None
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
 def setup_gpu(memory_limit=None, allow_growth=True, visible_devices=None):
     """
     Configure GPU for training.
@@ -24,9 +39,17 @@ def setup_gpu(memory_limit=None, allow_growth=True, visible_devices=None):
     if visible_devices is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(visible_devices)
 
-    # The paper-run queue caps a job that shares its GPU (GPU_MEMORY_LIMIT_MB); a limit in the config wins.
+    # A job that shares its GPU is capped by GPU_MEMORY_LIMIT_MB; a limit in the config wins.
     if memory_limit is None and int(os.environ.get('GPU_MEMORY_LIMIT_MB', 0) or 0):
         memory_limit = int(os.environ['GPU_MEMORY_LIMIT_MB'])
+    # Otherwise TensorFlow's pool stops GPU_MEMORY_HEADROOM_MB (default 3072) below the card's memory. The CUDA
+    # context and cuDNN / cuBLAS workspaces live outside the pool; with the pool at TensorFlow's default (all but
+    # ~2 GB) they filled a 24 GB card and training steps ran out of memory hundreds of epochs into a run.
+    if memory_limit is None:
+        headroom = int(os.environ.get('GPU_MEMORY_HEADROOM_MB', 3072) or 0)
+        total = _total_memory_mb(visible_devices) if headroom > 0 else None
+        if total:
+            memory_limit = total - headroom
 
     # Get list of GPUs
     gpus = tf.config.list_physical_devices('GPU')
