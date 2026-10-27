@@ -61,7 +61,7 @@ class CytoNucsConfig:
                           nms_candidate_spacing=0.12, nms_border_exclude_xy=2,
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
                           refinement_windows=False, max_prompts_per_head=0,
-                          skip_covered_prompts=False, refinement_roi_stride=0),
+                          skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -498,12 +498,12 @@ class CytoNucsConfig:
             raise ValueError(f'refinement_windows must be true or false, got {self.refinement_windows!r}')
         if not isinstance(self.skip_covered_prompts, bool):
             raise ValueError(f'skip_covered_prompts must be true or false, got {self.skip_covered_prompts!r}')
-        stride = self.refinement_roi_stride
-        values = list(stride) if isinstance(stride, (list, tuple)) else [stride]
-        if (any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in values)
-                or (isinstance(stride, (list, tuple)) and (len(values) != self.ndim or min(values) < 1))):
-            raise ValueError('refinement_roi_stride must be 0 (off), a positive integer or one per spatial axis, '
-                             f'got {stride!r}')
+        for key in ('refinement_roi_stride', 'refinement_roi_size_step'):
+            stride = getattr(self, key)
+            values = list(stride) if isinstance(stride, (list, tuple)) else [stride]
+            if (any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in values)
+                    or (isinstance(stride, (list, tuple)) and (len(values) != self.ndim or min(values) < 1))):
+                raise ValueError(f'{key} must be 0 (off), a positive integer or one per spatial axis, got {stride!r}')
         for key in ('image_batch_size', 'prompts_per_crop', 'log_every_steps', 'val_loss_every_n_epochs',
                     'prefetch_workers', 'prefetch_depth', 'refine_feature_cache_windows', 'predicted_prompt_start_epoch'):
             value = getattr(self, key)

@@ -227,6 +227,9 @@ def main():
     if args.gpu is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+    # No cuDNN algorithm search per new input shape: prompt ROIs come in many shapes, and the search halved BBBC020's
+    # speed on first sight of a shape while compiled passes were as fast without it.
+    os.environ.setdefault('TF_CUDNN_USE_AUTOTUNE', '0')
     memory_limit = args.memory_limit or int(os.environ.get('GPU_MEMORY_LIMIT_MB', 0) or 0) or None   # the queue's cap
     result = score(args.config, args.weights, args.split, args.limit, memory_limit, args.predictions)
     output = Path(args.output or str(args.weights) + f'.hierarchy_{args.split}.json')

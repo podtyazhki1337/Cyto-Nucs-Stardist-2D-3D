@@ -154,7 +154,8 @@
     "refinement_windows": false,
     "max_prompts_per_head": 0,
     "skip_covered_prompts": false,
-    "refinement_roi_stride": 0
+    "refinement_roi_stride": 0,
+    "refinement_roi_size_step": 0
   },
   "loss_weights": {
     "lambda_prob_nucleus": 1.0,

@@ -342,9 +342,12 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     multiple = architecture_plan(config)['input_multiple']
     feature_cache = OrderedDict()
     cache_limit = max(1, int(getattr(config, 'refine_feature_cache_windows', 1)))
-    roi_stride = getattr(config, 'refinement_roi_stride', None)
-    roi_stride = (None if not roi_stride else
-                  np.array([max(1, int(round(t))) for t in (roi_stride if np.ndim(roi_stride) else [roi_stride] * nd)]))
+    def per_axis(value):
+        return None if not value else np.array([max(1, int(round(t))) for t in (value if np.ndim(value) else [value] * nd)])
+    roi_stride = per_axis(getattr(config, 'refinement_roi_stride', None))
+    # inference.refinement_roi_size_step: adaptive ROI sizes rounded up to its multiples, origins as before. Every new
+    # ROI shape costs a trace and a cuDNN algorithm search (most of BBBC020's 29 s per image, 6 s once compiled).
+    roi_size_step = roi_stride if roi_stride is not None else per_axis(getattr(config, 'refinement_roi_size_step', None))
     runs = feature_runs = 0
     nuc_candidates, cell_candidates, evidence = [], [], []
     diagnostics = {h: dict(attempted=0, empty_threshold=0, missing_component=0,
@@ -394,8 +397,8 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             vertices = np.asarray(rays.vertices) * np.maximum(distances, 1e-3)[:, None]
             # Centre the ROI on the prompt and include both extreme sides with margin.
             extent = np.ceil(3 * np.max(np.abs(vertices), axis=0)).astype(int)
-            if roi_stride is not None:
-                extent = -(-extent // roi_stride) * roi_stride        # a few ROI shapes
+            if roi_size_step is not None:
+                extent = -(-extent // roi_size_step) * roi_size_step  # a few ROI shapes
             run_shape = tuple(min(s, max(b, int(e))) for s, b, e in zip(shape, base_shape, extent))
         origin = tuple(max(0, min(int(c)-s//2, n-s)) for c, s, n in zip(center, run_shape, shape))
         if roi_stride is not None:
@@ -700,13 +703,17 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             def full_roi(kind, ids):
                 """The network over the whole ROI for the prompts `ids` (indices into prepared)."""
                 n = len(ids)
+
+                def batch_of(fs, m):
+                    # One broadcast per map (tf.repeat runs several eager ops and was a third of BBBC020's time).
+                    return [tf.broadcast_to(f[:1], [m] + list(f.shape[1:])) for f in fs]
                 if kind not in repeated:
                     # Backbone features repeated once per ROI for the largest chunk; smaller calls take a slice.
                     used = features if kind == 'nucleus' else [features[k] for k in (1, 2, 5, 6)]
                     largest = max(len(c) for kd, c in chunks if kd == kind)
-                    repeated[kind] = [tf.repeat(f, max(largest, n), axis=0) for f in used]
+                    repeated[kind] = batch_of(used, max(largest, n))
                 if int(repeated[kind][0].shape[0]) < n:
-                    repeated[kind] = [tf.repeat(f[:1], n, axis=0) for f in repeated[kind]]
+                    repeated[kind] = batch_of(repeated[kind], n)
                 inputs = repeated[kind] if n == int(repeated[kind][0].shape[0]) else [f[:n] for f in repeated[kind]]
                 buffer = np.empty((n,) + tuple(net_shape), np.float32)
                 for k, i in enumerate(ids):
