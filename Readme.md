@@ -106,7 +106,7 @@ Main options:
 | training | `train_epochs`, `steps_per_epoch`, `initial_learning_rate`, `weight_decay`, `ema_decay` | schedule and optimiser |
 | training | `keep_epoch_checkpoints` | how many latest epoch checkpoints to keep (best checkpoints are kept apart) |
 | loss_params | `dist_polar_iou_weight`, `prob_iou_aware` | Polar IoU on the rays, IoU-aware probability target |
-| inference | `refinement_batch`, `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride` | speed of the prompt refinement |
+| inference | `refinement_batch`, `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride`, `refinement_roi_size_step` | speed of the prompt refinement |
 
 The ray geometry and grids are measured on the training labels at the start of a run and saved next to the
 weights. The run folder (`output.basedir/experiment.name`) holds the best checkpoints by full validation and by

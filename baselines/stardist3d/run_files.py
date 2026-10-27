@@ -6,8 +6,10 @@ object level, trained like the CytoNucs run it is compared with and scored like 
   - the train volumes are cached once as float16 / smallest-unsigned .npy files (--cache) and memory-mapped, so a large
     dataset (342 KiTS23 CT volumes) is not held in RAM. StarDist's own sampler keeps every valid patch centre of
     every volume in memory (hundreds of MB per CT volume), so it is replaced by one with the same distribution:
-    a centre drawn uniformly among the valid centres, with probability train_foreground_only (0.9) among those
-    whose patch contains foreground (rejection sampling on a bit mask of them);
+    a centre drawn uniformly among the valid centres, with probability train_foreground_only (--foreground-only,
+    StarDist's 0.9) among those whose patch contains foreground (rejection sampling on a bit mask of them). The
+    volumes reach StarDist as a sequence that is not a list: it copies a list of volumes to float32 in RAM
+    (60-70 GB for KiTS23);
   - patch --patch, --batch patches per step, --steps steps per epoch, --epochs epochs; augmentation: the CytoNucs functions with
     the values of --like (flips and 90 degree rotations in XY, Z flip, intensity scale / offset / gamma, noise,
     blur, elastic XY deformation; no zoom);
@@ -18,7 +20,8 @@ object level, trained like the CytoNucs run it is compared with and scored like 
     (predicted inner objects paired with predicted outer objects by overlap), and the HydraStarDist-paper metrics
     (score_hierarchy.paper_metrics).
 StarDist's own choices: 96 rays (3D, GoldenSpiral, anisotropy of the training objects) or 32 (2D); U-Net backbone
-(depth 3, pool 2, the StarDist default) or the ResNet of the 3d-oids recipe (3D).
+(depth 3, width 32, pool 2, the StarDist default; --depth / --width, e.g. as the CytoNucs run) or the ResNet of the
+3d-oids recipe (3D).
 
 Usage:
   python run_files.py --data DIR --target kidney --gpu 0 --like CONFIG --patch 48 192 192 --grid 1 2 2 [--name NAME]
@@ -47,6 +50,10 @@ parser.add_argument('--patch', type=int, nargs='+', required=True, help='trainin
 parser.add_argument('--grid', type=int, nargs='+', help='StarDist grid (default 2 per axis, 1 along Z)')
 parser.add_argument('--rays', type=int, help='default 96 (3D), 32 (2D)')
 parser.add_argument('--backbone', default='unet', choices=('unet', 'resnet'))
+parser.add_argument('--depth', type=int, default=3, help='U-Net depth (StarDist default 3)')
+parser.add_argument('--width', type=int, default=32, help='U-Net filters of the first level (StarDist default 32)')
+parser.add_argument('--foreground-only', type=float, default=0.9,
+                    help="share of training patches drawn around objects (StarDist's train_foreground_only)")
 parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/stardist')
 parser.add_argument('--cache', help='folder of the memory-mapped train volumes (default <basedir>/cache/<parent>_<data name>)')
 parser.add_argument('--score', action='store_true')
@@ -147,6 +154,20 @@ def cached(split, level):
     return xs, ys
 
 
+class Volumes:
+    """The memory-mapped train volumes as one sequence: StarDistDataBase copies a list, tuple or array of volumes
+    to float32 in RAM, and indexes any other sequence as it is (patches are cut from the float16 memory maps)."""
+
+    def __init__(self, volumes):
+        self.volumes = volumes
+
+    def __len__(self):
+        return len(self.volumes)
+
+    def __getitem__(self, k):
+        return self.volumes[k]
+
+
 valid_centres = light_valid_inds('Y')                              # same distribution, no index cache
 StarDistDataBase.get_valid_inds = valid_centres
 
@@ -191,21 +212,22 @@ def train():
     common = dict(n_channel_in=x_train[0].shape[-1] if channels else 1, grid=GRID, use_gpu=False, train_patch_size=PATCH,
                   train_background_reg=1e-4, train_dist_loss='mae', train_loss_weights=(1.0, 0.2), train_epochs=args.epochs,
                   train_steps_per_epoch=args.steps, train_learning_rate=3e-4, train_batch_size=args.batch, train_n_val_patches=None,
-                  train_tensorboard=False, train_reduce_lr=dict(factor=0.5, patience=40, min_delta=0))
+                  train_tensorboard=False, train_reduce_lr=dict(factor=0.5, patience=40, min_delta=0),
+                  train_foreground_only=args.foreground_only)
     if NDIM == 3:
         anisotropy = tuple(float(v) for v in np.max(median) / median)
         backbone = (dict(backbone='resnet', resnet_n_blocks=4, resnet_kernel_size=(3, 3, 3), resnet_kernel_init='he_normal',
                          resnet_n_filter_base=32, resnet_n_conv_per_block=3, resnet_activation='relu', resnet_batch_norm=False,
                          net_conv_after_resnet=128) if args.backbone == 'resnet' else
-                    dict(backbone='unet', unet_n_depth=3, unet_kernel_size=(3, 3, 3), unet_n_filter_base=32, unet_pool=(2, 2, 2),
+                    dict(backbone='unet', unet_n_depth=args.depth, unet_kernel_size=(3, 3, 3), unet_n_filter_base=args.width, unet_pool=(2, 2, 2),
                          net_conv_after_unet=128))
         conf = Config3D(axes='ZYXC' if channels else 'ZYX', rays=Rays_GoldenSpiral(args.rays or 96, anisotropy=anisotropy),
                         anisotropy=anisotropy, **backbone, **common)
         model = StarDist3D(conf, name=name, basedir=args.basedir)
     else:
         anisotropy = None
-        conf = Config2D(axes='YXC' if channels else 'YX', n_rays=args.rays or 32, backbone='unet', unet_n_depth=3,
-                        unet_kernel_size=(3, 3), unet_n_filter_base=32, unet_pool=(2, 2), net_conv_after_unet=128, **common)
+        conf = Config2D(axes='YXC' if channels else 'YX', n_rays=args.rays or 32, backbone='unet', unet_n_depth=args.depth,
+                        unet_kernel_size=(3, 3), unet_n_filter_base=args.width, unet_pool=(2, 2), net_conv_after_unet=128, **common)
         model = StarDist2D(conf, name=name, basedir=args.basedir)
     params = int(sum(int(np.prod(v.shape)) for v in model.keras_model.trainable_weights))
     fov = [int(v) for v in model._axes_tile_overlap('ZYX' if NDIM == 3 else 'YX')]
@@ -213,7 +235,7 @@ def train():
           f'anisotropy {anisotropy}, field of view {fov}, {params} parameters, cache {cache_s:.0f} s')
     tf.config.experimental.reset_memory_stats('GPU:0') if tf.config.list_logical_devices('GPU') else None
     started = time.time()
-    history = model.train(x_train, y_train, validation_data=(x_val, y_val), augmenter=augment,
+    history = model.train(Volumes(x_train), y_train, validation_data=(x_val, y_val), augmenter=augment,
                           epochs=args.epochs, steps_per_epoch=args.steps)
     hours = (time.time() - started) / 3600
     peak = (tf.config.experimental.get_memory_info('GPU:0')['peak'] / 2 ** 30) if tf.config.list_logical_devices('GPU') else None
@@ -228,6 +250,7 @@ def train():
             thresholds = model.optimize_thresholds(x_val, y_val, predict_kwargs=dict(n_tiles=tiles, show_tile_progress=False))
     info = dict(target=args.target, name=name, data=str(DATA), ndim=NDIM, epochs=args.epochs, steps_per_epoch=args.steps,
                 patch=list(PATCH), batch=args.batch, grid=list(GRID), rays=conf.n_rays, backbone=args.backbone,
+                depth=args.depth, width=args.width, foreground_only=args.foreground_only,
                 anisotropy=None if anisotropy is None else list(anisotropy), median_extent=median.tolist(),
                 train_volumes=len(x_train), val_volumes=len(x_val), augmentation=aug_values, parameters=params,
                 field_of_view=fov, cache_s=cache_s, training_hours=hours, gpu_peak_mem_gb=peak,
