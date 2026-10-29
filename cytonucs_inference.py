@@ -264,6 +264,22 @@ def assemble_head(config, head, candidates, shape, observer=None):
                           min_remaining_fraction=config.mask_min_remaining_fraction)
 
 
+def keep_inner_inside_outer(config, nuclei, cells):
+    """Inner labels without the objects that have less than inference.inner_min_inside_outer of their voxels
+    inside the kept outer objects (0 = off), and how many were removed: an inner object exists only inside an
+    outer one, e.g. a renal mass inside its kidney, so a mass found in the liver is a false positive."""
+    share = float(getattr(config, 'inner_min_inside_outer', 0.0) or 0.0)
+    if share <= 0 or not np.any(nuclei):
+        return nuclei, 0
+    total = np.bincount(nuclei.ravel())
+    inside = np.bincount(nuclei[cells > 0], minlength=len(total))
+    drop = np.flatnonzero((total > 0) & (inside < share * total))
+    drop = drop[drop > 0]
+    if len(drop):
+        nuclei = np.where(np.isin(nuclei, drop), 0, nuclei).astype(nuclei.dtype)
+    return nuclei, int(len(drop))
+
+
 def rethreshold_prediction(config, sink, head, threshold, nuclei, cells):
     """Final labels and pairs when only `head` uses another mask threshold (higher or lower).
 
@@ -282,6 +298,7 @@ def rethreshold_prediction(config, sink, head, threshold, nuclei, cells):
         cells = labels
         evidence = [(n, shrunk.get(id(c)) if c is not None else None) for n, c in sink.get('evidence', [])]
     evidence = [(n, c) for n, c in evidence if n is not None]
+    nuclei, _ = keep_inner_inside_outer(config, nuclei, cells)
     pairs = assign_final_masks(nuclei, cells, getattr(config, 'pair_min_overlap', 0.1),
                                evidence, getattr(config, 'pair_min_mask_iou', 0.25))
     return nuclei, cells, pairs
@@ -334,6 +351,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     if policy == 'polyhedron':
         n = np.zeros(shape, np.int32) if nuc_labels is None else np.asarray(nuc_labels, np.int32)
         c = np.zeros(shape, np.int32) if cyto_labels is None else np.asarray(cyto_labels, np.int32)
+        n, _ = keep_inner_inside_outer(config, n, c)
         return n, c, assign_final_masks(n, c, getattr(config, 'pair_min_overlap', 0.1))
     if policy != 'mask':
         raise ValueError(f'Unknown refinement_mode: {policy}')
@@ -1005,6 +1023,12 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             nuclei, quality_gates.get('nucleus_min_area', 0))
         cells, diagnostics['cytoplasm']['area_gate_removed'] = drop_small_instances(
             cells, quality_gates.get('cytoplasm_min_area', 0))
+    if stage_audit is None:
+        nuclei, diagnostics['nucleus']['outside_outer_removed'] = keep_inner_inside_outer(config, nuclei, cells)
+    else:
+        # The audit's written masks calibrate the gates against these outputs: removing objects that keep their
+        # rows would remove their TP twice (gated AP above 1), so the audited output stays unfiltered, as ungated.
+        diagnostics['nucleus']['outside_outer_removed'] = 0
     pairs = assign_final_masks(nuclei, cells, getattr(config, 'pair_min_overlap', 0.1),
                                evidence, getattr(config, 'pair_min_mask_iou', 0.25))
     for h, stats in (('nucleus', ns), ('cytoplasm', cs)):

@@ -41,13 +41,14 @@ class CytoNucsConfig:
                          predicted_prompt_fraction=0.0, predicted_prompt_start_epoch=10,
                          detector_prompt_slots=0, cell_predicted_nucleus_fraction=0.0,
                          predicted_prompt_sample_peaks=False, reset_best_on_resume=False,
-                         dist_target_stride=None, tile_sampling_by_objects=0.0, train_region_crops=False,
+                         dist_target_stride=None, tile_sampling_by_objects=0.0, object_crop_shares=None,
+                         train_region_crops=False,
                          partial_annotation=False, unknown_label=None, annotated_anchor_share=0.0,
                          init_weights=None, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0,
                          val_loss_every_n_epochs=1, keep_epoch_checkpoints=1),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
-                          pair_min_overlap=0.1, pair_min_mask_iou=0.25,
+                          pair_min_overlap=0.1, pair_min_mask_iou=0.25, inner_min_inside_outer=0.0,
                           mask_thresh_nucleus=None, mask_thresh_cytoplasm=None,
                           tiling_fixed_axes=None, refinement_patch_size=None,
                           refinement_adaptive_roi=False, proposal_mode='stardist',
@@ -534,12 +535,16 @@ class CytoNucsConfig:
         self.extra_train_dirs = list(self.extra_train_dirs)
         if self.extra_train_share and not self.extra_train_dirs:
             raise ValueError('extra_train_share needs extra_train_dirs')
+        shares = self.object_crop_shares
+        if shares is not None and (not isinstance(shares, (list, tuple)) or len(shares) != 2 or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1 for v in shares) or sum(shares) > 1):
+            raise ValueError(f'object_crop_shares must be null or [inner, outer] shares in [0, 1] with sum <= 1, got {shares!r}')
         for key, positive in (('weight_decay', False), ('elastic_alpha', False), ('elastic_sigma', True)):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0 or (positive and value == 0):
                 raise ValueError(f'{key} must be a number {">" if positive else ">="} 0, got {value!r}')
         for key in ('cell_predicted_nucleus_fraction', 'mask_nms_nucleus', 'mask_nms_cytoplasm', 'pair_min_overlap',
-                    'pair_min_mask_iou', 'cyto_center_prompt_prob', 'negative_prompt_prob',
+                    'pair_min_mask_iou', 'inner_min_inside_outer', 'cyto_center_prompt_prob', 'negative_prompt_prob',
                     'mask_ce_empty_weight', 'mask_thresh_nucleus', 'mask_thresh_cytoplasm',
                     'refinement_gradient_scale', 'repeat_cell_prompt_prob', 'neighbor_cell_prompt_prob', 'cell_z_pair_prob', 'nucleus_z_pair_prob', 'mask_containment_threshold', 'predicted_prompt_fraction',
                     'mask_overlap_nucleus', 'mask_overlap_cytoplasm', 'mask_min_remaining_fraction',
