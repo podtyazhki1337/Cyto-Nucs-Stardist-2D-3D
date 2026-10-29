@@ -49,6 +49,7 @@ class CytoNucsConfig:
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25, inner_min_inside_outer=0.0,
+                          semantic_scores=False, semantic_min_nucleus=0.0, semantic_min_cytoplasm=0.0,
                           mask_thresh_nucleus=None, mask_thresh_cytoplasm=None,
                           tiling_fixed_axes=None, refinement_patch_size=None,
                           refinement_adaptive_roi=False, proposal_mode='stardist',
@@ -63,7 +64,7 @@ class CytoNucsConfig:
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
                           refinement_windows=False, max_prompts_per_head=0,
                           skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0),
-        'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1,
+        'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1, negative_prompt_inside_outer=0.0,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
                              neighbor_cell_prompt_prob=0.0, cell_z_pair_prob=0.0,
@@ -544,7 +545,8 @@ class CytoNucsConfig:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0 or (positive and value == 0):
                 raise ValueError(f'{key} must be a number {">" if positive else ">="} 0, got {value!r}')
         for key in ('cell_predicted_nucleus_fraction', 'mask_nms_nucleus', 'mask_nms_cytoplasm', 'pair_min_overlap',
-                    'pair_min_mask_iou', 'inner_min_inside_outer', 'cyto_center_prompt_prob', 'negative_prompt_prob',
+                    'pair_min_mask_iou', 'inner_min_inside_outer', 'semantic_min_nucleus', 'semantic_min_cytoplasm',
+                    'cyto_center_prompt_prob', 'negative_prompt_prob', 'negative_prompt_inside_outer',
                     'mask_ce_empty_weight', 'mask_thresh_nucleus', 'mask_thresh_cytoplasm',
                     'refinement_gradient_scale', 'repeat_cell_prompt_prob', 'neighbor_cell_prompt_prob', 'cell_z_pair_prob', 'nucleus_z_pair_prob', 'mask_containment_threshold', 'predicted_prompt_fraction',
                     'mask_overlap_nucleus', 'mask_overlap_cytoplasm', 'mask_min_remaining_fraction',
@@ -555,6 +557,9 @@ class CytoNucsConfig:
                 continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f'{key} must be a number in [0, 1], got {value!r}')
+        if (self.semantic_scores or self.semantic_min_nucleus or self.semantic_min_cytoplasm) and not self.semantic_foreground_weight:
+            raise ValueError('semantic_scores / semantic_min_* read the semantic foreground heads: they need '
+                             'loss_params.semantic_foreground_weight > 0 (the heads exist only then)')
         if 'auto' in (self.mask_thresh_nucleus, self.mask_thresh_cytoplasm) and self.refinement_mode != 'mask':
             raise ValueError('mask_thresh_*=auto calibrates prompted masks and requires refinement_mode=mask')
         if self.mask_quality_min == 'auto':

@@ -150,6 +150,19 @@ def allowed_crop_starts(region, size):
     return t[h:, w:] - t[:-h, w:] - t[h:, :-w] + t[:-h, :-w] == h * w
 
 
+def inside_outer_point(inner, outer, unknown, rng):
+    """A voxel, uniformly drawn, of an outer object that no inner object covers and no unknown region holds, or
+    None when the crop has none."""
+    region = (outer > 0) & (inner == 0)
+    for u in unknown.values():
+        if u is not None:
+            region &= ~u
+    points = np.flatnonzero(region)
+    if not len(points):
+        return None
+    return tuple(int(v) for v in np.unravel_index(points[int(rng.integers(len(points)))], region.shape))
+
+
 class CytoNucsDataGenerator(Sequence):
     """
     Data generator for CytoNucs StarDist training.
@@ -940,8 +953,15 @@ class CytoNucsDataGenerator(Sequence):
                     # Like false detector peaks at inference: any non-nuclear voxel
                     # (background or cytoplasm), nucleus-sized. The nuclear target is
                     # empty; the cell head still owns the cell containing the prompt.
+                    # augmentation.negative_prompt_inside_outer: that share of them at a voxel of
+                    # an outer object no inner object covers (hard negatives: on KiTS the
+                    # detector fires on kidney tissue that looks like a mass).
+                    inside = self.config.negative_prompt_inside_outer
+                    hard = inside_outer_point(nucleus_mask, cytoplasm_mask, unknown, rng) if (
+                        inside and rng.random() < inside) else None
                     for _attempt in range(64):
-                        center_neg = tuple(int(rng.integers(s)) for s in nucleus_mask.shape)
+                        center_neg = hard if hard is not None else tuple(
+                            int(rng.integers(s)) for s in nucleus_mask.shape)
                         if nucleus_mask[center_neg] == 0 and not any(u is not None and u[center_neg] for u in unknown.values()):
                             if nuc_present:
                                 sized = np.argwhere(nucleus_mask == int(rng.choice(sorted(nuc_present))))

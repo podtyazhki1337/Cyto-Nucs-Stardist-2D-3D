@@ -47,6 +47,7 @@ cytonucs_refinement_audit.py, cytonucs_runtime.py, cytonucs_gpu_setup.py      he
 
 score_hierarchy.py           AP, JTPR and the HydraStarDist-paper metrics of a trained model on a split
 score_predictions.py         the same scores for saved label images of any method
+semantic_gate.py             threshold of the semantic gate of one level, chosen on saved predictions
 evaluate_blocks.py           scores on whole held-out blocks of a spatially split 3D volume
 score_native_resolution.py   scores of a model trained on a downscaled copy, against the native annotation
 gpu_monitor.py               GPU and host memory log of a run (resource tables)
@@ -105,10 +106,12 @@ Main options:
 | training | `train_patch_size`, `image_batch_size`, `prompts_per_crop` | crop size, crops per step, prompts per crop |
 | training | `train_epochs`, `steps_per_epoch`, `initial_learning_rate`, `weight_decay`, `ema_decay` | schedule and optimiser |
 | training | `object_crop_shares` | [inner, outer]: shares of the crops centred on one object of that level, picked uniformly; the rest at random positions (replaces `fg_crop_prob`) |
+| augmentation | `negative_prompt_prob`, `negative_prompt_inside_outer` | share of empty-target (negative) prompts; share of them placed in an outer object where no inner object lies (hard negatives, e.g. kidney tissue) |
 | training | `keep_epoch_checkpoints` | how many latest epoch checkpoints to keep (best checkpoints are kept apart) |
 | loss_params | `dist_polar_iou_weight`, `prob_iou_aware` | Polar IoU on the rays, IoU-aware probability target |
 | inference | `refinement_batch`, `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride`, `refinement_roi_size_step` | speed of the prompt refinement |
 | inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (0 = off) |
+| inference | `semantic_scores`, `semantic_min_nucleus`, `semantic_min_cytoplasm` | mean semantic foreground probability of every object (saved with `--predictions` in `semantic/`); objects of a role below its minimum are removed (0 = off) |
 
 The ray geometry and grids are measured on the training labels at the start of a run and saved next to the
 weights. The run folder (`output.basedir/experiment.name`) holds the best checkpoints by full validation and by

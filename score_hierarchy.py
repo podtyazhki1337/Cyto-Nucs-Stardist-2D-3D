@@ -202,6 +202,9 @@ def score(config_path, weights, split='test', limit=0, memory_limit=None, predic
             records.append(dict(record, name=name, seconds=seconds))
             if predictions:
                 save_prediction(predictions, name, scored)
+                if pred.get('semantic'):                                 # per-object semantic scores (semantic_gate.py)
+                    (Path(predictions) / 'semantic').mkdir(parents=True, exist_ok=True)
+                    (Path(predictions) / 'semantic' / (Path(name).stem + '.json')).write_text(json.dumps(pred['semantic']))
     result = dict(split=split, volumes=len(names), seconds_per_volume=float(np.mean([r['seconds'] for r in records])),
                   weights=str(weights), calibration=calibration, predictions=str(predictions) if predictions else None)
     result.update(summarise(records, levels, pairs))
