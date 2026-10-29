@@ -137,7 +137,8 @@ Scores are kept per image, so bootstrap intervals and breakdowns can be computed
 - `baselines/hydrastardist/`: HydraStarDist [7], the authors' code, vendored with its BSD licence.
 - `baselines/cellpose/`: Cellpose [8] (version 3), fine-tuned from the pretrained models and as pretrained;
   `run_cellpose3d.py` for the 3D volume (2D network on XY / XZ / YZ planes, 3D flows or stitched planes chosen on
-  the val blocks, scored on whole blocks).
+  the val blocks, scored on whole blocks), `run_cellpose3d_files.py` the same for a dataset of one file per volume
+  (KiTS; settings chosen on val16, scored with `score_predictions.py`).
 - `baselines/nnunet/`: nnU-Net v2 [9] on KiTS: `prepare_kits.py` writes the CytoNucs conversion as an nnU-Net
   dataset (kidney / tumour / cyst, the same split as one fold), `to_instances.py` turns its predictions into
   kidney and mass instances by the rule of the CytoNucs labels.
