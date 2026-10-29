@@ -51,7 +51,7 @@ evaluate_blocks.py           scores on whole held-out blocks of a spatially spli
 score_native_resolution.py   scores of a model trained on a downscaled copy, against the native annotation
 gpu_monitor.py               GPU and host memory log of a run (resource tables)
 
-baselines/                   StarDist (2D/3D), HydraStarDist and Cellpose baselines on the same splits
+baselines/                   StarDist (2D/3D), HydraStarDist, Cellpose (2D/3D) and nnU-Net baselines on the same splits
 dataset_prep/                converters of public datasets and split / sparse-annotation tools
 ```
 
@@ -65,7 +65,7 @@ pip install "tensorflow[and-cuda]==2.18.*" "numpy<2.1" stardist csbdeep scikit-i
 pip install --no-deps edt      # optional: fast EDT for the StarDist targets (several times faster batches)
 ```
 
-Install the Cellpose baseline in its own environment (Cellpose 3, PyTorch).
+Install the Cellpose baseline (Cellpose 3, PyTorch) and the nnU-Net baseline (nnU-Net v2) in their own environments.
 
 ## Data layout
 
@@ -135,7 +135,12 @@ Scores are kept per image, so bootstrap intervals and breakdowns can be computed
 
 - `baselines/stardist3d/`: StarDist with one model per level (2D or 3D, files or spatial splits, full resolution).
 - `baselines/hydrastardist/`: HydraStarDist [7], the authors' code, vendored with its BSD licence.
-- `baselines/cellpose/`: Cellpose [8] (version 3), fine-tuned from the pretrained models and as pretrained.
+- `baselines/cellpose/`: Cellpose [8] (version 3), fine-tuned from the pretrained models and as pretrained;
+  `run_cellpose3d.py` for the 3D volume (2D network on XY / XZ / YZ planes, 3D flows or stitched planes chosen on
+  the val blocks, scored on whole blocks).
+- `baselines/nnunet/`: nnU-Net v2 [9] on KiTS: `prepare_kits.py` writes the CytoNucs conversion as an nnU-Net
+  dataset (kidney / tumour / cyst, the same split as one fold), `to_instances.py` turns its predictions into
+  kidney and mass instances by the rule of the CytoNucs labels.
 
 ## References
 
@@ -156,6 +161,9 @@ Scores are kept per image, so bootstrap intervals and breakdowns can be computed
    [arXiv:2504.12078](https://arxiv.org/abs/2504.12078)
 8. C. Stringer, T. Wang, M. Michaelos, M. Pachitariu. Cellpose: a generalist algorithm for cellular
    segmentation. Nature Methods 18, 100–106 (2021). [doi:10.1038/s41592-020-01018-x](https://doi.org/10.1038/s41592-020-01018-x)
+9. F. Isensee, P. F. Jaeger, S. A. A. Kohl, J. Petersen, K. H. Maier-Hein. nnU-Net: a self-configuring method for
+   deep learning-based biomedical image segmentation. Nature Methods 18, 203–211 (2021).
+   [doi:10.1038/s41592-020-01008-z](https://doi.org/10.1038/s41592-020-01008-z)
 
 The paper describing CytoNucs is in preparation.
 
