@@ -202,6 +202,9 @@ def score(config_path, weights, split='test', limit=0, memory_limit=None, predic
             records.append(dict(record, name=name, seconds=seconds))
             if predictions:
                 save_prediction(predictions, name, scored)
+                if pred.get('semantic'):                                 # per-object semantic scores (semantic_gate.py)
+                    (Path(predictions) / 'semantic').mkdir(parents=True, exist_ok=True)
+                    (Path(predictions) / 'semantic' / (Path(name).stem + '.json')).write_text(json.dumps(pred['semantic']))
     result = dict(split=split, volumes=len(names), seconds_per_volume=float(np.mean([r['seconds'] for r in records])),
                   weights=str(weights), calibration=calibration, predictions=str(predictions) if predictions else None)
     result.update(summarise(records, levels, pairs))
@@ -227,9 +230,8 @@ def main():
     if args.gpu is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
-    # No cuDNN algorithm search per new input shape: prompt ROIs come in many shapes, and the search halved BBBC020's
-    # speed on first sight of a shape while compiled passes were as fast without it.
-    os.environ.setdefault('TF_CUDNN_USE_AUTOTUNE', '0')
+    # cuDNN autotuning stays on (TF_CUDNN_USE_AUTOTUNE=0 is faster on many ROI shapes): without it a convolution has
+    # no fallback that needs no scratch memory, and KiTS test volumes failed to allocate the scratch space.
     memory_limit = args.memory_limit or int(os.environ.get('GPU_MEMORY_LIMIT_MB', 0) or 0) or None   # the queue's cap
     result = score(args.config, args.weights, args.split, args.limit, memory_limit, args.predictions)
     output = Path(args.output or str(args.weights) + f'.hierarchy_{args.split}.json')

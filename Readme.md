@@ -47,11 +47,12 @@ cytonucs_refinement_audit.py, cytonucs_runtime.py, cytonucs_gpu_setup.py      he
 
 score_hierarchy.py           AP, JTPR and the HydraStarDist-paper metrics of a trained model on a split
 score_predictions.py         the same scores for saved label images of any method
+semantic_gate.py             threshold of the semantic gate of one level, chosen on saved predictions
 evaluate_blocks.py           scores on whole held-out blocks of a spatially split 3D volume
 score_native_resolution.py   scores of a model trained on a downscaled copy, against the native annotation
 gpu_monitor.py               GPU and host memory log of a run (resource tables)
 
-baselines/                   StarDist (2D/3D), HydraStarDist and Cellpose baselines on the same splits
+baselines/                   StarDist (2D/3D), HydraStarDist, Cellpose (2D/3D) and nnU-Net baselines on the same splits
 dataset_prep/                converters of public datasets and split / sparse-annotation tools
 ```
 
@@ -65,7 +66,7 @@ pip install "tensorflow[and-cuda]==2.18.*" "numpy<2.1" stardist csbdeep scikit-i
 pip install --no-deps edt      # optional: fast EDT for the StarDist targets (several times faster batches)
 ```
 
-Install the Cellpose baseline in its own environment (Cellpose 3, PyTorch).
+Install the Cellpose baseline (Cellpose 3, PyTorch) and the nnU-Net baseline (nnU-Net v2) in their own environments.
 
 ## Data layout
 
@@ -104,9 +105,13 @@ Main options:
 | model | `unet_n_filter_base`, `unet_n_depth` | width and depth of the shared U-Net |
 | training | `train_patch_size`, `image_batch_size`, `prompts_per_crop` | crop size, crops per step, prompts per crop |
 | training | `train_epochs`, `steps_per_epoch`, `initial_learning_rate`, `weight_decay`, `ema_decay` | schedule and optimiser |
+| training | `object_crop_shares` | [inner, outer]: shares of the crops centred on one object of that level, picked uniformly; the rest at random positions (replaces `fg_crop_prob`) |
+| augmentation | `negative_prompt_prob`, `negative_prompt_inside_outer` | share of empty-target (negative) prompts; share of them placed in an outer object where no inner object lies (hard negatives, e.g. kidney tissue) |
 | training | `keep_epoch_checkpoints` | how many latest epoch checkpoints to keep (best checkpoints are kept apart) |
 | loss_params | `dist_polar_iou_weight`, `prob_iou_aware` | Polar IoU on the rays, IoU-aware probability target |
 | inference | `refinement_batch`, `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride`, `refinement_roi_size_step` | speed of the prompt refinement |
+| inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (0 = off) |
+| inference | `semantic_scores`, `semantic_min_nucleus`, `semantic_min_cytoplasm` | mean semantic foreground probability of every object (saved with `--predictions` in `semantic/`); objects of a role below its minimum are removed (0 = off) |
 
 The ray geometry and grids are measured on the training labels at the start of a run and saved next to the
 weights. The run folder (`output.basedir/experiment.name`) holds the best checkpoints by full validation and by
@@ -133,7 +138,13 @@ Scores are kept per image, so bootstrap intervals and breakdowns can be computed
 
 - `baselines/stardist3d/`: StarDist with one model per level (2D or 3D, files or spatial splits, full resolution).
 - `baselines/hydrastardist/`: HydraStarDist [7], the authors' code, vendored with its BSD licence.
-- `baselines/cellpose/`: Cellpose [8] (version 3), fine-tuned from the pretrained models and as pretrained.
+- `baselines/cellpose/`: Cellpose [8] (version 3), fine-tuned from the pretrained models and as pretrained;
+  `run_cellpose3d.py` for the 3D volume (2D network on XY / XZ / YZ planes, 3D flows or stitched planes chosen on
+  the val blocks, scored on whole blocks), `run_cellpose3d_files.py` the same for a dataset of one file per volume
+  (KiTS; settings chosen on val16, scored with `score_predictions.py`).
+- `baselines/nnunet/`: nnU-Net v2 [9] on KiTS: `prepare_kits.py` writes the CytoNucs conversion as an nnU-Net
+  dataset (kidney / tumour / cyst, the same split as one fold), `to_instances.py` turns its predictions into
+  kidney and mass instances by the rule of the CytoNucs labels.
 
 ## References
 
@@ -154,6 +165,9 @@ Scores are kept per image, so bootstrap intervals and breakdowns can be computed
    [arXiv:2504.12078](https://arxiv.org/abs/2504.12078)
 8. C. Stringer, T. Wang, M. Michaelos, M. Pachitariu. Cellpose: a generalist algorithm for cellular
    segmentation. Nature Methods 18, 100–106 (2021). [doi:10.1038/s41592-020-01018-x](https://doi.org/10.1038/s41592-020-01018-x)
+9. F. Isensee, P. F. Jaeger, S. A. A. Kohl, J. Petersen, K. H. Maier-Hein. nnU-Net: a self-configuring method for
+   deep learning-based biomedical image segmentation. Nature Methods 18, 203–211 (2021).
+   [doi:10.1038/s41592-020-01008-z](https://doi.org/10.1038/s41592-020-01008-z)
 
 The paper describing CytoNucs is in preparation.
 

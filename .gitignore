@@ -29,6 +29,9 @@
 !/baselines/cellpose/
 /baselines/cellpose/*
 !/baselines/cellpose/*.py
+!/baselines/nnunet/
+/baselines/nnunet/*
+!/baselines/nnunet/*.py
 
 __pycache__/
 *.pyc

@@ -264,6 +264,43 @@ def assemble_head(config, head, candidates, shape, observer=None):
                           min_remaining_fraction=config.mask_min_remaining_fraction)
 
 
+def keep_inner_inside_outer(config, nuclei, cells):
+    """Inner labels without the objects that have less than inference.inner_min_inside_outer of their voxels
+    inside the kept outer objects (0 = off), and how many were removed: an inner object exists only inside an
+    outer one, e.g. a renal mass inside its kidney, so a mass found in the liver is a false positive."""
+    share = float(getattr(config, 'inner_min_inside_outer', 0.0) or 0.0)
+    if share <= 0 or not np.any(nuclei):
+        return nuclei, 0
+    total = np.bincount(nuclei.ravel())
+    inside = np.bincount(nuclei[cells > 0], minlength=len(total))
+    drop = np.flatnonzero((total > 0) & (inside < share * total))
+    drop = drop[drop > 0]
+    if len(drop):
+        nuclei = np.where(np.isin(nuclei, drop), 0, nuclei).astype(nuclei.dtype)
+    return nuclei, int(len(drop))
+
+
+def semantic_minimum(config, head):
+    return float(getattr(config, f'semantic_min_{head}', 0.0) or 0.0)
+
+
+def semantic_object_scores(labels, probability, grid):
+    """Mean of a head's semantic foreground probability (at the head grid) over the voxels of every object:
+    {label: score}. Every voxel takes the grid cell it falls in, as the training targets are subsampled."""
+    labels = np.asarray(labels)
+    if not np.any(labels):
+        return {}
+    up = np.asarray(probability, np.float32)
+    for axis, g in enumerate(grid):
+        if int(g) > 1:
+            up = np.repeat(up, int(g), axis=axis)
+    up = up[tuple(slice(0, s) for s in labels.shape)]
+    flat = labels.ravel()
+    sums = np.bincount(flat, weights=up.ravel())
+    counts = np.bincount(flat)
+    return {int(k): float(sums[k] / counts[k]) for k in np.flatnonzero(counts) if k}
+
+
 def rethreshold_prediction(config, sink, head, threshold, nuclei, cells):
     """Final labels and pairs when only `head` uses another mask threshold (higher or lower).
 
@@ -282,6 +319,7 @@ def rethreshold_prediction(config, sink, head, threshold, nuclei, cells):
         cells = labels
         evidence = [(n, shrunk.get(id(c)) if c is not None else None) for n, c in sink.get('evidence', [])]
     evidence = [(n, c) for n, c in evidence if n is not None]
+    nuclei, _ = keep_inner_inside_outer(config, nuclei, cells)
     pairs = assign_final_masks(nuclei, cells, getattr(config, 'pair_min_overlap', 0.1),
                                evidence, getattr(config, 'pair_min_mask_iou', 0.25))
     return nuclei, cells, pairs
@@ -334,6 +372,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     if policy == 'polyhedron':
         n = np.zeros(shape, np.int32) if nuc_labels is None else np.asarray(nuc_labels, np.int32)
         c = np.zeros(shape, np.int32) if cyto_labels is None else np.asarray(cyto_labels, np.int32)
+        n, _ = keep_inner_inside_outer(config, n, c)
         return n, c, assign_final_masks(n, c, getattr(config, 'pair_min_overlap', 0.1))
     if policy != 'mask':
         raise ValueError(f'Unknown refinement_mode: {policy}')
@@ -1005,6 +1044,12 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             nuclei, quality_gates.get('nucleus_min_area', 0))
         cells, diagnostics['cytoplasm']['area_gate_removed'] = drop_small_instances(
             cells, quality_gates.get('cytoplasm_min_area', 0))
+    if stage_audit is None:
+        nuclei, diagnostics['nucleus']['outside_outer_removed'] = keep_inner_inside_outer(config, nuclei, cells)
+    else:
+        # The audit's written masks calibrate the gates against these outputs: removing objects that keep their
+        # rows would remove their TP twice (gated AP above 1), so the audited output stays unfiltered, as ungated.
+        diagnostics['nucleus']['outside_outer_removed'] = 0
     pairs = assign_final_masks(nuclei, cells, getattr(config, 'pair_min_overlap', 0.1),
                                evidence, getattr(config, 'pair_min_mask_iou', 0.25))
     for h, stats in (('nucleus', ns), ('cytoplasm', cs)):
@@ -1836,6 +1881,30 @@ class CytoNucsPredictor:
                   'masks are not gated')
         return gates
 
+    def _semantic_wanted(self):
+        return bool(getattr(self.config, 'semantic_scores', False) or semantic_minimum(self.config, 'nucleus')
+                    or semantic_minimum(self.config, 'cytoplasm'))
+
+    def _apply_semantic(self, nucleus_instances, cytoplasm_instances, semantic, grids):
+        """Mean semantic foreground probability of every predicted object (self._last_semantic_scores: head ->
+        {label: score}) and the objects below inference.semantic_min_<head> removed. Not on the stage-audited
+        output: the audit's rows calibrate the quality gates against exactly these masks (keep_inner_inside_outer)."""
+        self._last_semantic_scores = None
+        if not semantic:
+            return nucleus_instances, cytoplasm_instances
+        out, scores = {}, {}
+        audited = getattr(self, '_refinement_stage_audit', None) is not None
+        for head, labels in (('nucleus', nucleus_instances), ('cytoplasm', cytoplasm_instances)):
+            labels = np.asarray(labels)
+            scores[head] = semantic_object_scores(labels, semantic[head], grids[head])
+            minimum = semantic_minimum(self.config, head)
+            drop = [k for k, v in scores[head].items() if v < minimum] if minimum and not audited else []
+            out[head] = np.where(np.isin(labels, drop), 0, labels).astype(labels.dtype) if drop else labels
+            if drop:
+                print(f'  [{head}] semantic gate {minimum}: removed {len(drop)} of {len(scores[head])} objects')
+        self._last_semantic_scores = scores
+        return out['nucleus'], out['cytoplasm']
+
     def _get_detection_model(self):
         """
         Detection-only submodel для первого StarDist прохода.
@@ -1852,6 +1921,18 @@ class CytoNucsPredictor:
         Настоящий refinement выполняется позже через
         predict_instances_prompted() с реальным Gaussian prompt.
         """
+        if self._semantic_wanted():
+            # The semantic foreground heads as well (inference.semantic_scores / semantic_min_*), in a submodel of
+            # their own: the plain one stays the one training's full validation traces.
+            if getattr(self.model, '_detection_submodel_semantic', None) is None:
+                keras_model = self.model.keras_model
+                self.model._detection_submodel_semantic = tf.keras.Model(
+                    inputs=keras_model.inputs,
+                    outputs={name: keras_model.get_layer(name).output for name in (
+                        'nucleus_prob', 'nucleus_dist', 'cytoplasm_prob', 'cytoplasm_dist',
+                        'nucleus_semantic_logit', 'cytoplasm_semantic_logit')},
+                    name='cytonucs_detection_semantic_inference')
+            return self.model._detection_submodel_semantic
         if getattr(self.model, '_detection_submodel', None) is not None:
             return self.model._detection_submodel
         if not hasattr(self, '_detection_model') or self._detection_model is None:
@@ -2088,6 +2169,9 @@ class CytoNucsPredictor:
 
         cov_nuc = np.zeros(nuc_shape_tiled, np.uint8)
         cov_cyto = np.zeros(cyto_shape_tiled, np.uint8)
+        semantic_full = (dict(nucleus=np.empty(nuc_shape_tiled, np.float32),
+                              cytoplasm=np.empty(cyto_shape_tiled, np.float32))
+                         if self._semantic_wanted() else None)
 
         # ============================================================
         # OUTPUT COPY
@@ -2146,12 +2230,13 @@ class CytoNucsPredictor:
         _fwd_cache = self._detection_forward_cache = self.model._detection_forward_cache
 
         def _forward(x):
-            key = tuple(int(v) for v in x.shape)
+            shape = tuple(int(v) for v in x.shape)
+            key = shape + (('semantic',) if semantic_full is not None else ())
             fn = _fwd_cache.get(key)
             if fn is None:
                 fn = tf.function(
                     lambda t: detection_model(t, training=False),
-                    input_signature=[tf.TensorSpec(key, tf.float32)],
+                    input_signature=[tf.TensorSpec(shape, tf.float32)],
                     reduce_retracing=True)
                 _fwd_cache[key] = fn
                 # Bound retained concrete graphs for heterogeneous volume sizes.
@@ -2226,6 +2311,10 @@ class CytoNucsPredictor:
                          s_src, s_dst, fx, coverage=cov_cyto)
                     _put(cytoplasm_dist_full, _arr('cytoplasm_dist'), cyto_grid,
                          s_src, s_dst, fx)
+                    if semantic_full is not None:
+                        for _h, _g in (('nucleus', nuc_grid), ('cytoplasm', cyto_grid)):
+                            _put(semantic_full[_h], 1. / (1. + np.exp(-_arr(_h + '_semantic_logit'))), _g,
+                                 s_src, s_dst, fx)
 
                     tiles_done += 1
                     del y_pred
@@ -2266,6 +2355,9 @@ class CytoNucsPredictor:
         nucleus_dist_full = _crop(nucleus_dist_full, nuc_grid, rays=True)
         cytoplasm_prob_full = _crop(cytoplasm_prob_full, cyto_grid)
         cytoplasm_dist_full = _crop(cytoplasm_dist_full, cyto_grid, rays=True)
+        if semantic_full is not None:
+            semantic_full = dict(nucleus=_crop(semantic_full['nucleus'], nuc_grid),
+                                 cytoplasm=_crop(semantic_full['cytoplasm'], cyto_grid))
 
         print(f"  nucleus_dist: [{nucleus_dist_full.min():.1f}, "
               f"{nucleus_dist_full.max():.1f}] px")
@@ -2345,6 +2437,8 @@ class CytoNucsPredictor:
         else:
             print("  ⚠️ Ни ядер, ни клеток -> prompted refinement не запускался")
             self._prompt_assignments = None
+        nucleus_instances, cytoplasm_instances = self._apply_semantic(
+            nucleus_instances, cytoplasm_instances, semantic_full, dict(nucleus=nuc_grid, cytoplasm=cyto_grid))
 
         # ============================================================
         # DETAILS
@@ -2455,6 +2549,10 @@ class CytoNucsPredictor:
         cytoplasm_dist = _get('cytoplasm_dist', cyto_grid)
         nuc_mask_pred = _get('nucleus_mask', nuc_grid)
         cyto_mask_pred = _get('cytoplasm_mask', cyto_grid)
+        semantic = None
+        if self._semantic_wanted():
+            semantic = {h: 1. / (1. + np.exp(-_get(h + '_semantic_logit', g)))
+                        for h, g in (('nucleus', nuc_grid), ('cytoplasm', cyto_grid))}
         del y_pred
 
         self._current_type = 'nucleus'
@@ -2498,6 +2596,8 @@ class CytoNucsPredictor:
             print("  ⚠️  Ни ядер, ни клеток -> промпт-ветка НЕ ЗАПУСКАЛАСЬ. "
                   "Возвращены сырые полиэдры StarDist.")
             self._prompt_assignments = None
+        nucleus_instances, cytoplasm_instances = self._apply_semantic(
+            nucleus_instances, cytoplasm_instances, semantic, dict(nucleus=nuc_grid, cytoplasm=cyto_grid))
 
         details = {
             'nucleus_prob': nucleus_prob,

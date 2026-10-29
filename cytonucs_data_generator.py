@@ -150,6 +150,19 @@ def allowed_crop_starts(region, size):
     return t[h:, w:] - t[:-h, w:] - t[h:, :-w] + t[:-h, :-w] == h * w
 
 
+def inside_outer_point(inner, outer, unknown, rng):
+    """A voxel, uniformly drawn, of an outer object that no inner object covers and no unknown region holds, or
+    None when the crop has none."""
+    region = (outer > 0) & (inner == 0)
+    for u in unknown.values():
+        if u is not None:
+            region &= ~u
+    points = np.flatnonzero(region)
+    if not len(points):
+        return None
+    return tuple(int(v) for v in np.unravel_index(points[int(rng.integers(len(points)))], region.shape))
+
+
 class CytoNucsDataGenerator(Sequence):
     """
     Data generator for CytoNucs StarDist training.
@@ -378,6 +391,14 @@ class CytoNucsDataGenerator(Sequence):
                                  axis=1).astype(np.int32)
             if len(fg_coords) == 0:  # фолбэк как в каноне
                 fg_coords = np.argwhere(seed_mask > 0).astype(np.int32)
+            # training.object_crop_shares: bounding-box centres of the objects of each level, for crops centred
+            # on one object picked uniformly (a small cyst as often as a large tumour).
+            object_centres = None
+            if getattr(self.config, 'object_crop_shares', None):
+                from scipy.ndimage import find_objects
+                object_centres = {role: np.array([[(sl.start + sl.stop) // 2 for sl in box] for box in find_objects(mask)
+                                                  if box is not None], np.int32).reshape(-1, nd)
+                                  for role, mask in (('nucleus', nucleus_mask), ('cytoplasm', cytoplasm_mask))}
             # Levels of the run annotated in this file (all of them unless training.partial_annotation).
             annotated = tuple(name for name, f in (('nucleus', self.nucleus_files[idx]), ('cytoplasm', self.cytoplasm_files[idx]))
                               if f is not None)
@@ -405,6 +426,7 @@ class CytoNucsDataGenerator(Sequence):
                 'nucleus_unknown': nucleus_unknown,
                 'cytoplasm_unknown': cytoplasm_unknown,
                 'fg_coords': fg_coords,
+                'object_centres': object_centres,
                 'assignments': assignments,
                 'filename': self.image_files[idx].name,
                 'annotated': annotated,
@@ -697,7 +719,17 @@ class CytoNucsDataGenerator(Sequence):
                 p_fg = getattr(self.config, 'fg_crop_prob', 0.9)
                 center = None
                 fg = sample['fg_coords']
-                if rng.random() < p_fg and len(fg) > 0:
+                shares = getattr(self.config, 'object_crop_shares', None)
+                if shares:
+                    # training.object_crop_shares (instead of fg_crop_prob): centred on one object of the inner
+                    # or the outer level, shifted by up to a quarter of the crop; else at any position.
+                    u = rng.random()
+                    role = 'nucleus' if u < shares[0] else 'cytoplasm' if u < shares[0] + shares[1] else None
+                    centres = sample['object_centres'][role] if role else ()
+                    if len(centres):
+                        center = centres[int(rng.integers(len(centres)))] + [
+                            int(rng.integers(-(p // 4), p // 4 + 1)) for p in need]
+                elif rng.random() < p_fg and len(fg) > 0:
                     center = fg[int(rng.integers(len(fg)))][:nd]
 
                 starts = []
@@ -921,8 +953,15 @@ class CytoNucsDataGenerator(Sequence):
                     # Like false detector peaks at inference: any non-nuclear voxel
                     # (background or cytoplasm), nucleus-sized. The nuclear target is
                     # empty; the cell head still owns the cell containing the prompt.
+                    # augmentation.negative_prompt_inside_outer: that share of them at a voxel of
+                    # an outer object no inner object covers (hard negatives: on KiTS the
+                    # detector fires on kidney tissue that looks like a mass).
+                    inside = self.config.negative_prompt_inside_outer
+                    hard = inside_outer_point(nucleus_mask, cytoplasm_mask, unknown, rng) if (
+                        inside and rng.random() < inside) else None
                     for _attempt in range(64):
-                        center_neg = tuple(int(rng.integers(s)) for s in nucleus_mask.shape)
+                        center_neg = hard if hard is not None else tuple(
+                            int(rng.integers(s)) for s in nucleus_mask.shape)
                         if nucleus_mask[center_neg] == 0 and not any(u is not None and u[center_neg] for u in unknown.values()):
                             if nuc_present:
                                 sized = np.argwhere(nucleus_mask == int(rng.choice(sorted(nuc_present))))

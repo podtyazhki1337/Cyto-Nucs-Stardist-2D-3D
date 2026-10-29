@@ -240,7 +240,8 @@ def predict_hierarchy(model, config, image, calibration=None, normalize=True, th
 
     calibration: pair -> quality gates (read_calibration of the checkpoint); thresholds:
     dict(prob_thresh_nucleus, prob_thresh_cytoplasm, nms_thresh) for the predictors.
-    Returns dict(levels={level: labels}, parents={child level: {child id: parent id}}).
+    Returns dict(levels={level: labels}, parents={child level: {child id: parent id}}, semantic={level: {id:
+    mean semantic foreground probability}} (with inference.semantic_scores or semantic_min_*, else empty)).
     """
     from cytonucs_runtime import normalize_percentiles as percentile_normalize
     from cytonucs_inference import CytoNucsPredictor
@@ -266,8 +267,10 @@ def predict_hierarchy(model, config, image, calibration=None, normalize=True, th
             if chosen is None:                                   # as compute_jtpr does without predicted pairs
                 chosen = compute_nucleus_cell_assignments(levels[config.levels[0]], levels[config.levels[1]])[0]
             parents[config.levels[0]] = {int(k): int(v) for k, v in chosen.items()}
-        return dict(levels=levels, parents=parents)
-    levels = {}
+        scores = getattr(predictor, '_last_semantic_scores', None) or {}
+        semantic = {level: scores[role] for role, level in config.level_roles.items() if role in scores}
+        return dict(levels=levels, parents=parents, semantic=semantic)
+    levels, semantic = {}, {}
     outer = None
     for index in range(len(config.level_pairs)):
         view = ModelPairView(model, config.pair_view(index))
@@ -276,9 +279,14 @@ def predict_hierarchy(model, config, image, calibration=None, normalize=True, th
         inner, outer, _ = DiceCallback._predict_full_volume(SimpleNamespace(model=view), predictor,
                                                             with_pair_code(image, view.config))
         levels[view.config.levels[0]] = np.asarray(inner)
+        scores = getattr(predictor, '_last_semantic_scores', None) or {}
+        if 'nucleus' in scores:
+            semantic[view.config.levels[0]] = scores['nucleus']
+        if 'cytoplasm' in scores:
+            semantic[config.levels[-1]] = scores['cytoplasm']                    # the last pair's stays
     levels[config.levels[-1]] = np.asarray(outer)
     parents = {child: link_children(levels[child], levels[parent]) for child, parent in config.level_pairs}
-    return dict(levels=levels, parents=parents)
+    return dict(levels=levels, parents=parents, semantic=semantic)
 
 
 def train_hierarchy(config_dict, config, experiment=None):
