@@ -511,13 +511,13 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         return mask_thresh if threshold is None else float(threshold)
 
     def head_candidate(h, p_grid, quality, origin, run_shape, net_shape, center, sigma, fine_mask, expand,
-                       expansion_step, coarse=None):
+                       expansion_step, coarse=None, record=True):
         """Candidate of one head for one prompt from its probability on the head grid (the rule of both the
         one-prompt and the batched path): threshold and prompt component (`coarse`: local_prompt_mask already
         evaluated); a cell cut by an inner ROI face is prompted again over a larger ROI (expand(...) returns
         that candidate); full-resolution mask (fine_mask(lo, mask_shape, threshold)); quality gate. None when
-        it yields no candidate."""
-        observer = stage_audit.get(h) if stage_audit is not None else None
+        it yields no candidate. record=False: not reported to the stage audit (a second refinement pass)."""
+        observer = stage_audit.get(h) if stage_audit is not None and record else None
         if observer is not None:
             observer.record_roi(origin, run_shape, net_shape, center + origin, getattr(config, h+'_grid'))
         diag = diagnostics[h]
@@ -572,7 +572,8 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         # Raw probabilities and prompt let calibration re-threshold without new forwards;
         # the window around the mask (only when candidates are collected) also allows lower ones.
         candidate.update(probability=candidate['score'], prompt_center=center + origin,
-                         prompt_sigma=np.asarray(sigma, np.float64), threshold=threshold)
+                         prompt_sigma=np.asarray(sigma, np.float64), threshold=threshold,
+                         roi=(tuple(int(v) for v in origin), tuple(int(v) for v in run_shape)))
         if candidate_sink is not None:
             if fine_used:                              # the fine window already has a margin
                 window = (np.asarray(window_origin), p)
@@ -596,12 +597,17 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         diag['accepted'] += 1
         return candidate
 
-    def run(center, distances, head, roi=None, fixed_sigma=None, expansion_step=0):
-        """Candidates (nucleus, cytoplasm) of one prompt, one network pass."""
+    def run(center, distances, head, roi=None, fixed_sigma=None, expansion_step=0, prompt_fn=None, record=True,
+            only=None):
+        """Candidates (nucleus, cytoplasm) of one prompt, one network pass. prompt_fn(origin, center, sigma,
+        net_shape): the prompt map instead of the Gaussian (a mask prompt of inference.refinement_iterations);
+        only: the head whose candidate is wanted (the other is not built)."""
         nonlocal runs
         origin, run_shape, center, sigma = prepare(center, distances, head, roi, fixed_sigma)
         cache_key, net_shape = roi_input(origin, run_shape)
-        prompt = tf.convert_to_tensor(gaussian_prompt(center, sigma, net_shape)[None, ..., None], tf.float32)
+        prompt_map = (gaussian_prompt(center, sigma, net_shape) if prompt_fn is None
+                      else prompt_fn(origin, center, sigma, net_shape))
+        prompt = tf.convert_to_tensor(np.asarray(prompt_map, np.float32)[None, ..., None], tf.float32)
         hidden = {}
         if head == 'cytoplasm':
             cell_logits = cell_fn([feature_cache[cache_key][i] for i in (1, 2, 5, 6)] + [prompt])
@@ -623,6 +629,8 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         runs += 1
         candidates = [None, None]
         for h, logit in head_logits:
+            if only is not None and h != only:
+                continue
             # Only the target channel leaves the device; the grid map is finite exactly
             # when its linear upsampling is.
             p_grid = tf.nn.softmax(logit, axis=-1)[0, ..., 1].numpy()
@@ -631,7 +639,8 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                 lo, mask_shape, run_shape, net_shape, center, sigma, threshold))
             expand = lambda c, roi, s, step: run(c, None, 'cytoplasm', roi=roi, fixed_sigma=s, expansion_step=step)[1]
             candidates[0 if h == 'nucleus' else 1] = head_candidate(
-                h, p_grid, quality, origin, run_shape, net_shape, center, sigma, fine_mask, expand, expansion_step)
+                h, p_grid, quality, origin, run_shape, net_shape, center, sigma, fine_mask, expand, expansion_step,
+                record=record)
         return candidates
 
     batch = int(getattr(config, 'refinement_batch', 0) or 0)
@@ -1032,6 +1041,40 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                     nuc_candidates.append(flag(n))
                     evidence.append((n, flag(c)))
                 cell_candidates.append(flag(c))
+    iterations = int(getattr(config, 'refinement_iterations', 1) or 1)
+    if iterations > 1:
+        # inference.refinement_iterations: every candidate is refined again with its own mask in the prompt
+        # (cytonucs_runtime.mask_prompt, as training.mask_prompt_fraction trains it), over the same ROI and with
+        # the same Gaussian. The candidate dict is updated in place, so the nucleus-cell evidence keeps pointing
+        # at it; a pass that yields no candidate keeps the previous one.
+        from cytonucs_runtime import mask_prompt
+
+        def again(candidate, head):
+            mask, lo = candidate['mask'], np.asarray(candidate['lo'])
+
+            def prompt_fn(origin, center, sigma, net_shape):
+                m = np.zeros(net_shape, np.float32)
+                start = lo - np.asarray(origin)
+                src = tuple(slice(max(0, -int(b)), min(int(n), int(t) - int(b))) for b, n, t in zip(start, mask.shape, net_shape))
+                dst = tuple(slice(max(0, int(b)), min(int(t), int(b) + int(n))) for b, n, t in zip(start, mask.shape, net_shape))
+                m[dst] = mask[src]
+                return mask_prompt(gaussian_prompt(center, sigma, net_shape), m)
+            new = run(candidate['prompt_center'], None, head, roi=candidate['roi'], fixed_sigma=candidate['prompt_sigma'],
+                      expansion_step=config.cell_roi_expansion_steps, prompt_fn=prompt_fn, record=False, only=head)
+            new = new[0 if head == 'nucleus' else 1]
+            diagnostics[head]['iterated'] = diagnostics[head].get('iterated', 0) + 1
+            if new is None:
+                diagnostics[head]['iteration_kept'] = diagnostics[head].get('iteration_kept', 0) + 1
+                return
+            kept = {k: candidate[k] for k in ('detection_score', 'residual') if k in candidate}
+            candidate.clear()
+            candidate.update(new, **kept)
+
+        for _ in range(iterations - 1):
+            for head, candidates in (('nucleus', nuc_candidates), ('cytoplasm', cell_candidates)):
+                for candidate in candidates:
+                    if isinstance(candidate, dict) and 'roi' in candidate:
+                        again(candidate, head)
     if candidate_sink is not None:
         candidate_sink.update(nucleus=nuc_candidates, cytoplasm=cell_candidates, evidence=evidence)
     nuclei, ns = assemble_head(config, 'nucleus', nuc_candidates, shape,

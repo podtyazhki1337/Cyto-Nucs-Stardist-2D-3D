@@ -45,7 +45,8 @@ class CytoNucsConfig:
                          train_region_crops=False,
                          partial_annotation=False, unknown_label=None, annotated_anchor_share=0.0,
                          init_weights=None, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0,
-                         val_loss_every_n_epochs=1, keep_epoch_checkpoints=1),
+                         val_loss_every_n_epochs=1, keep_epoch_checkpoints=1,
+                         mask_prompt_fraction=0.0, mask_prompt_start_epoch=20),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25, inner_min_inside_outer=0.0,
@@ -64,7 +65,8 @@ class CytoNucsConfig:
                           nms_candidate_spacing=0.12, nms_border_exclude_xy=2,
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
                           refinement_windows=False, max_prompts_per_head=0,
-                          skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0),
+                          skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0,
+                          refinement_iterations=1),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1, negative_prompt_inside_outer=0.0,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -497,6 +499,10 @@ class CytoNucsConfig:
             raise ValueError(f'refinement_batch must be a nonnegative integer, got {self.refinement_batch!r}')
         if isinstance(self.max_prompts_per_head, bool) or not isinstance(self.max_prompts_per_head, (int, np.integer)) or self.max_prompts_per_head < 0:
             raise ValueError(f'max_prompts_per_head must be a nonnegative integer (0: no limit), got {self.max_prompts_per_head!r}')
+        if isinstance(self.refinement_iterations, bool) or not isinstance(self.refinement_iterations, (int, np.integer)) or self.refinement_iterations < 1:
+            raise ValueError(f'refinement_iterations must be a positive integer (1: one pass), got {self.refinement_iterations!r}')
+        if isinstance(self.mask_prompt_start_epoch, bool) or not isinstance(self.mask_prompt_start_epoch, (int, np.integer)) or self.mask_prompt_start_epoch < 0:
+            raise ValueError(f'mask_prompt_start_epoch must be a nonnegative integer, got {self.mask_prompt_start_epoch!r}')
         if not isinstance(self.refinement_windows, bool):
             raise ValueError(f'refinement_windows must be true or false, got {self.refinement_windows!r}')
         if not isinstance(self.skip_covered_prompts, bool):
@@ -547,6 +553,7 @@ class CytoNucsConfig:
                 raise ValueError(f'{key} must be a number {">" if positive else ">="} 0, got {value!r}')
         for key in ('cell_predicted_nucleus_fraction', 'mask_nms_nucleus', 'mask_nms_cytoplasm', 'pair_min_overlap',
                     'pair_min_mask_iou', 'inner_min_inside_outer', 'semantic_min_nucleus', 'semantic_min_cytoplasm',
+                    'mask_prompt_fraction',
                     'cyto_center_prompt_prob', 'negative_prompt_prob', 'negative_prompt_inside_outer',
                     'mask_ce_empty_weight', 'mask_thresh_nucleus', 'mask_thresh_cytoplasm',
                     'refinement_gradient_scale', 'repeat_cell_prompt_prob', 'neighbor_cell_prompt_prob', 'cell_z_pair_prob', 'nucleus_z_pair_prob', 'mask_containment_threshold', 'predicted_prompt_fraction',

@@ -30,6 +30,13 @@ def align_training_history(history, completed_epochs):
     return result
 
 
+def mask_prompt(gaussian, mask):
+    """Prompt of a refinement pass that knows the object's mask: the Gaussian, raised to at least 0.5 inside the
+    mask; its maximum stays the Gaussian's peak (training.mask_prompt_fraction, inference.refinement_iterations).
+    Works on NumPy arrays and tensors alike."""
+    return gaussian + .5 * mask * (1. - gaussian)
+
+
 def checkpoint_jtpr_weight(config):
     """Weight of JTPR in the checkpoint metric: loss_params.checkpoint_w_jtpr; 0 for a run with
     one object level (model.levels), which has no nucleus-cell pairs."""
