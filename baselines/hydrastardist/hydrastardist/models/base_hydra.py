@@ -107,6 +107,21 @@ def masked_loss_wbr(mask, reg_weight=0, norm_by_mask=True):
         return loss
     return generic_masked_loss(mask, wbr_loss, reg_weight=reg_weight, norm_by_mask=norm_by_mask)
 
+def wbr_loss_paper(eps=1e-7, max_ratio=0.99):
+    """WBR of the paper (De et al. 2025, Eq. 5), differentiable: Lambda = 1 / (1 + eps - sum((1 - p_outer) * p_inner)
+    / sum(1 - y_outer)) per image, p the probability maps of the two branches, y_outer the ground-truth foreground of the
+    outer level. [CytoNucs baseline change: the released masked_loss_wbr below has zero gradient, see run_hsd.py.]
+    The ratio is capped at max_ratio (Lambda <= 100): where the crop holds little ground-truth background the
+    paper's ratio exceeds 1 and Lambda turns negative.
+    y_true: (B, H, W, 1) outer foreground; y_pred: (B, H, W, 2) = [inner probability, outer probability]."""
+    def wbr(y_true, y_pred):
+        inner, outer = y_pred[..., 0], y_pred[..., 1]
+        outside = tf.reduce_sum((1. - outer) * inner, axis=[1, 2])
+        background = tf.reduce_sum(1. - y_true[..., 0], axis=[1, 2])
+        ratio = tf.minimum(outside / tf.maximum(background, 1.), max_ratio)
+        return 1. / (1. + eps - ratio)
+    return wbr
+
 def weighted_categorical_crossentropy(weights, ndim):
     """ ndim = (2,3) """
 
@@ -364,14 +379,14 @@ class StarDistBase(BaseModel):
             loss = [[prob1_loss, dist_loss], [prob2_loss, dist_loss]]
 
 
-        self.keras_model.compile(optimizer, loss         = {'prob1':loss[0][0],
-                                                            'dist1':loss[0][1],
-                                                            'prob2':loss[1][0],
-                                                            'dist2':loss[1][1]},
-                                            loss_weights = {'prob1':list(self.config.train_loss_weights)[0][0],
-                                                            'dist1':list(self.config.train_loss_weights)[0][1],
-                                                            'prob2':list(self.config.train_loss_weights)[1][0],
-                                                            'dist2':list(self.config.train_loss_weights)[1][1]},
+        losses = {'prob1': loss[0][0], 'dist1': loss[0][1], 'prob2': loss[1][0], 'dist2': loss[1][1]}
+        weights = {'prob1': list(self.config.train_loss_weights)[0][0], 'dist1': list(self.config.train_loss_weights)[0][1],
+                   'prob2': list(self.config.train_loss_weights)[1][0], 'dist2': list(self.config.train_loss_weights)[1][1]}
+        if self.config.train_wbr_loss:                    # [CytoNucs baseline change] the 'wbr' output, lambda_3
+            losses['wbr'] = wbr_loss_paper(getattr(self.config, 'train_wbr_eps', 1e-7))
+            weights['wbr'] = getattr(self.config, 'train_wbr_weight', 1.0)
+        self.keras_model.compile(optimizer, loss         = losses,
+                                            loss_weights = weights,
                                             metrics      = {'prob1': kld,
                                                             'dist1': [relevant_mae, relevant_mse, dist_iou_metric],
                                                             'prob2': kld,

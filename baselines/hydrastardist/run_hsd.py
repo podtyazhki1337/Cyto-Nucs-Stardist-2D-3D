@@ -11,9 +11,12 @@ labels with filled holes. Choices of this baseline:
   - grid --grid (2 x 2 as the CytoNucs and StarDist runs; the code's default is 1 x 1);
   - augmentation: the CytoNucs functions with the values of --like, as for the other methods (the paper names
     none): flips, 90 degree rotations, intensity, noise, blur, elastic deformation;
-  - no WBR: in the released code the WBR layer gets the input image as its mask, multiplies predictions of
+  - WBR: in the released code the WBR layer gets the input image as its mask, multiplies predictions of
     different batch elements, and binarises the sigmoid outputs (always > 0) to 1, so its gradient is zero and
-    HSD-WBR trains exactly as HSD;
+    HSD-WBR trains exactly as HSD. Without --wbr the run is HSD; with --wbr it is HSD-WBR with the loss of the paper
+    (Eq. 4-5, lambda_3 = 1, eps = 1e-7) made to work: an output 'wbr' = [inner, outer] probability maps of the two
+    branches, trained against the ground-truth outer foreground per image (base_hydra.wbr_loss_paper; its ratio is
+    capped at 0.99 so the loss stays below 100, where the paper's form turns negative);
   - the code's data generator trains branch 1 on the second label set it is given and branch 2 on the first
     (StarDistData2D.__getitem__ swaps them), while optimize_thresholds compares branch 1 with the first set; here
     the thresholds are optimised with the label sets in the order the branches learned them, and branch 1 is read
@@ -25,7 +28,7 @@ overlap), the paper's metrics (score_hierarchy.paper_metrics); predicted objects
 <split>/<level>_unknown/<name> are left out.
 
 Usage:
-  python run_hsd.py --data DIR --gpu 0 --like CONFIG --name NAME [--epochs 400] [--batch 32]
+  python run_hsd.py --data DIR --gpu 0 --like CONFIG --name NAME [--epochs 400] [--batch 32] [--wbr]
   python run_hsd.py --data DIR --score --name NAME --gpu 0 [--split test val]
 """
 import argparse
@@ -51,6 +54,7 @@ parser.add_argument('--grid', type=int, nargs=2, default=[2, 2])
 parser.add_argument('--like', help='CytoNucs config whose augmentation values are used')
 parser.add_argument('--name', required=True)
 parser.add_argument('--seed', type=int, default=42, help='random seed of the run (42: the default of the code)')
+parser.add_argument('--wbr', action='store_true', help="HSD-WBR: the paper's within-boundary regularisation, lambda_3 = 1")
 parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/hydrastardist')
 parser.add_argument('--score', action='store_true')
 parser.add_argument('--split', nargs='+', default=['test'])
@@ -150,7 +154,8 @@ def train():
     augment, aug_values = make_augmenter(args.like)
     conf = Config2D(axes='YXC' if channels else 'YX', n_rays=32, n_channel_in=x_train[0].shape[-1] if channels else 1,
                     grid=GRID, use_gpu=False, train_patch_size=PATCH, train_batch_size=args.batch, train_epochs=args.epochs,
-                    train_steps_per_epoch=args.steps, train_learning_rate=3e-4, train_tensorboard=False)
+                    train_steps_per_epoch=args.steps, train_learning_rate=3e-4, train_tensorboard=False,
+                    train_wbr_loss=args.wbr)
     model = StarDist2D(conf, name=args.name, basedir=args.basedir)
     params = int(model.keras_model.count_params())
     fov = [int(max(a, b)) for a, b in zip(*model._axes_tile_overlap('YX'))]       # per branch in this code: the larger
@@ -180,7 +185,8 @@ def train():
                 thresholds={args.outer: {k: float(v) for k, v in thresholds[0].items()},
                             args.inner: {k: float(v) for k, v in thresholds[1].items()}},
                 val_loss=[float(v) for v in history.history.get('val_loss', [])],
-                code='baselines/hydrastardist/hydrastardist = napari-hydra c68ae35 (BSD-3-Clause), no WBR',
+                code='baselines/hydrastardist/hydrastardist = napari-hydra c68ae35 (BSD-3-Clause), ' +
+                     ('WBR of the paper, made differentiable (wbr_loss_paper)' if args.wbr else 'no WBR'), wbr=args.wbr,
                 weights=str(Path(args.basedir) / args.name / 'weights_best.h5'))
     (Path(args.basedir) / args.name / 'training.json').write_text(json.dumps(info, indent=2, default=str))
     print(json.dumps({k: info[k] for k in ('training_hours', 'gpu_peak_mem_gb', 'thresholds', 'parameters')}))

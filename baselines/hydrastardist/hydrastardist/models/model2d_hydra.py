@@ -101,14 +101,15 @@ class StarDistData2D(StarDistDataBase):
 
 
         if self.n_classes is None:
-            return ({'input': X}, 
-                    {
+            targets = {
                         'dist1': dist_and_mask1,
                         'prob1': prob1,
                         'dist2': dist_and_mask2,
                         'prob2': prob2
-                    }   
-                )
+                    }
+            if getattr(self, 'wbr', False):               # [CytoNucs baseline change] outer (branch 1) foreground
+                targets['wbr'] = (prob1 > 0).astype(np.float32)
+            return ({'input': X}, targets)
 
         else:
             prob_class1 = np.stack(tuple((mask_to_categorical(y, self.n_classes, self.classes[k]) for y,k in zip(Y1, idx))))
@@ -253,6 +254,8 @@ class Config2D(BaseConfig):
 
         self.train_dist_loss           = 'mae'
         self.train_wbr_loss            = False 
+        self.train_wbr_weight          = 1.0     # [CytoNucs baseline change] lambda_3 of the paper
+        self.train_wbr_eps             = 1e-7    # [CytoNucs baseline change] epsilon of the paper's Eq. 5
         self.train_loss_weights        = ((1,0.2),(1,0.2)) if self.n_classes is None else ((1,0.2,1),(1,0.2,1))
         self.train_class_weights       = ((1,1),(1,1)) if self.n_classes is None else ((1,)*(self.n_classes+1),(1,)*(self.n_classes+1))
         self.train_epochs              = 400
@@ -355,12 +358,12 @@ class StarDist2D(StarDistBase):
         output_prob2 = Conv2D(                 1, (1,1), name='prob2', padding='same', activation='sigmoid')(unet_branch2)
         output_dist2 = Conv2D(self.config.n_rays, (1,1), name='dist2', padding='same', activation='linear')(unet_branch2)
 
-        if self.config.train_wbr_loss:
-            concat = Concatenate(axis = 1,name='Concatenated_prob')([output_prob1, output_prob2])
-            self.activity_reg = ActivityRegularizationLayer()
-            _, _ = self.activity_reg(concat, input_img[:,:,1:])
-        else:
-            pass
+        # [CytoNucs baseline change] WBR as an output of its own, [inner, outer] probability, trained against the
+        # outer ground truth by base_hydra.wbr_loss_paper. The released code concatenated the maps along the image
+        # height, passed the input image as the mask and binarised the probabilities (zero gradient). Branch 2 learns
+        # the first label set given to train() and branch 1 the second (StarDistData2D swaps them): run_hsd.py gives
+        # the inner level first, so branch 2 is the inner level and branch 1 the outer one.
+        wbr_output = Concatenate(axis=-1, name='wbr')([output_prob2, output_prob1]) if self.config.train_wbr_loss else None
         
         # attach extra classification head when self.n_classes is given
         if self._is_multiclass():
@@ -386,15 +389,15 @@ class StarDist2D(StarDistBase):
                         }
                 )
         else:
-            return Model(
-                inputs = input_img,
-                outputs = {
-                        'dist1': output_dist1,
-                        'prob1': output_prob1,
-                        'dist2': output_dist2,
-                        'prob2': output_prob2,
-                    }
-                )
+            outputs = {
+                    'dist1': output_dist1,
+                    'prob1': output_prob1,
+                    'dist2': output_dist2,
+                    'prob2': output_prob2,
+                }
+            if wbr_output is not None:
+                outputs['wbr'] = wbr_output
+            return Model(inputs = input_img, outputs = outputs)
 
     def train(self, X, Y1, Y2, validation_data, classes='auto', augmenter=None, seed=None, epochs=None, steps_per_epoch=None, workers=1):
         """Train the neural network with the given data.
@@ -483,11 +486,13 @@ class StarDist2D(StarDistBase):
         classes_val = self._parse_classes_arg(validation_data[2], n_data_val) if self._is_multiclass() else None
         n_take = self.config.train_n_val_patches if self.config.train_n_val_patches is not None else n_data_val
         _data_val = StarDistData2D(validation_data[0],validation_data[1], validation_data[2], classes=classes_val, batch_size=n_take, length=1, **data_kwargs)
+        _data_val.wbr = bool(self.config.train_wbr_loss)
         data_val = _data_val[0]
 
         # expose data generator as member for general diagnostics
         self.data_train = StarDistData2D(X, Y1, Y2, classes=classes, batch_size=self.config.train_batch_size,
                                          augmenter=augmenter, length=epochs*steps_per_epoch, **data_kwargs)
+        self.data_train.wbr = bool(self.config.train_wbr_loss)
 
         if self.config.train_tensorboard:
             # show dist for three rays

@@ -137,7 +137,9 @@ Scores are kept per image, so bootstrap intervals and breakdowns can be computed
 ## Baselines
 
 - `baselines/stardist3d/`: StarDist with one model per level (2D or 3D, files or spatial splits, full resolution).
-- `baselines/hydrastardist/`: HydraStarDist [7], the authors' code, vendored with its BSD licence.
+- `baselines/hydrastardist/`: HydraStarDist [7], the authors' code, vendored with its BSD licence;
+  `run_hsd.py --wbr` trains HSD-WBR with the paper's within-boundary loss made differentiable (the released
+  WBR has zero gradient; the changes are marked in the code).
 - `baselines/cellpose/`: Cellpose [8] (version 3), fine-tuned from the pretrained models and as pretrained;
   `run_cellpose3d.py` for the 3D volume (2D network on XY / XZ / YZ planes, 3D flows or stitched planes chosen on
   the val blocks, scored on whole blocks), `run_cellpose3d_files.py` the same for a dataset of one file per volume
