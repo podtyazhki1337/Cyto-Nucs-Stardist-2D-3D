@@ -131,6 +131,7 @@
     "semantic_scores": false,
     "semantic_min_nucleus": 0.0,
     "semantic_min_cytoplasm": 0.0,
+    "quality_gates_override": null,
     "mask_thresh_nucleus": null,
     "mask_thresh_cytoplasm": null,
     "tiling_fixed_axes": null,

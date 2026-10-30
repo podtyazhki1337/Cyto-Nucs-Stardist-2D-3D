@@ -1851,8 +1851,11 @@ class CytoNucsPredictor:
         # mask_quality_min='auto': per-head gates calibrated by full validation
         # and stored with the checkpoint. Calibration passes (full validation,
         # threshold search) set calibrating=True and see ungated candidates.
-        self.quality_gates = (getattr(model, 'loaded_quality_gates', None)
-                              if config.mask_quality_min == 'auto' else None)
+        # inference.quality_gates_override replaces some or all of them (e.g. gates chosen for AP alone by
+        # recalibrate_gates.py from the full validation of the checkpoint).
+        override = getattr(config, 'quality_gates_override', None)
+        self.quality_gates = (dict(getattr(model, 'loaded_quality_gates', None) or {}, **override) if override
+                              else getattr(model, 'loaded_quality_gates', None)) if config.mask_quality_min == 'auto' else None
         self.mask_thresholds = (getattr(model, 'loaded_mask_thresholds', None)
                                 if 'auto' in (config.mask_thresh_nucleus, config.mask_thresh_cytoplasm) else None)
         self.calibrating = False

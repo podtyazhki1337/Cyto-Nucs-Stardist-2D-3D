@@ -50,6 +50,7 @@ class CytoNucsConfig:
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25, inner_min_inside_outer=0.0,
                           semantic_scores=False, semantic_min_nucleus=0.0, semantic_min_cytoplasm=0.0,
+                          quality_gates_override=None,
                           mask_thresh_nucleus=None, mask_thresh_cytoplasm=None,
                           tiling_fixed_axes=None, refinement_patch_size=None,
                           refinement_adaptive_roi=False, proposal_mode='stardist',
@@ -557,6 +558,14 @@ class CytoNucsConfig:
                 continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f'{key} must be a number in [0, 1], got {value!r}')
+        override = self.quality_gates_override
+        if override is not None:
+            keys = {'nucleus', 'cytoplasm', 'nucleus_min_area', 'cytoplasm_min_area'}
+            if (not isinstance(override, dict) or not set(override) <= keys or any(
+                    isinstance(v, bool) or not isinstance(v, (int, float)) or not np.isfinite(v) or v < 0 for v in override.values())):
+                raise ValueError(f'quality_gates_override must be null or a dict of {sorted(keys)} with numbers >= 0, got {override!r}')
+            if self.mask_quality_min != 'auto':
+                raise ValueError('quality_gates_override replaces calibrated gates: it needs mask_quality_min = "auto"')
         if (self.semantic_scores or self.semantic_min_nucleus or self.semantic_min_cytoplasm) and not self.semantic_foreground_weight:
             raise ValueError('semantic_scores / semantic_min_* read the semantic foreground heads: they need '
                              'loss_params.semantic_foreground_weight > 0 (the heads exist only then)')

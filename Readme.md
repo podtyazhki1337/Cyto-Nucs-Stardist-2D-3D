@@ -48,6 +48,7 @@ cytonucs_refinement_audit.py, cytonucs_runtime.py, cytonucs_gpu_setup.py      he
 score_hierarchy.py           AP, JTPR and the HydraStarDist-paper metrics of a trained model on a split
 score_predictions.py         the same scores for saved label images of any method
 semantic_gate.py             threshold of the semantic gate of one level, chosen on saved predictions
+recalibrate_gates.py         quality gates of a trained run chosen for AP alone, from its full-validation log
 evaluate_blocks.py           scores on whole held-out blocks of a spatially split 3D volume
 score_native_resolution.py   scores of a model trained on a downscaled copy, against the native annotation
 gpu_monitor.py               GPU and host memory log of a run (resource tables)
@@ -111,6 +112,7 @@ Main options:
 | loss_params | `dist_polar_iou_weight`, `prob_iou_aware` | Polar IoU on the rays, IoU-aware probability target |
 | inference | `refinement_batch`, `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride`, `refinement_roi_size_step` | speed of the prompt refinement |
 | inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (0 = off) |
+| inference | `quality_gates_override` | per-head quality / size gates replacing the calibrated ones (e.g. from `recalibrate_gates.py`) |
 | inference | `semantic_scores`, `semantic_min_nucleus`, `semantic_min_cytoplasm` | mean semantic foreground probability of every object (saved with `--predictions` in `semantic/`); objects of a role below its minimum are removed (0 = off) |
 
 The ray geometry and grids are measured on the training labels at the start of a run and saved next to the
