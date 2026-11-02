@@ -301,6 +301,67 @@ def semantic_object_scores(labels, probability, grid):
     return {int(k): float(sums[k] / counts[k]) for k in np.flatnonzero(counts) if k}
 
 
+def group_by_center_votes(labels, coords, probs, dists, offset, grid, radius):
+    """StarDist candidates of one head grouped by the centre their objects vote for (inference.center_vote_grouping):
+    every voxel of a candidate's polygon votes at its position plus the predicted centre offset (head-grid nodes),
+    the candidate's vote is the mean; two candidates whose votes lie closer than `radius` times the larger mean ray
+    are one object. A group keeps its most probable candidate, the union of the group's polygons as its label and
+    its rays scaled to the union's size, so the object is prompted once. Returns (labels, coords, probs, dists,
+    number of candidates removed)."""
+    if coords is None or len(coords) < 2 or offset is None:
+        return labels, coords, probs, dists, 0
+    labels = np.asarray(labels)
+    grid = np.asarray(grid, int)
+    nd = labels.ndim
+    nodes = labels[tuple(slice(0, None, g) for g in grid)]
+    offset = np.asarray(offset, np.float32)[tuple(slice(0, s) for s in nodes.shape)]
+    where = np.nonzero(nodes)
+    lab = nodes[where].astype(np.int64)
+    n_lab = int(labels.max()) + 1
+    count = np.bincount(lab, minlength=n_lab).astype(np.float64)
+    votes = np.stack([np.bincount(lab, weights=(where[d] + offset[where][:, d]) * grid[d], minlength=n_lab)
+                      for d in range(nd)], 1) / np.maximum(count, 1)[:, None]
+    coords = np.asarray(coords)
+    at = [int(labels[tuple(np.clip(np.asarray(c, int), 0, np.array(labels.shape) - 1))]) for c in coords]
+    reach = np.array([float(np.mean(d)) if d is not None else 0. for d in (dists if dists is not None else [None] * len(coords))])
+    parent = list(range(len(coords)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    valid = [i for i in range(len(coords)) if at[i] and count[at[i]]]
+    for a, i in enumerate(valid):
+        for j in valid[a + 1:]:
+            if np.linalg.norm(votes[at[i]] - votes[at[j]]) < radius * max(reach[i], reach[j]):
+                parent[root(i)] = root(j)
+    groups = {}
+    for i in range(len(coords)):
+        groups.setdefault(root(i), []).append(i)
+    if all(len(g) == 1 for g in groups.values()):
+        return labels, coords, probs, dists, 0
+    score = np.asarray(probs, np.float64) if probs is not None else np.ones(len(coords))
+    lookup = np.arange(n_lab)
+    keep, scaled = [], {}
+    for members in groups.values():
+        k = max(members, key=lambda i: score[i])
+        keep.append(k)
+        if len(members) > 1:
+            for i in members:
+                if at[i]:
+                    lookup[at[i]] = at[k]
+            area = np.bincount(labels.ravel(), minlength=n_lab)
+            union = sum(float(area[at[i]]) for i in members if at[i])
+            if dists is not None and at[k] and area[at[k]]:
+                scaled[k] = np.asarray(dists[k]) * min(3., (union / float(area[at[k]])) ** (1. / nd))
+    keep = sorted(keep)
+    labels = lookup[labels].astype(labels.dtype)
+    out_dists = None if dists is None else np.stack([scaled.get(i, np.asarray(dists[i])) for i in keep])
+    out_probs = None if probs is None else np.asarray(probs)[keep]
+    return labels, coords[keep], out_probs, out_dists, len(coords) - len(keep)
+
+
 def rethreshold_prediction(config, sink, head, threshold, nuclei, cells):
     """Final labels and pairs when only `head` uses another mask threshold (higher or lower).
 
@@ -930,9 +991,12 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                             h, p_grids[h][k], {q: float(v[k]) for q, v in quality.items()}, origin, run_shape,
                             net_shape, center, sigma, fine_mask, expand, specs[i][5], coarse=coarse[h][k])
 
-            # Prompts per refinement call: `batch`, fewer for large (3D) ROIs.
+            # Prompts per refinement call: `batch`, fewer for large (3D) ROIs. A ROI above the memory bound
+            # runs one call at a time: the next chunk starts after this one is assembled (two whole-volume
+            # kidney ROIs on the device at once ran out of memory on KiTS).
             nodes = int(np.prod([-(-s // g) for s, g in zip(net_shape, config.nucleus_grid)]))
             step = max(1, min(batch, REFINE_BATCH_NODES // nodes))
+            ahead = nodes <= REFINE_BATCH_NODES
             chunks = []
             for kind in ('nucleus', 'cytoplasm'):
                 ids = [i for i in members if specs[i][0] == kind]
@@ -940,8 +1004,12 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             pending = launch(*chunks[0]) if chunks else None
             for j, (kind, _) in enumerate(chunks):
                 current = pending
-                pending = launch(*chunks[j + 1]) if j + 1 < len(chunks) else None
+                if ahead:
+                    pending = launch(*chunks[j + 1]) if j + 1 < len(chunks) else None
                 process(current[0], kind, *current[1:])
+                if not ahead:
+                    current = None
+                    pending = launch(*chunks[j + 1]) if j + 1 < len(chunks) else None
         if follow:
             for (i, _), (_, cell) in zip(follow, run_batched([spec for _, spec in follow])):
                 out[i][1] = cell
@@ -1931,6 +1999,19 @@ class CytoNucsPredictor:
         return bool(getattr(self.config, 'semantic_scores', False) or semantic_minimum(self.config, 'nucleus')
                     or semantic_minimum(self.config, 'cytoplasm'))
 
+    def _votes_wanted(self):
+        return bool(getattr(self.config, 'center_vote_grouping', False))
+
+    def _group_votes(self, head, labels, coords, probs, dists, offsets, grid):
+        """group_by_center_votes for one head when inference.center_vote_grouping is on."""
+        if offsets is None:
+            return labels, coords, probs, dists
+        labels, coords, probs, dists, removed = group_by_center_votes(
+            labels, coords, probs, dists, offsets[head], grid, float(self.config.center_vote_radius))
+        if removed:
+            print(f'  [{head}] centre votes: {removed} candidates joined to another of the same object')
+        return labels, coords, probs, dists
+
     def _apply_semantic(self, nucleus_instances, cytoplasm_instances, semantic, grids):
         """Mean semantic foreground probability of every predicted object (self._last_semantic_scores: head ->
         {label: score}) and the objects below inference.semantic_min_<head> removed. Not on the stage-audited
@@ -1967,6 +2048,19 @@ class CytoNucsPredictor:
         Настоящий refinement выполняется позже через
         predict_instances_prompted() с реальным Gaussian prompt.
         """
+        if self._votes_wanted():
+            # The centre-offset heads (inference.center_vote_grouping), with the semantic heads when those are wanted.
+            names = ('nucleus_prob', 'nucleus_dist', 'cytoplasm_prob', 'cytoplasm_dist',
+                     'nucleus_center_offset', 'cytoplasm_center_offset')
+            if self._semantic_wanted():
+                names += ('nucleus_semantic_logit', 'cytoplasm_semantic_logit')
+            models = self.model.__dict__.setdefault('_detection_submodels', {})
+            if names not in models:
+                keras_model = self.model.keras_model
+                models[names] = tf.keras.Model(
+                    inputs=keras_model.inputs, outputs={name: keras_model.get_layer(name).output for name in names},
+                    name='cytonucs_detection_votes_inference')
+            return models[names]
         if self._semantic_wanted():
             # The semantic foreground heads as well (inference.semantic_scores / semantic_min_*), in a submodel of
             # their own: the plain one stays the one training's full validation traces.
@@ -2218,6 +2312,9 @@ class CytoNucsPredictor:
         semantic_full = (dict(nucleus=np.empty(nuc_shape_tiled, np.float32),
                               cytoplasm=np.empty(cyto_shape_tiled, np.float32))
                          if self._semantic_wanted() else None)
+        votes_full = (dict(nucleus=np.empty(nuc_shape_tiled + (nd,), np.float32),
+                           cytoplasm=np.empty(cyto_shape_tiled + (nd,), np.float32))
+                      if self._votes_wanted() else None)
 
         # ============================================================
         # OUTPUT COPY
@@ -2277,7 +2374,7 @@ class CytoNucsPredictor:
 
         def _forward(x):
             shape = tuple(int(v) for v in x.shape)
-            key = shape + (('semantic',) if semantic_full is not None else ())
+            key = shape + (('semantic',) if semantic_full is not None else ()) + (('votes',) if votes_full is not None else ())
             fn = _fwd_cache.get(key)
             if fn is None:
                 fn = tf.function(
@@ -2361,6 +2458,9 @@ class CytoNucsPredictor:
                         for _h, _g in (('nucleus', nuc_grid), ('cytoplasm', cyto_grid)):
                             _put(semantic_full[_h], 1. / (1. + np.exp(-_arr(_h + '_semantic_logit'))), _g,
                                  s_src, s_dst, fx)
+                    if votes_full is not None:                      # offsets are relative: tiles stitch as they are
+                        for _h, _g in (('nucleus', nuc_grid), ('cytoplasm', cyto_grid)):
+                            _put(votes_full[_h], _arr(_h + '_center_offset'), _g, s_src, s_dst, fx)
 
                     tiles_done += 1
                     del y_pred
@@ -2404,6 +2504,9 @@ class CytoNucsPredictor:
         if semantic_full is not None:
             semantic_full = dict(nucleus=_crop(semantic_full['nucleus'], nuc_grid),
                                  cytoplasm=_crop(semantic_full['cytoplasm'], cyto_grid))
+        if votes_full is not None:
+            votes_full = dict(nucleus=_crop(votes_full['nucleus'], nuc_grid, rays=True),
+                              cytoplasm=_crop(votes_full['cytoplasm'], cyto_grid, rays=True))
 
         print(f"  nucleus_dist: [{nucleus_dist_full.min():.1f}, "
               f"{nucleus_dist_full.max():.1f}] px")
@@ -2430,9 +2533,8 @@ class CytoNucsPredictor:
             nucleus_prob_full, nucleus_dist_full,
             prob_thresh=self.prob_thresh_nucleus,
             nms_thresh=self.nms_thresh)
-        self._last_coords_nuc = self._last_coords
-        self._last_probs_nuc = self._last_probs
-        self._last_dists_nuc = self._last_dists
+        (nucleus_instances, self._last_coords_nuc, self._last_probs_nuc, self._last_dists_nuc) = self._group_votes(
+            'nucleus', nucleus_instances, self._last_coords, self._last_probs, self._last_dists, votes_full, nuc_grid)
         residual = dict(nucleus=self._last_residual)
 
         print(f"  [cytoplasm] Proposal mode: {self.config.proposal_mode}")
@@ -2441,9 +2543,8 @@ class CytoNucsPredictor:
             cytoplasm_prob_full, cytoplasm_dist_full,
             prob_thresh=self.prob_thresh_cytoplasm,
             nms_thresh=self.nms_thresh)
-        self._last_coords_cyto = self._last_coords
-        self._last_probs_cyto = self._last_probs
-        self._last_dists_cyto = self._last_dists
+        (cytoplasm_instances, self._last_coords_cyto, self._last_probs_cyto, self._last_dists_cyto) = self._group_votes(
+            'cytoplasm', cytoplasm_instances, self._last_coords, self._last_probs, self._last_dists, votes_full, cyto_grid)
         residual['cytoplasm'] = self._last_residual
 
         # ============================================================
@@ -2599,22 +2700,24 @@ class CytoNucsPredictor:
         if self._semantic_wanted():
             semantic = {h: 1. / (1. + np.exp(-_get(h + '_semantic_logit', g)))
                         for h, g in (('nucleus', nuc_grid), ('cytoplasm', cyto_grid))}
+        votes = ({h: _get(h + '_center_offset', g) for h, g in (('nucleus', nuc_grid), ('cytoplasm', cyto_grid))}
+                 if self._votes_wanted() else None)
         del y_pred
 
         self._current_type = 'nucleus'
         nucleus_instances = self._stardist_postprocess(
             nucleus_prob, nucleus_dist,
             self.prob_thresh_nucleus, self.nms_thresh)
-        nuc_coords, nuc_probs, nuc_dists = (
-            self._last_coords, self._last_probs, self._last_dists)
+        nucleus_instances, nuc_coords, nuc_probs, nuc_dists = self._group_votes(
+            'nucleus', nucleus_instances, self._last_coords, self._last_probs, self._last_dists, votes, nuc_grid)
         residual = dict(nucleus=self._last_residual)
 
         self._current_type = 'cytoplasm'
         cytoplasm_instances = self._stardist_postprocess(
             cytoplasm_prob, cytoplasm_dist,
             self.prob_thresh_cytoplasm, self.nms_thresh)
-        cyto_coords, cyto_probs, cyto_dists = (
-            self._last_coords, self._last_probs, self._last_dists)
+        cytoplasm_instances, cyto_coords, cyto_probs, cyto_dists = self._group_votes(
+            'cytoplasm', cytoplasm_instances, self._last_coords, self._last_probs, self._last_dists, votes, cyto_grid)
         residual['cytoplasm'] = self._last_residual
 
         mask_thr = getattr(self.config, 'mask_thresh', 0.5)

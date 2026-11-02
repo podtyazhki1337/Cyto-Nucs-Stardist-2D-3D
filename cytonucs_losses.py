@@ -348,6 +348,27 @@ class CytoNucsLoss:
                 semantic_monitoring[head + '_semantic_dice'] = tf.math.divide_no_nan(
                     2. * tf.reduce_sum(binary * target), tf.reduce_sum(binary) + tf.reduce_sum(target))
                 semantic_foreground += on[head] * cfg.semantic_foreground_weight * 0.5 * (0.5 * bce + 0.5 * overlap)
+        center_offset = tf.constant(0., tf.float32)
+        offset_monitoring = {}
+        if cfg.center_offset_weight:
+            # Offset to the object's centre at every voxel of an object (Huber, in head-grid nodes); the centre is
+            # where the object's prob target peaks, on the object's part inside the crop.
+            for head in ('nucleus', 'cytoplasm'):
+                labels = self._subsample(y_true_raw[head + '_instances'], getattr(cfg, head + '_grid'))
+                prob_target = y_true[head + '_prob']
+                if prob_target.shape.rank == self.ndim + 2:
+                    prob_target = prob_target[..., 0]
+                target = tf.stop_gradient(center_offset_targets(labels, prob_target, self.ndim))
+                weight = tf.cast(labels > 0, tf.float32)
+                if known[head] is not None:
+                    weight *= known[head][..., 0]
+                difference = tf.cast(y_pred[head + '_center_offset'], tf.float32) - target
+                error = tf.abs(difference)
+                huber = tf.reduce_sum(tf.where(error < 1., .5 * tf.square(error), error - .5), axis=-1)
+                offset_monitoring[head + '_center_offset_error'] = tf.math.divide_no_nan(
+                    tf.reduce_sum(tf.norm(difference, axis=-1) * weight), tf.reduce_sum(weight))
+                center_offset += on[head] * cfg.center_offset_weight * .5 * tf.math.divide_no_nan(
+                    tf.reduce_sum(huber * weight), tf.reduce_sum(weight))
         mask_quality = tf.constant(0., tf.float32)
         quality_monitoring = {}
         if cfg.mask_quality_weight:
@@ -424,7 +445,7 @@ class CytoNucsLoss:
                 loss_background +
                 loss_cyto_mask +
                 loss_nuc_mask + consistency + prompt_consistency + cell_prompt_separation + cell_z_dice + nucleus_z_dice + mask_quality +
-                semantic_foreground + fine_mask
+                semantic_foreground + fine_mask + center_offset
         )
 
         self.last_components = {
@@ -440,6 +461,9 @@ class CytoNucsLoss:
         if cfg.semantic_foreground_weight:
             self.last_components['semantic_foreground'] = semantic_foreground
             self.last_components.update(semantic_monitoring)
+        if cfg.center_offset_weight:
+            self.last_components['center_offset'] = center_offset
+            self.last_components.update(offset_monitoring)
         self.last_components.update(fine_monitoring)
 
         for head in ('nucleus', 'cytoplasm'):
@@ -1534,3 +1558,28 @@ def object_balanced_probability(bce, probability, instances):
     monitoring.update({'prob_gt_max_above_' + key: means[i+3]
                        for i, key in enumerate(('020', '030', '040', '050'))})
     return means[0], {k: tf.stop_gradient(v) for k, v in monitoring.items()}
+
+
+def center_offset_targets(instances, target, ndim):
+    """Offset from every voxel of an object to the object's centre, in grid nodes ((B, *S, ndim); 0 on background).
+
+    The centre is the mean position of the voxels where the object's soft-EDT prob target is largest, so it lies
+    inside the object also for a non-convex one; it is taken on the object's voxels in the crop, which is what the
+    network sees. IDs are local to each image."""
+    def per_image(args):
+        labels, values = args
+        shape = tf.shape(labels)
+        flat = tf.reshape(labels, [-1])
+        ids, segment = tf.unique(flat)
+        n = tf.size(ids)
+        values = tf.reshape(values, [-1])
+        top = tf.math.unsorted_segment_max(values, segment, n)
+        at_top = tf.cast(values >= tf.gather(top, segment) - 1e-6, tf.float32)
+        axes = tf.meshgrid(*[tf.range(shape[d]) for d in range(ndim)], indexing='ij')
+        coords = tf.cast(tf.stack([tf.reshape(a, [-1]) for a in axes], 1), tf.float32)
+        centre = tf.math.divide_no_nan(tf.math.unsorted_segment_sum(coords * at_top[:, None], segment, n),
+                                       tf.math.unsorted_segment_sum(at_top, segment, n)[:, None])
+        offset = (tf.gather(centre, segment) - coords) * tf.cast(flat > 0, tf.float32)[:, None]
+        return tf.reshape(offset, tf.concat([shape, [ndim]], 0))
+    return tf.map_fn(per_image, (tf.cast(instances, tf.int32), tf.cast(target, tf.float32)),
+                     fn_output_signature=tf.TensorSpec([None] * ndim + [ndim], tf.float32))

@@ -114,6 +114,8 @@ Main options:
 | inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (0 = off) |
 | training | `mask_prompt_fraction`, `mask_prompt_start_epoch` | share of the prompts that also carry the model's own first mask (a pass without gradient), from that epoch: trains the second refinement pass |
 | inference | `refinement_iterations` | refinement passes per candidate; from the second on the prompt carries the previous mask (`mask_prompt_fraction` must have trained this) |
+| loss_params | `center_offset_weight` | head predicting each voxel's offset to its object's centre (Panoptic-DeepLab), Huber in head-grid nodes (0 = no head) |
+| inference | `center_vote_grouping`, `center_vote_radius` | StarDist candidates whose objects vote for one centre (closer than the radius share of the larger mean ray) are prompted once, as the union of their polygons (needs `center_offset_weight`) |
 | inference | `quality_gates_override` | per-head quality / size gates replacing the calibrated ones (e.g. from `recalibrate_gates.py`) |
 | inference | `semantic_scores`, `semantic_min_nucleus`, `semantic_min_cytoplasm` | mean semantic foreground probability of every object (saved with `--predictions` in `semantic/`); objects of a role below its minimum are removed (0 = off) |
 

@@ -66,7 +66,7 @@ class CytoNucsConfig:
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
                           refinement_windows=False, max_prompts_per_head=0,
                           skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0,
-                          refinement_iterations=1),
+                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1, negative_prompt_inside_outer=0.0,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -80,7 +80,8 @@ class CytoNucsConfig:
                             mask_quality_target='grid', mask_quality_ignore_boundary_targets=False,
                             mask_ce_class_balance=False, cell_prompt_separation_weight=0.0,
                             cell_z_dice_weight=0.0, nucleus_z_dice_weight=0.0,
-                            semantic_foreground_weight=0.0, dist_polar_iou_weight=0.0, prob_iou_aware=0.0),
+                            semantic_foreground_weight=0.0, dist_polar_iou_weight=0.0, prob_iou_aware=0.0,
+                            center_offset_weight=0.0),
     }
 
     def __init__(
@@ -505,6 +506,11 @@ class CytoNucsConfig:
             raise ValueError(f'mask_prompt_start_epoch must be a nonnegative integer, got {self.mask_prompt_start_epoch!r}')
         if not isinstance(self.refinement_windows, bool):
             raise ValueError(f'refinement_windows must be true or false, got {self.refinement_windows!r}')
+        if not isinstance(self.center_vote_grouping, bool):
+            raise ValueError(f'center_vote_grouping must be true or false, got {self.center_vote_grouping!r}')
+        if (isinstance(self.center_vote_radius, bool) or not isinstance(self.center_vote_radius, (int, float))
+                or not 0 < self.center_vote_radius <= 2):
+            raise ValueError(f'center_vote_radius must be a number in (0, 2] (a share of the object radius), got {self.center_vote_radius!r}')
         if not isinstance(self.skip_covered_prompts, bool):
             raise ValueError(f'skip_covered_prompts must be true or false, got {self.skip_covered_prompts!r}')
         for key in ('refinement_roi_stride', 'refinement_roi_size_step'):
@@ -573,6 +579,9 @@ class CytoNucsConfig:
                 raise ValueError(f'quality_gates_override must be null or a dict of {sorted(keys)} with numbers >= 0, got {override!r}')
             if self.mask_quality_min != 'auto':
                 raise ValueError('quality_gates_override replaces calibrated gates: it needs mask_quality_min = "auto"')
+        if self.center_vote_grouping and not self.center_offset_weight:
+            raise ValueError('center_vote_grouping reads the centre-offset heads: it needs '
+                             'loss_params.center_offset_weight > 0 (the heads exist only then)')
         if (self.semantic_scores or self.semantic_min_nucleus or self.semantic_min_cytoplasm) and not self.semantic_foreground_weight:
             raise ValueError('semantic_scores / semantic_min_* read the semantic foreground heads: they need '
                              'loss_params.semantic_foreground_weight > 0 (the heads exist only then)')
@@ -591,7 +600,7 @@ class CytoNucsConfig:
             raise ValueError(f'mask_quality_min must be a number in [0, 1] or "auto", got {self.mask_quality_min!r}')
         for key in ('nucleus_prob_object_weight', 'cytoplasm_prob_object_weight', 'prob_object_peak_weight',
                     'mask_quality_rank_weight', 'gradient_clip_norm', 'prompt_center_jitter', 'prompt_sigma_jitter', 'prompt_consistency_weight', 'mask_quality_weight', 'cell_prompt_separation_weight', 'cell_z_dice_weight', 'nucleus_z_dice_weight',
-                    'semantic_foreground_weight', 'dist_polar_iou_weight', 'prob_iou_aware'):
+                    'semantic_foreground_weight', 'dist_polar_iou_weight', 'prob_iou_aware', 'center_offset_weight'):
             value = getattr(self, key)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
                 raise ValueError(f'{key} must be finite and nonnegative')

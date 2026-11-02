@@ -135,6 +135,8 @@
     "semantic_min_cytoplasm": 0.0,
     "quality_gates_override": null,
     "refinement_iterations": 1,
+    "center_vote_grouping": false,
+    "center_vote_radius": 0.25,
     "mask_thresh_nucleus": null,
     "mask_thresh_cytoplasm": null,
     "tiling_fixed_axes": null,
@@ -210,7 +212,8 @@
     "object_losses_min_area_from_gate": false,
     "semantic_foreground_weight": 0.0,
     "dist_polar_iou_weight": 0.0,
-    "prob_iou_aware": 0.0
+    "prob_iou_aware": 0.0,
+    "center_offset_weight": 0.0
   },
   "augmentation": {
     "enable": true,
