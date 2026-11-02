@@ -137,6 +137,7 @@
     "refinement_iterations": 1,
     "center_vote_grouping": false,
     "center_vote_radius": 0.25,
+    "tile_blending": false,
     "mask_thresh_nucleus": null,
     "mask_thresh_cytoplasm": null,
     "tiling_fixed_axes": null,

@@ -2301,20 +2301,31 @@ class CytoNucsPredictor:
         cyto_shape_tiled = _map_shape(cyto_grid)
 
         _dist_dtype = np.dtype(getattr(self.config, 'dist_map_dtype', 'float32'))
+        # inference.tile_blending: along the fixed axes every window adds its whole output with a Hann weight that
+        # peaks at its centre, instead of writing only its centre. The windows overlap by half (fixed_window_plan),
+        # so the weights cross-fade and the maps have no step where two windows meet (each window sees its own
+        # context and group-norm statistics). Same number of forwards.
+        blend = bool(getattr(self.config, 'tile_blending', False)) and bool(fixed_axes)
+        _alloc = np.zeros if blend else np.empty
+        if blend:
+            _dist_dtype = np.dtype(np.float32)
 
-        nucleus_prob_full = np.empty(nuc_shape_tiled, np.float32)
-        nucleus_dist_full = np.empty(nuc_shape_tiled + (self.n_rays,), _dist_dtype)
-        cytoplasm_prob_full = np.empty(cyto_shape_tiled, np.float32)
-        cytoplasm_dist_full = np.empty(cyto_shape_tiled + (self.n_rays,), _dist_dtype)
+        nucleus_prob_full = _alloc(nuc_shape_tiled, np.float32)
+        nucleus_dist_full = _alloc(nuc_shape_tiled + (self.n_rays,), _dist_dtype)
+        cytoplasm_prob_full = _alloc(cyto_shape_tiled, np.float32)
+        cytoplasm_dist_full = _alloc(cyto_shape_tiled + (self.n_rays,), _dist_dtype)
 
-        cov_nuc = np.zeros(nuc_shape_tiled, np.uint8)
-        cov_cyto = np.zeros(cyto_shape_tiled, np.uint8)
-        semantic_full = (dict(nucleus=np.empty(nuc_shape_tiled, np.float32),
-                              cytoplasm=np.empty(cyto_shape_tiled, np.float32))
+        cov_nuc = np.zeros(nuc_shape_tiled, np.float32 if blend else np.uint8)
+        cov_cyto = np.zeros(cyto_shape_tiled, np.float32 if blend else np.uint8)
+        semantic_full = (dict(nucleus=_alloc(nuc_shape_tiled, np.float32),
+                              cytoplasm=_alloc(cyto_shape_tiled, np.float32))
                          if self._semantic_wanted() else None)
-        votes_full = (dict(nucleus=np.empty(nuc_shape_tiled + (nd,), np.float32),
-                           cytoplasm=np.empty(cyto_shape_tiled + (nd,), np.float32))
+        votes_full = (dict(nucleus=_alloc(nuc_shape_tiled + (nd,), np.float32),
+                           cytoplasm=_alloc(cyto_shape_tiled + (nd,), np.float32))
                       if self._votes_wanted() else None)
+
+        def _hann(length):
+            return (np.sin(np.pi * (np.arange(length) + .5) / length) ** 2).astype(np.float32)
 
         # ============================================================
         # OUTPUT COPY
@@ -2322,12 +2333,13 @@ class CytoNucsPredictor:
 
         def _put(dst, val, grid_, s_src, s_dst, fx, coverage=None):
             """fx: {axis: (src_lo, dst_lo, dst_hi)} для фиксированных осей.
-            Для свободных осей берутся слайсы tile_iterator."""
+            Для свободных осей берутся слайсы tile_iterator. With tile_blending the window's Hann weight multiplies
+            the values, which are added, and coverage sums the weights."""
             ss, sd = [], []
             for a in range(nd):
                 g = int(grid_[a])
                 if fixed[a]:
-                    src_lo, dst_lo, dst_hi = fx[a]
+                    src_lo, dst_lo, dst_hi = fx[a][:3]
                     if src_lo % g or dst_lo % g:
                         raise RuntimeError(
                             f"ось {a}: окно {src_lo}/{dst_lo} не кратно grid={g}")
@@ -2346,9 +2358,19 @@ class CytoNucsPredictor:
                     ss.append(slice(a_src.start // g, a_src.stop // g))
                     sd.append(slice(a_dst.start // g, a_dst.stop // g))
             ss, sd = tuple(ss), tuple(sd)
-            dst[sd] = val[ss]
+            if not blend:
+                dst[sd] = val[ss]
+                if coverage is not None:
+                    coverage[sd] += 1
+                return
+            weight = np.ones([1] * nd, np.float32)
+            for a in fixed_axes:
+                window = _hann(-(-int(fx[a][3]) // int(grid_[a])))[ss[a]]
+                weight = weight * window.reshape([-1 if b == a else 1 for b in range(nd)])
+            values = val[ss]
+            dst[sd] += values * (weight[..., None] if values.ndim > nd else weight)
             if coverage is not None:
-                coverage[sd] += 1
+                coverage[sd] += np.broadcast_to(weight, values.shape[:nd])
 
         # ============================================================
         # DETECTION MODEL
@@ -2409,7 +2431,9 @@ class CytoNucsPredictor:
             # Перебор окон по фиксированным осям (для 2D список пуст ->
             # ровно одна итерация со всем изображением).
             for combo in product(*[fixed_plans[a] for a in fixed_axes]):
-                fx = {a: (c[0], c[2], c[3]) for a, c in zip(fixed_axes, combo)}
+                # (src_lo, dst_lo, dst_hi, window): the window's centre, or with blending all of it
+                fx = {a: ((c[0], c[0], min(c[0] + c[1], img_shape[a]), c[1]) if blend else (c[0], c[2], c[3], c[1]))
+                      for a, c in zip(fixed_axes, combo)}
                 win = {a: (c[0], c[1]) for a, c in zip(fixed_axes, combo)}
 
                 sub = img[tuple(
@@ -2477,7 +2501,17 @@ class CytoNucsPredictor:
         # COVERAGE CHECK
         # ============================================================
 
-        for _tag, _cov in (('nucleus', cov_nuc), ('cytoplasm', cov_cyto)):
+        if blend:
+            for _tag, _cov, _maps in (('nucleus', cov_nuc, [nucleus_prob_full, nucleus_dist_full]),
+                                      ('cytoplasm', cov_cyto, [cytoplasm_prob_full, cytoplasm_dist_full])):
+                if not np.all(_cov > 0):
+                    raise RuntimeError(f"Tiling coverage нарушен для {_tag}: missing={int((_cov <= 0).sum())}")
+                _h = _tag
+                _maps += [m[_h] for m in (semantic_full, votes_full) if m is not None]
+                for _m in _maps:
+                    _m /= (_cov[..., None] if _m.ndim > nd else _cov)
+            print(f"  blended windows: weight sum min nucleus={float(cov_nuc.min()):.3f}, cytoplasm={float(cov_cyto.min()):.3f}")
+        for _tag, _cov in (() if blend else (('nucleus', cov_nuc), ('cytoplasm', cov_cyto))):
             _mn_cov, _mx_cov = int(_cov.min()), int(_cov.max())
             print(f"  coverage[{_tag}]: min={_mn_cov}, max={_mx_cov}")
             if _mn_cov != 1 or _mx_cov != 1:

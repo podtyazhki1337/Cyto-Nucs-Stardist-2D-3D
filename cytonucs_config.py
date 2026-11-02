@@ -66,7 +66,8 @@ class CytoNucsConfig:
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
                           refinement_windows=False, max_prompts_per_head=0,
                           skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0,
-                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25),
+                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25,
+                          tile_blending=False),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1, negative_prompt_inside_outer=0.0,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -506,6 +507,8 @@ class CytoNucsConfig:
             raise ValueError(f'mask_prompt_start_epoch must be a nonnegative integer, got {self.mask_prompt_start_epoch!r}')
         if not isinstance(self.refinement_windows, bool):
             raise ValueError(f'refinement_windows must be true or false, got {self.refinement_windows!r}')
+        if not isinstance(self.tile_blending, bool):
+            raise ValueError(f'tile_blending must be true or false, got {self.tile_blending!r}')
         if not isinstance(self.center_vote_grouping, bool):
             raise ValueError(f'center_vote_grouping must be true or false, got {self.center_vote_grouping!r}')
         if (isinstance(self.center_vote_radius, bool) or not isinstance(self.center_vote_radius, (int, float))
