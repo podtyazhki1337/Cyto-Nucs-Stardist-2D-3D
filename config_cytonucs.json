@@ -108,7 +108,9 @@
     "extra_train_dirs": [],
     "extra_train_share": 0.0,
     "val_loss_every_n_epochs": 1,
-    "keep_epoch_checkpoints": 1
+    "keep_epoch_checkpoints": 1,
+    "mask_prompt_fraction": 0.0,
+    "mask_prompt_start_epoch": 20
   },
   "inference": {
     "checkpoint_path": "/storage02/miroslavm/Multi-Nuclear-Stardist-2D-3D/models/cytonucs_emese_HK_3_stardist_3d_patches_fixes_v1/weights_best.weights.h5",
@@ -128,9 +130,15 @@
     "pair_min_overlap": 0.1,
     "pair_min_mask_iou": 0.25,
     "inner_min_inside_outer": 0.0,
+    "outer_min_inner_share": 0.0,
     "semantic_scores": false,
     "semantic_min_nucleus": 0.0,
     "semantic_min_cytoplasm": 0.0,
+    "quality_gates_override": null,
+    "refinement_iterations": 1,
+    "center_vote_grouping": false,
+    "center_vote_radius": 0.25,
+    "tile_blending": false,
     "mask_thresh_nucleus": null,
     "mask_thresh_cytoplasm": null,
     "tiling_fixed_axes": null,
@@ -206,7 +214,8 @@
     "object_losses_min_area_from_gate": false,
     "semantic_foreground_weight": 0.0,
     "dist_polar_iou_weight": 0.0,
-    "prob_iou_aware": 0.0
+    "prob_iou_aware": 0.0,
+    "center_offset_weight": 0.0
   },
   "augmentation": {
     "enable": true,

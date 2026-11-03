@@ -666,6 +666,8 @@ class CytoNucsStarDistModel:
                 dist=_nothing(grid_reference, [0.] * int(cfg.n_rays), f'{head}_dist'),
                 features=features,
                 semantic=_nothing(grid_reference, [-20.], f'{tag}_none_semantic'),
+                # Named as the real layer: the detection pass fetches it by name.
+                offset=_nothing(grid_reference, [0.] * self.ndim, f'{head}_center_offset'),
                 logits=[_nothing(q, [20., -20., -20.], f'{tag}_none_mask_logit_{k}',
                                  linked=features + ([_ctx_for_refine] if head == 'cytoplasm' else []))
                         for k, q in enumerate(prompts)],
@@ -718,6 +720,19 @@ class CytoNucsStarDistModel:
                 outputs[head + '_semantic_logit'] = ConvLayer(
                     1, 1, padding='same', activation=None, kernel_initializer='glorot_uniform',
                     name=head + '_semantic_logit')(feat)
+        if cfg.center_offset_weight:
+            # Offset from every voxel of an object to its centre, in head-grid nodes (Panoptic-DeepLab instance
+            # branch), from the features of the prob and dist heads. At inference the StarDist peaks of one
+            # object vote for one centre and are prompted once (inference.center_vote_grouping).
+            for head, feat in (('nucleus', x_nucleus), ('cytoplasm', x_cytoplasm)):
+                if head in absent:
+                    outputs[head + '_center_offset'] = absent[head]['offset']
+                    continue
+                hidden = ConvLayer(32, 3, padding='same', activation='relu', kernel_initializer='he_normal',
+                                   name=head + '_center_offset_hidden')(feat)
+                outputs[head + '_center_offset'] = ConvLayer(
+                    self.ndim, 1, padding='same', activation=None, kernel_initializer='zeros',
+                    name=head + '_center_offset')(hidden)
         fine_runtime = {}
         if cfg.refinement_full_resolution:
             # Full-resolution residual on the linearly upsampled coarse mask (cytonucs_fine_mask).
@@ -848,6 +863,8 @@ class CytoNucsStarDistModel:
         result['mask_quality_pooling'] = self.config.mask_quality_pooling
         result['refinement_pool'] = self.config.refinement_pool
         result['semantic_foreground_head'] = bool(self.config.semantic_foreground_weight)
+        if getattr(self.config, 'center_offset_weight', 0):
+            result['center_offset_head'] = True                  # absent from sidecars of runs without the head
         result['refinement_full_resolution'] = bool(self.config.refinement_full_resolution)
         if self.config.refinement_full_resolution:
             result['fine_wiring'] = self.fine_wiring
@@ -921,6 +938,8 @@ class CytoNucsStarDistModel:
             # v3.2 sidecars have no wiring field: their fine head was wired to the first prompt.
             old_wiring = saved.pop('fine_wiring', 'slot0' if old_fine else None)
             current.pop('fine_wiring', None)
+            if saved.pop('center_offset_head', False) != current.pop('center_offset_head', False):
+                raise ValueError('Checkpoint and config differ in the centre-offset head (loss_params.center_offset_weight)')
             if saved != current or (old_semantic and not new_semantic) or (old_fine and not new_fine):
                 raise ValueError('Checkpoint architecture differs from config; use its original config or start a new run')
             if old_pool != new_pool and self.config.mask_quality_head:

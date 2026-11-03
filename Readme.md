@@ -48,6 +48,7 @@ cytonucs_refinement_audit.py, cytonucs_runtime.py, cytonucs_gpu_setup.py      he
 score_hierarchy.py           AP, JTPR and the HydraStarDist-paper metrics of a trained model on a split
 score_predictions.py         the same scores for saved label images of any method
 semantic_gate.py             threshold of the semantic gate of one level, chosen on saved predictions
+recalibrate_gates.py         quality gates of a trained run chosen for AP alone, from its full-validation log
 evaluate_blocks.py           scores on whole held-out blocks of a spatially split 3D volume
 score_native_resolution.py   scores of a model trained on a downscaled copy, against the native annotation
 gpu_monitor.py               GPU and host memory log of a run (resource tables)
@@ -111,6 +112,13 @@ Main options:
 | loss_params | `dist_polar_iou_weight`, `prob_iou_aware` | Polar IoU on the rays, IoU-aware probability target |
 | inference | `refinement_batch`, `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride`, `refinement_roi_size_step` | speed of the prompt refinement |
 | inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (0 = off) |
+| inference | `outer_min_inner_share` | an outer object is kept only if at least this share of some inner object lies inside it, e.g. a cell needs a nucleus (0 = off; leave off where cells without a nucleus are real) |
+| training | `mask_prompt_fraction`, `mask_prompt_start_epoch` | share of the prompts that also carry the model's own first mask (a pass without gradient), from that epoch: trains the second refinement pass |
+| inference | `refinement_iterations` | refinement passes per candidate; from the second on the prompt carries the previous mask (`mask_prompt_fraction` must have trained this) |
+| loss_params | `center_offset_weight` | head predicting each voxel's offset to its object's centre (Panoptic-DeepLab), Huber in head-grid nodes (0 = no head) |
+| inference | `center_vote_grouping`, `center_vote_radius` | StarDist candidates whose objects vote for one centre (closer than the radius share of the larger mean ray) are prompted once, as the union of their polygons (needs `center_offset_weight`) |
+| inference | `tile_blending` | fixed tiling windows (half overlap) added with a Hann weight instead of each writing its centre: no step where two windows meet (each window has its own context and group-norm statistics); same forwards |
+| inference | `quality_gates_override` | per-head quality / size gates replacing the calibrated ones (e.g. from `recalibrate_gates.py`) |
 | inference | `semantic_scores`, `semantic_min_nucleus`, `semantic_min_cytoplasm` | mean semantic foreground probability of every object (saved with `--predictions` in `semantic/`); objects of a role below its minimum are removed (0 = off) |
 
 The ray geometry and grids are measured on the training labels at the start of a run and saved next to the
@@ -137,7 +145,9 @@ Scores are kept per image, so bootstrap intervals and breakdowns can be computed
 ## Baselines
 
 - `baselines/stardist3d/`: StarDist with one model per level (2D or 3D, files or spatial splits, full resolution).
-- `baselines/hydrastardist/`: HydraStarDist [7], the authors' code, vendored with its BSD licence.
+- `baselines/hydrastardist/`: HydraStarDist [7], the authors' code, vendored with its BSD licence;
+  `run_hsd.py --wbr` trains HSD-WBR with the paper's within-boundary loss made differentiable (the released
+  WBR has zero gradient; the changes are marked in the code).
 - `baselines/cellpose/`: Cellpose [8] (version 3), fine-tuned from the pretrained models and as pretrained;
   `run_cellpose3d.py` for the 3D volume (2D network on XY / XZ / YZ planes, 3D flows or stitched planes chosen on
   the val blocks, scored on whole blocks), `run_cellpose3d_files.py` the same for a dataset of one file per volume

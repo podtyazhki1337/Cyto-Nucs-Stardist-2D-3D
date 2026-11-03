@@ -457,18 +457,27 @@ class CytoNucsTrainer:
             x_batch, nuclear_cell_fraction = tf.cond(self.current_epoch_var >= self.config.predicted_prompt_start_epoch,
                 lambda: self._predicted_prompts(x_batch, y_batch_dict, return_stats=True),
                 lambda: (x_batch, tf.constant(0., tf.float32)))
+        # Quality targets read the prompts' Gaussian geometry: taken before mask prompts are added.
         y_batch_dict = self._mask_quality_inputs(x_batch, y_batch_dict)
+        detector_prompts = x_batch
+        mask_prompt_share = tf.constant(0., tf.float32)
+        if self.config.mask_prompt_fraction:
+            x_batch, mask_prompt_share = tf.cond(self.current_epoch_var >= self.config.mask_prompt_start_epoch,
+                lambda: self._mask_prompts(x_batch),
+                lambda: (x_batch, tf.constant(0., tf.float32)))
         with tf.GradientTape() as tape:
             y_pred = self.model.keras_model(x_batch, training=True)
             loss = self.loss_fn(y_batch_dict, y_pred, current_epoch=self.current_epoch_var)
 
         for hi, head in enumerate(('nucleus', 'cytoplasm')):
             changed = tf.reduce_any(tf.not_equal(
-                x_batch[..., self.config.n_channel_in+hi::2],
+                detector_prompts[..., self.config.n_channel_in+hi::2],
                 original_prompts[..., self.config.n_channel_in+hi::2]),
                 axis=list(range(1, self.config.ndim+1)))
             self.loss_fn.last_components[head + '_detector_prompt_changed_fraction'] = tf.reduce_mean(tf.cast(changed, tf.float32))
         self.loss_fn.last_components['cytoplasm_nuclear_detector_prompt_fraction'] = nuclear_cell_fraction
+        if self.config.mask_prompt_fraction:
+            self.loss_fn.last_components['mask_prompt_fraction'] = mask_prompt_share
         gradients = tape.gradient(loss, self.model.keras_model.trainable_variables)
 
         # Имена слоёв статичны на этапе трейса — группируем по веткам.
@@ -564,6 +573,36 @@ class CytoNucsTrainer:
                 x[..., self.config.n_channel_in + 2*k + hi]
                 for k in range(self.config.prompts_per_crop)], axis=0)
         return result
+
+    def _mask_prompts(self, x):
+        """training.mask_prompt_fraction: in that share of the prompt slots (per crop and slot) both prompt
+        channels also carry the model's own mask for that prompt, g + 0.5 * m * (1 - g), with g the prompt as given
+        and m the mask of a pass without gradient (refinement probability > 0.5 on the head grid, upsampled by
+        repetition). The peak stays g's, so the centre the refinement measures its offsets from is unchanged. The
+        refinement thus learns the second pass of inference.refinement_iterations, which prompts it with its first
+        mask. Returns (prompts, share of slots with a mask prompt)."""
+        cfg = self.config
+        nd, slots = cfg.ndim, cfg.prompts_per_crop
+        pred = self.model.keras_model(x, training=False)
+        batch = tf.shape(x)[0]
+        spatial = tf.shape(x)[1:nd + 1]
+        seed = tf.stack([tf.cast(cfg.seed, tf.int32) + 7919, tf.cast(self.optimizer.iterations, tf.int32)])
+        chosen = tf.random.stateless_uniform((slots, batch), seed) < cfg.mask_prompt_fraction
+        channels = [x[..., :cfg.n_channel_in]]
+        for k in range(slots):
+            select = tf.reshape(chosen[k], [-1] + [1] * (nd + 1))
+            for hi, head in enumerate(('nucleus', 'cytoplasm')):
+                logit = tf.stop_gradient(pred[head + '_mask_logit'][k * batch:(k + 1) * batch])
+                mask = tf.cast(tf.nn.softmax(logit, axis=-1)[..., 1:2] > .5, tf.float32)
+                for axis, g in enumerate(getattr(cfg, head + '_grid')):
+                    if int(g) > 1:
+                        mask = tf.repeat(mask, int(g), axis=axis + 1)
+                mask = tf.slice(mask, tf.zeros([nd + 2], tf.int32), tf.concat([[-1], spatial, [-1]], 0))
+                offset = cfg.n_channel_in + 2 * k + hi
+                gaussian = x[..., offset:offset + 1]
+                from cytonucs_runtime import mask_prompt
+                channels.append(tf.where(select, mask_prompt(gaussian, mask), gaussian))
+        return tf.stop_gradient(tf.concat(channels, axis=-1)), tf.reduce_mean(tf.cast(chosen, tf.float32))
 
     def _predicted_prompts(self, x, targets, return_stats=False):
         """Detached detector prompts with existing GT ownership and hard negatives.

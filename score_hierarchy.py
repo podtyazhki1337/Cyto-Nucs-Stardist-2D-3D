@@ -5,7 +5,7 @@ prediction (JTPR of that pair). Runs cytonucs_hierarchy.predict_hierarchy with t
 next to the weights; also times every volume.
 
 Usage:
-  python score_hierarchy.py --config CONFIG --weights WEIGHTS [--split test] [--gpu 0] [--output FILE]
+  python score_hierarchy.py --config CONFIG --weights WEIGHTS [--split test] [--gpu 0] [--output FILE] [--resume]
 Annotated pairs: <split>/assignments/<stem>.json for nucleus -> cytoplasm, assignments_<inner>_<outer>/ for
 other pairs; missing files are derived by overlap. A region where a level is not annotated can be given as
 <split>/<level>_unknown/<name> (non-zero = unknown): predicted objects of that level lying mostly inside it are
@@ -159,7 +159,7 @@ def save_prediction(folder, name, labels):
                          photometric='minisblack', compression='zlib')
 
 
-def score(config_path, weights, split='test', limit=0, memory_limit=None, predictions=None):
+def score(config_path, weights, split='test', limit=0, memory_limit=None, predictions=None, resume=None):
     import tensorflow as tf
     for gpu in tf.config.list_physical_devices('GPU'):
         if memory_limit:                                         # a cap, e.g. for a test next to running jobs
@@ -191,7 +191,15 @@ def score(config_path, weights, split='test', limit=0, memory_limit=None, predic
         records = []
         names = sorted(p.name for p in (folder / 'images').iterdir() if p.suffix.lower() in ('.tif', '.tiff'))
         names = names[:limit] if limit else names
+        done = {}
+        if resume and Path(resume).exists():                     # records of an earlier, interrupted run
+            for line in Path(resume).read_text().splitlines():
+                record = json.loads(line)
+                done[record['name']] = record
         for name in names:
+            if name in done:
+                records.append(done[name])
+                continue
             image = read_model_image(folder / 'images' / name, int(cfg.ndim), int(cfg.n_image_channels))
             gt, truths, ignore = ground_truth(folder, name, levels, pairs)
             started = time.time()
@@ -200,6 +208,9 @@ def score(config_path, weights, split='test', limit=0, memory_limit=None, predic
             seconds = time.time() - started
             record, scored = score_image(gt, pred['levels'], pairs, truths, pred_parents=pred['parents'], ignore=ignore)
             records.append(dict(record, name=name, seconds=seconds))
+            if resume:
+                with open(resume, 'a') as f:
+                    f.write(json.dumps(records[-1]) + '\n')
             if predictions:
                 save_prediction(predictions, name, scored)
                 if pred.get('semantic'):                                 # per-object semantic scores (semantic_gate.py)
@@ -226,6 +237,9 @@ def main():
     parser.add_argument('--limit', type=int, default=0, help='score only this many volumes (smoke test)')
     parser.add_argument('--memory-limit', type=int, help='GPU memory cap in MB (default: grow as needed)')
     parser.add_argument('--predictions', help='folder for the predicted labels (<level>/<name>), to score again later')
+    parser.add_argument('--resume', action='store_true',
+                        help='keep each volume\'s record in OUTPUT.records.jsonl and skip the volumes already there '
+                             '(run again after a failure, e.g. GPU memory of a long 3D run, in a fresh process)')
     args = parser.parse_args()
     if args.gpu is not None:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -233,8 +247,9 @@ def main():
     # cuDNN autotuning stays on (TF_CUDNN_USE_AUTOTUNE=0 is faster on many ROI shapes): without it a convolution has
     # no fallback that needs no scratch memory, and KiTS test volumes failed to allocate the scratch space.
     memory_limit = args.memory_limit or int(os.environ.get('GPU_MEMORY_LIMIT_MB', 0) or 0) or None   # the queue's cap
-    result = score(args.config, args.weights, args.split, args.limit, memory_limit, args.predictions)
     output = Path(args.output or str(args.weights) + f'.hierarchy_{args.split}.json')
+    resume = str(output) + '.records.jsonl' if args.resume else None
+    result = score(args.config, args.weights, args.split, args.limit, memory_limit, args.predictions, resume)
     output.write_text(json.dumps(result, indent=1))
     print('->', output)
 
