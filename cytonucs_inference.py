@@ -280,6 +280,26 @@ def keep_inner_inside_outer(config, nuclei, cells):
     return nuclei, int(len(drop))
 
 
+def keep_outer_with_inner(config, nuclei, cells):
+    """Outer labels without the objects that hold less than inference.outer_min_inner_share of every inner object
+    (0 = off), and how many were removed: a cell is kept only if at least that share of some predicted nucleus lies
+    inside it, so a fragment of a cell without its nucleus is a false positive. Off by default: in some data cells
+    without a nucleus are real (anucleate cells, the nucleus outside the section)."""
+    share = float(getattr(config, 'outer_min_inner_share', 0.0) or 0.0)
+    if share <= 0 or not np.any(cells):
+        return cells, 0
+    held = np.zeros(int(cells.max()) + 1)                          # per cell: largest share of one nucleus inside
+    both = (cells > 0) & (nuclei > 0)
+    if np.any(both):
+        pairs, counts = np.unique(np.stack([cells[both], nuclei[both]]), axis=1, return_counts=True)
+        np.maximum.at(held, pairs[0], counts / np.bincount(nuclei.ravel())[pairs[1]])
+    present = np.flatnonzero(np.bincount(cells.ravel()))
+    drop = present[(present > 0) & (held[present] < share)]
+    if len(drop):
+        cells = np.where(np.isin(cells, drop), 0, cells).astype(cells.dtype)
+    return cells, int(len(drop))
+
+
 def semantic_minimum(config, head):
     return float(getattr(config, f'semantic_min_{head}', 0.0) or 0.0)
 
@@ -380,6 +400,7 @@ def rethreshold_prediction(config, sink, head, threshold, nuclei, cells):
         cells = labels
         evidence = [(n, shrunk.get(id(c)) if c is not None else None) for n, c in sink.get('evidence', [])]
     evidence = [(n, c) for n, c in evidence if n is not None]
+    cells, _ = keep_outer_with_inner(config, nuclei, cells)
     nuclei, _ = keep_inner_inside_outer(config, nuclei, cells)
     pairs = assign_final_masks(nuclei, cells, getattr(config, 'pair_min_overlap', 0.1),
                                evidence, getattr(config, 'pair_min_mask_iou', 0.25))
@@ -433,6 +454,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     if policy == 'polyhedron':
         n = np.zeros(shape, np.int32) if nuc_labels is None else np.asarray(nuc_labels, np.int32)
         c = np.zeros(shape, np.int32) if cyto_labels is None else np.asarray(cyto_labels, np.int32)
+        c, _ = keep_outer_with_inner(config, n, c)
         n, _ = keep_inner_inside_outer(config, n, c)
         return n, c, assign_final_masks(n, c, getattr(config, 'pair_min_overlap', 0.1))
     if policy != 'mask':
@@ -1156,11 +1178,12 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         cells, diagnostics['cytoplasm']['area_gate_removed'] = drop_small_instances(
             cells, quality_gates.get('cytoplasm_min_area', 0))
     if stage_audit is None:
+        cells, diagnostics['cytoplasm']['without_inner_removed'] = keep_outer_with_inner(config, nuclei, cells)
         nuclei, diagnostics['nucleus']['outside_outer_removed'] = keep_inner_inside_outer(config, nuclei, cells)
     else:
         # The audit's written masks calibrate the gates against these outputs: removing objects that keep their
         # rows would remove their TP twice (gated AP above 1), so the audited output stays unfiltered, as ungated.
-        diagnostics['nucleus']['outside_outer_removed'] = 0
+        diagnostics['nucleus']['outside_outer_removed'] = diagnostics['cytoplasm']['without_inner_removed'] = 0
     pairs = assign_final_masks(nuclei, cells, getattr(config, 'pair_min_overlap', 0.1),
                                evidence, getattr(config, 'pair_min_mask_iou', 0.25))
     for h, stats in (('nucleus', ns), ('cytoplasm', cs)):

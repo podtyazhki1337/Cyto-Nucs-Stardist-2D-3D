@@ -130,6 +130,7 @@
     "pair_min_overlap": 0.1,
     "pair_min_mask_iou": 0.25,
     "inner_min_inside_outer": 0.0,
+    "outer_min_inner_share": 0.0,
     "semantic_scores": false,
     "semantic_min_nucleus": 0.0,
     "semantic_min_cytoplasm": 0.0,

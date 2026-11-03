@@ -50,6 +50,7 @@ class CytoNucsConfig:
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
                           mask_nms_nucleus=0.8, mask_nms_cytoplasm=0.5,
                           pair_min_overlap=0.1, pair_min_mask_iou=0.25, inner_min_inside_outer=0.0,
+                          outer_min_inner_share=0.0,
                           semantic_scores=False, semantic_min_nucleus=0.0, semantic_min_cytoplasm=0.0,
                           quality_gates_override=None,
                           mask_thresh_nucleus=None, mask_thresh_cytoplasm=None,
@@ -561,7 +562,7 @@ class CytoNucsConfig:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0 or (positive and value == 0):
                 raise ValueError(f'{key} must be a number {">" if positive else ">="} 0, got {value!r}')
         for key in ('cell_predicted_nucleus_fraction', 'mask_nms_nucleus', 'mask_nms_cytoplasm', 'pair_min_overlap',
-                    'pair_min_mask_iou', 'inner_min_inside_outer', 'semantic_min_nucleus', 'semantic_min_cytoplasm',
+                    'pair_min_mask_iou', 'inner_min_inside_outer', 'outer_min_inner_share', 'semantic_min_nucleus', 'semantic_min_cytoplasm',
                     'mask_prompt_fraction',
                     'cyto_center_prompt_prob', 'negative_prompt_prob', 'negative_prompt_inside_outer',
                     'mask_ce_empty_weight', 'mask_thresh_nucleus', 'mask_thresh_cytoplasm',
