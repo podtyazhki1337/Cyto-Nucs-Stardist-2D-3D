@@ -92,7 +92,7 @@ volumes.
 
 ## Training
 
-Copy `config_cytonucs.json`, set `data.dataset_dir`, `model.ndim`, `model.levels` and the patch size, then run:
+Copy `config_cytonucs.json`, set `data.dataset_dir`, `model.ndim` and the patch size, then run:
 
 ```bash
 python train_cytonucs.py my_config.json
@@ -102,7 +102,7 @@ Main options:
 
 | Section | Option | Meaning |
 |---|---|---|
-| model | `ndim`, `levels` | dimensionality, nested levels (inner first) |
+| model | `ndim`, `levels` | dimensionality, nested levels (inner first; read from the `<level>_masks` folders when left out) |
 | model | `unet_n_filter_base` | width of the shared U-Net |
 | training | `train_patch_size`, `image_batch_size`, `prompts_per_crop` | crop size, crops per step, prompts per crop |
 | training | `train_epochs`, `steps_per_epoch`, `lr_decay_steps` | schedule |
@@ -110,8 +110,8 @@ Main options:
 | augmentation | `negative_prompt_prob`, `negative_prompt_inside_outer` | share of empty-target (negative) prompts; share of them placed in an outer object where no inner object lies (hard negatives, e.g. kidney tissue) |
 | loss_weights, loss_params | `lambda_*`, `*_weight`, `wbr_*`, `prob_iou_aware` | loss weights, e.g. `dist_polar_iou_weight` (Polar IoU on the rays), `prob_iou_aware` (IoU-aware probability target), `lambda_wbr` / `wbr_sigma` (within-boundary regularisation) |
 | inference | `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride`, `refinement_roi_size_step` | speed of the prompt refinement |
-| inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (0 = off) |
-| inference | `outer_min_inner_share` | an outer object is kept only if at least this share of some inner object lies inside it, e.g. a cell needs a nucleus (0 = off; leave off where cells without a nucleus are real) |
+| inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (`auto`: calibrated after training; 0 = off) |
+| inference | `outer_min_inner_share` | an outer object is kept only if at least this share of some inner object lies inside it, e.g. a cell needs a nucleus (`auto`: calibrated after training; 0 = off, e.g. where cells without a nucleus are real) |
 | training | `mask_prompt_fraction`, `mask_prompt_start_epoch` | share of the prompts that also carry the model's own first mask (a pass without gradient), from that epoch: trains the second refinement pass |
 | inference | `refinement_iterations` | refinement passes per candidate; from the second on the prompt carries the previous mask (`mask_prompt_fraction` must have trained this) |
 | loss_params | `center_offset_weight` | head predicting each voxel's offset to its object's centre (Panoptic-DeepLab), Huber in head-grid nodes (0 = no head) |
@@ -120,13 +120,26 @@ Main options:
 | inference | `semantic_scores`, `semantic_min_nucleus`, `semantic_min_cytoplasm` | mean semantic foreground probability of every object (saved with `--predictions` in `semantic/`); objects of a role below its minimum are removed (0 = off) |
 
 Everything else comes from the method (`METHOD_SETTINGS` in `cytonucs_config.py`: architecture, optimiser and
-learning-rate schedule, augmentation, mask assembly, calibration grids; the same in every run of the paper). An older
-configuration that still sets such a key keeps its value, with a notice where it differs; keys that no longer exist
+learning-rate schedule, augmentation, mask assembly, calibration grids; the same in every run of the
+paper) or follows from the dimensionality (`NDIM_SETTINGS`: Z augmentation, pairing distance, containment margin,
+NMS border, data-loader workers) and the head grids (ray targets on the coarser grid). An older configuration that
+still sets such a key keeps its value, with a notice where it differs; keys that no longer exist
 (`REMOVED_SETTINGS`) are ignored with a notice. Inference uses the StarDist tiling (whole image or tiles with an
 overlap of at least the receptive field; in 3D, training-size windows along Z blended with Hann weights).
 
-The ray geometry and grids are measured on the training labels at the start of a run and saved next to the
-weights, with the extent of large objects that bounds the refinement ROI. The run folder (`output.basedir/experiment.name`) holds the best checkpoints by full validation and by
+Read from the training data when the configuration leaves them out (`cytonucs_data_settings.py`): the levels and
+their order, the image channels, sparse annotation (`training.partial_annotation`, `training.unknown_label`) and how
+many training images stay in memory (`data.pool_size`, 15 % of the host memory). The ray geometry and grids are
+measured on the training labels at the start of a run and saved next to the weights (`geometry.json`), with these
+data settings and the extent of large objects that bounds the refinement ROI.
+
+The probability thresholds of the peaks that become prompts (`prob_thresh_nucleus`, `prob_thresh_cytoplasm`) and
+the nesting filters are `auto` by default: training and its validation use 0.4 / 0.3 and no filter; at the end of
+training they are calibrated on as much of the validation set as fits into five minutes (`cytonucs_calibration.py`:
+every volume is predicted once with the lowest threshold searched, other thresholds and the filters re-assemble the
+final labels from the cached refinement candidates, objective the checkpoint metric) and saved as
+`<weights>.inference.json`, which inference reads for those weights. The StarDist NMS threshold is not calibrated:
+with the peak proposals of the method it does not run. The run folder (`output.basedir/experiment.name`) holds the best checkpoints by full validation and by
 validation loss, the last epoch checkpoint, the calibrated quality gates and mask thresholds, and the history.
 
 ## Evaluation

@@ -171,7 +171,7 @@ def score(config_path, weights, split='test', limit=0, memory_limit=None, predic
     from cytonucs_hierarchy import predict_hierarchy, read_calibration
     from cytonucs_runtime import read_model_image
 
-    raw = read_config(config_path)
+    raw = read_config(config_path, weights)                # 'auto' settings: calibrated for these weights
     raw['mode'] = 'inference'
     raw['inference']['checkpoint_path'] = str(weights)
     folder = Path(raw['data']['dataset_dir']) / split

@@ -57,7 +57,7 @@ def score(config_path, weights, splits=('val', 'test'), native=None):
     from cytonucs_trainer import DiceCallback, without_xy_face_objects
     from cytonucs_runtime import accuracy_profile
 
-    raw = read_config(config_path)
+    raw = read_config(config_path, weights)
     dataset = Path(raw['data']['dataset_dir'])
     source, factor = downscaling(dataset)
     native = Path(native) if native else source

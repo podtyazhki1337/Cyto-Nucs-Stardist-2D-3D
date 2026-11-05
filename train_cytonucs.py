@@ -13,7 +13,7 @@ import sys
 from tqdm import tqdm
 from cytonucs_gpu_setup import setup_gpu, print_gpu_info
 # Import CytoNucs modules
-from cytonucs_config import CytoNucsConfig, read_config
+from cytonucs_config import CytoNucsConfig, read_config, auto_inference_keys, resolve_auto_inference
 from cytonucs_model import build_cytonucs_model
 from cytonucs_losses import CytoNucsLoss
 from cytonucs_data_generator import (
@@ -711,6 +711,11 @@ def main(config_path='config_cytonucs.json'):
     tf.keras.utils.set_random_seed(seed)
     # ========== MODE SELECTION ==========
     mode = config_dict.get('mode', 'train')  # По умолчанию training
+    # 'auto' inference settings: the values calibrated for the checkpoint (inference modes), the defaults while
+    # training; training calibrates them on validation at its end.
+    auto_keys = auto_inference_keys(config_dict.get('inference', {}))
+    config_dict['inference'] = resolve_auto_inference(
+        config_dict.get('inference', {}), config_dict['inference'].get('checkpoint_path') if mode != 'train' else None)
     if mode != 'train' and len(config_dict.get('model', {}).get('levels', [])) > 2:
         raise NotImplementedError("Three or more levels: only mode 'train' is implemented; "
                                   'predict with cytonucs_hierarchy.predict_hierarchy')
@@ -732,7 +737,11 @@ def main(config_path='config_cytonucs.json'):
     experiment = None
 
     # ========== Create Model Configuration ==========
-    model_config = CytoNucsConfig.from_json(config_path)
+    # Settings the config leaves out that the training data tell (levels, channels, sparse annotation, pool size).
+    from cytonucs_data_settings import derive_data_settings
+    data_settings = derive_data_settings(config_dict)
+    model_config = CytoNucsConfig.from_dict(config_dict)
+    model_config.data_settings = {**(model_config.data_settings or {}), **data_settings} or None
     if model_config.n_pair_channels:
         # Three or more nested levels: adjacent pairs through the one pair network.
         from cytonucs_hierarchy import train_hierarchy
@@ -1126,6 +1135,24 @@ def main(config_path='config_cytonucs.json'):
         model.loaded_mask_thresholds = mask_thresholds
         save_mask_calibration(best_fullval_path if best_fullval_path.exists() else None, mask_thresholds,
                               calibration, best_fullval_path.parent / 'mask_calibration.json')
+
+    # ========== 'auto' INFERENCE SETTINGS: calibrated on a part of validation (time budget) ==========
+    if auto_keys and val_generator.data_pool:
+        print("\n" + "=" * 60)
+        print(f"Calibrating {auto_keys} on validation (at most 5 minutes)...")
+        print("=" * 60 + "\n")
+        from cytonucs_calibration import calibrate_after_training
+        calibration_predictor = CytoNucsPredictor(
+            model=model, config=model_config,
+            prob_thresh_nucleus=config_dict['inference']['prob_thresh_nucleus'],
+            prob_thresh_cytoplasm=config_dict['inference']['prob_thresh_cytoplasm'],
+            nms_thresh=config_dict['inference']['nms_thresh'])
+        calibrated, _ = calibrate_after_training(
+            calibration_predictor, val_generator.data_pool, auto_keys,
+            weights_path=best_fullval_path if best_fullval_path.exists() else None)
+        config_dict['inference'].update(calibrated)
+        for key, value in calibrated.items():
+            setattr(model_config, key, value)
     # ========== Threshold Optimization ==========
 
     print("\n" + "=" * 60)
