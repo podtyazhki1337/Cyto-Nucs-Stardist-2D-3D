@@ -9,6 +9,94 @@ import json
 from pathlib import Path
 
 
+# Settings of the method: the same in every configuration of the paper (2D and 3D), so the configuration template
+# does not carry them and a config without them gets these values. An older config that still sets one keeps its value
+# (its run stays reproducible), with a notice when it differs. The Python constructor keeps its own defaults.
+# Loss weights stay in the config.
+METHOD_SETTINGS = {
+    'model': dict(n_rays=32, unet_n_depth=4, unet_norm_groups=8, net_conv_after_unet=128, mask_refinement_filters=64,
+                  refinement_depth=2, refinement_full_resolution=True, refinement_gradient_scale=0.1,
+                  refinement_pool='auto', mask_quality_head=True, mask_quality_pooling='mask', shared_encoder=True,
+                  dist_activation='linear', use_gpu=True),
+    'training': dict(initial_learning_rate=3e-4, lr_decay_rate=0.85, lr_warmup_epochs=3, lr_staircase=False,
+                     gradient_clip_norm=0.0, weight_decay=0.05, ema_decay=0.999, log_every_steps=20,
+                     val_loss_every_n_epochs=10, keep_epoch_checkpoints=1, reset_best_on_resume=False,
+                     train_batch_size=2, predicted_prompt_fraction=0.25, predicted_prompt_start_epoch=10,
+                     predicted_prompt_sample_peaks=True, cell_predicted_nucleus_fraction=0.5,
+                     nucleus_prob_grid_normalize=True, tile_sampling_by_objects=0.0),
+    'loss_params': dict(checkpoint_w_jtpr=0.5, dist_loss='mae', huber_delta=1.0, mask_overlap_loss='lovasz',
+                        mask_ce_class_balance=False, mask_quality_target='component',
+                        mask_quality_ignore_boundary_targets=True, object_losses_include_crop_cut=True),
+    'augmentation': dict(enable=True, flip_prob=0.5, rotation_yx=True, gamma_range=[0.9, 1.1],
+                         intensity_range=[0.8, 1.2], intensity_offset=[-0.1, 0.1], noise_sigma=0.01,
+                         blur_sigma_range=[0.0, 1.0], elastic_prob=0.5, elastic_alpha=10.0, elastic_sigma=20.0,
+                         saturation_prob=0.0, prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
+                         cyto_center_prompt_prob=0.25, neighbor_cell_prompt_prob=1.0, prompt_inside_target=True,
+                         repeat_cell_prompt_prob=0.25),
+    'evaluation': dict(compute_jtpr=True, refinement_stage_audit=True, optimize_thresholds=False,
+                       save_predictions=False, threshold_opt_splits=['val'],
+                       prob_thresh_range=[0.2, 0.3, 0.4, 0.5, 0.6, 0.65, 0.7], nms_thresh_range=[0.1, 0.2, 0.3, 0.4, 0.5],
+                       mask_thresh_range=[0.25, 0.35, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]),
+    'inference': dict(prob_thresh_nucleus=0.4, prob_thresh_cytoplasm=0.3, nms_thresh=0.3, mask_thresh=0.45,
+                      mask_thresh_nucleus='auto', mask_thresh_cytoplasm='auto', mask_quality_min='auto',
+                      mask_quality_use_scores=False, proposal_mode='peaks', proposal_border_nucleus=0,
+                      proposal_border_cytoplasm=0, proposal_peak_window_nucleus=None,
+                      proposal_peak_window_cytoplasm=None, residual_proposals=False,
+                      mask_assembly_nucleus='object_quality_containment',
+                      mask_assembly_cytoplasm='object_quality_containment', mask_containment_threshold=0.95,
+                      mask_min_remaining_fraction=0.5, mask_nms_nucleus=0.5, mask_nms_cytoplasm=0.5,
+                      mask_overlap_nucleus=0.85, mask_overlap_cytoplasm=0.85, pair_min_overlap=0.1,
+                      pair_min_mask_iou=0.25, refinement_adaptive_roi=True, refinement_roi_snap=True,
+                      cell_roi_expansion_steps=2, refinement_batch=32, eval_splits=['val'], save_pred_tiff=True),
+    'output': dict(save_history=True, save_best_dice=True),
+    'gpu_config': dict(allow_growth=True, memory_limit=None),
+}
+# Keys of earlier configs that no longer exist; None removes the whole section.
+REMOVED_SETTINGS = {
+    'experiment': ('use_comet', 'comet_api_key', 'comet_project', 'comet_workspace'),   # no tracking service
+    'preprocessing': None,                     # datasets are prepared with dataset_prep/ before training
+    'data': ('skip_images', 'validation_images'),
+    'inference': ('bbox_padding_factor', 'tiling_fixed_axes', 'tile_blending'),   # StarDist tiling only
+}
+
+
+def normalize_config_dict(config_dict):
+    """A config dict with the removed keys dropped and the method settings filled in where it has none (one notice
+    line for the dropped keys and one for the settings it overrides)."""
+    import copy
+    out = copy.deepcopy(config_dict)
+    dropped, replaced = [], []
+    for section, keys in REMOVED_SETTINGS.items():
+        if section not in out:
+            continue
+        if keys is None:
+            del out[section]
+            dropped.append(section)
+            continue
+        for key in keys:
+            if key in out[section]:
+                del out[section][key]
+                dropped.append(f'{section}.{key}')
+    for section, settings in METHOD_SETTINGS.items():
+        values = out.setdefault(section, {})
+        for key, value in settings.items():
+            if key not in values:
+                values[key] = copy.deepcopy(value)
+            elif values[key] != value:
+                replaced.append(f'{section}.{key} = {values[key]!r} (method: {value!r})')
+    if dropped:
+        print('config: no longer used, ignored: ' + ', '.join(dropped))
+    if replaced:
+        print('config: sets method settings to other values: ' + ', '.join(replaced))
+    return out
+
+
+def read_config(path):
+    """JSON config of a run, normalised (normalize_config_dict)."""
+    with open(path, 'r') as f:
+        return normalize_config_dict(json.load(f))
+
+
 class CytoNucsConfig:
     """
     Configuration for CytoNucs StarDist model.
@@ -54,7 +142,7 @@ class CytoNucsConfig:
                           semantic_scores=False, semantic_min_nucleus=0.0, semantic_min_cytoplasm=0.0,
                           quality_gates_override=None,
                           mask_thresh_nucleus=None, mask_thresh_cytoplasm=None,
-                          tiling_fixed_axes=None, refinement_patch_size=None,
+                          refinement_patch_size=None,
                           refinement_adaptive_roi=False, proposal_mode='stardist',
                           cell_roi_expansion_steps=0,
                           proposal_peak_window_nucleus=None, proposal_peak_window_cytoplasm=None,
@@ -67,8 +155,7 @@ class CytoNucsConfig:
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
                           refinement_windows=False, max_prompts_per_head=0,
                           skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0,
-                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25,
-                          tile_blending=False),
+                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1, negative_prompt_inside_outer=0.0,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -140,6 +227,8 @@ class CytoNucsConfig:
             scale_factor_cytoplasm=None,
             median_max_dist_nucleus=None,
             median_max_dist_cytoplasm=None,
+            large_extent_nucleus=None,
+            large_extent_cytoplasm=None,
             mask_thresh_range=(0.1, 0.9),
             threshold_opt_splits="val",
             eval_splits="test",
@@ -244,6 +333,10 @@ class CytoNucsConfig:
         self.scale_factor_cytoplasm = scale_factor_cytoplasm
         self.median_max_dist_nucleus = median_max_dist_nucleus
         self.median_max_dist_cytoplasm = median_max_dist_cytoplasm
+        # Per-axis extent (voxels) of the large objects of the training masks (99th percentile, measured with the
+        # median one): bounds the refinement ROI at inference. None in a geometry.json written before it existed.
+        self.large_extent_nucleus = large_extent_nucleus
+        self.large_extent_cytoplasm = large_extent_cytoplasm
 
         # Training
         self.use_gpu = use_gpu
@@ -334,6 +427,7 @@ class CytoNucsConfig:
             if geometry:
                 setattr(view, 'rays_anisotropy_' + role, tuple(geometry['rays_anisotropy']))
                 setattr(view, 'median_max_dist_' + role, float(geometry['median_max_dist']))
+                setattr(view, 'large_extent_' + role, geometry.get('large_extent'))
         view._build_rays()
         return view
 
@@ -354,12 +448,14 @@ class CytoNucsConfig:
                 if scale is not None:
                     self.level_geometry[level] = dict(
                         rays_anisotropy=[float(v) for v in getattr(view, 'rays_anisotropy_' + role)],
-                        median_max_dist=float(scale))
+                        median_max_dist=float(scale), large_extent=getattr(view, 'large_extent_' + role))
         missing = [level for level in self.levels if level not in self.level_geometry]
         if missing:
             raise ValueError(f'No objects of level(s) {missing} in the training masks')
         for role, members in zip(self.ROLES, (self.levels[:-1], self.levels[1:])):
             setattr(self, 'median_max_dist_' + role, max(self.level_geometry[m]['median_max_dist'] for m in members))
+            large = [self.level_geometry[m].get('large_extent') for m in members]
+            setattr(self, 'large_extent_' + role, None if None in large else [int(v) for v in np.max(large, axis=0)])
         first = self.pair_view(0)
         self.rays_anisotropy_nucleus, self.rays_anisotropy_cytoplasm = first.rays_anisotropy_nucleus, first.rays_anisotropy_cytoplasm
         self._build_rays()
@@ -372,7 +468,8 @@ class CytoNucsConfig:
                 rays_anisotropy_cytoplasm=list(self.rays_anisotropy_cytoplasm),
                 nucleus_grid=list(self.nucleus_grid), cytoplasm_grid=list(self.cytoplasm_grid),
                 median_max_dist_nucleus=float(self.median_max_dist_nucleus),
-                median_max_dist_cytoplasm=float(self.median_max_dist_cytoplasm)), indent=2))
+                median_max_dist_cytoplasm=float(self.median_max_dist_cytoplasm),
+                large_extent_nucleus=self.large_extent_nucleus, large_extent_cytoplasm=self.large_extent_cytoplasm), indent=2))
         return self.level_geometry
 
     def has_level(self, role):
@@ -508,8 +605,6 @@ class CytoNucsConfig:
             raise ValueError(f'mask_prompt_start_epoch must be a nonnegative integer, got {self.mask_prompt_start_epoch!r}')
         if not isinstance(self.refinement_windows, bool):
             raise ValueError(f'refinement_windows must be true or false, got {self.refinement_windows!r}')
-        if not isinstance(self.tile_blending, bool):
-            raise ValueError(f'tile_blending must be true or false, got {self.tile_blending!r}')
         if not isinstance(self.center_vote_grouping, bool):
             raise ValueError(f'center_vote_grouping must be true or false, got {self.center_vote_grouping!r}')
         if (isinstance(self.center_vote_radius, bool) or not isinstance(self.center_vote_radius, (int, float))
@@ -744,6 +839,7 @@ class CytoNucsConfig:
                 res = _measure(lbls)
                 if res is not None:
                     setattr(self, f'median_max_dist_{name}', float(int(round(float(np.linalg.norm(res[1])) / 2.0))))
+                    setattr(self, f'large_extent_{name}', res[2])
                     print(f"   {name}: медианный bbox {tuple(int(round(v)) for v in res[1])} -> median_max_dist "
                           f"{getattr(self, f'median_max_dist_{name}'):.0f} px")
             self._write_geometry()
@@ -758,6 +854,8 @@ class CytoNucsConfig:
                            ('cytoplasm', cytoplasm_labels)):
             key = f'rays_anisotropy_{name}'
             res = _measure(lbls)
+            if res is not None:
+                setattr(self, f'large_extent_{name}', res[2])
             if getattr(self, key) != base:
                 print(f"   {key}: задана в конфиге "
                       f"{tuple(getattr(self, key))}, замер не применяется")
@@ -768,7 +866,7 @@ class CytoNucsConfig:
                 print(f"   {key}: объектов не найдено, оставляю {base}")
                 a = getattr(self, key)
             else:
-                a, ext = res
+                a, ext = res[:2]
                 measured_ext[name] = ext
                 setattr(self, key, a)
                 print(f"   {name}: медианный bbox "
@@ -804,9 +902,9 @@ class CytoNucsConfig:
         return self.rays_anisotropy_nucleus, self.rays_anisotropy_cytoplasm
 
     def _measure_extents(self, lbls):
-        """(integer aspect, median extent per axis) of the objects of label images, every axis on its
-        own: an object counts on an axis where it does not touch the image faces (if at least 30 do).
-        None without objects."""
+        """(integer aspect, median extent per axis, large extent per axis) of the objects of label images, every
+        axis on its own: an object counts on an axis where it does not touch the image faces (if at least 30 do).
+        The large extent is the 99th percentile of the same extents (integers). None without objects."""
         from scipy.ndimage import find_objects
         nd = self.ndim
         if lbls is None or len(lbls) == 0:
@@ -831,8 +929,9 @@ class CytoNucsConfig:
         if not any(len(v) for v in ext_all):
             return None
 
-        ext, src = [], []
+        ext, large, src = [], [], []
         for a in range(nd):
+            large.append(int(np.ceil(np.percentile(ext_in[a] if len(ext_in[a]) >= 30 else ext_all[a], 99))))
             if len(ext_in[a]) >= 30:
                 ext.append(float(np.median(ext_in[a])))
                 src.append(f"ось{a}: {len(ext_in[a])}/{len(ext_all[a])}")
@@ -845,7 +944,7 @@ class CytoNucsConfig:
         print(f"      замер {', '.join(src)}")
         # Аспект объекта, ЦЕЛЫЙ, не меньше 1.
         aniso = tuple(max(1, int(round(float(np.max(ext) / e)))) for e in ext)
-        return aniso, ext
+        return aniso, ext, large
 
     def _write_geometry(self):
         """geometry.json at geometry_path: the rays, grids and scales a checkpoint is read back with (from_json
@@ -865,6 +964,8 @@ class CytoNucsConfig:
                 'cytoplasm_grid': list(self.cytoplasm_grid),
                 'median_max_dist_nucleus': scale(self.median_max_dist_nucleus),
                 'median_max_dist_cytoplasm': scale(self.median_max_dist_cytoplasm),
+                'large_extent_nucleus': self.large_extent_nucleus,
+                'large_extent_cytoplasm': self.large_extent_cytoplasm,
             }, f, indent=2)
         print(f"   💾 geometry.json сохранён: {p}")
 
@@ -883,8 +984,7 @@ class CytoNucsConfig:
         другим набором направлений, и полиэдры выходят чужой геометрии.
         Файл пишет set_anisotropy_from_labels в конце обучающего замера.
         """
-        with open(json_path, 'r') as f:
-            config_dict = json.load(f)
+        config_dict = read_config(json_path)
 
         for expected_section, settings in cls.FIXES_SETTINGS.items():
             for section, values in config_dict.items():
@@ -955,7 +1055,8 @@ class CytoNucsConfig:
                     f"конфигом ({params.get('n_rays')}) — веса и лучи от разных прогонов")
             for k in ('rays_anisotropy_nucleus', 'rays_anisotropy_cytoplasm',
                       'nucleus_grid', 'cytoplasm_grid',
-                      'median_max_dist_nucleus', 'median_max_dist_cytoplasm'):
+                      'median_max_dist_nucleus', 'median_max_dist_cytoplasm',
+                      'large_extent_nucleus', 'large_extent_cytoplasm'):
                 if geo.get(k) is not None:
                     params[k] = geo[k]
             if geo.get('levels'):

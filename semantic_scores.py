@@ -37,7 +37,7 @@ def main():
             tf.config.set_logical_device_configuration(gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=args.memory_limit)])
         else:
             tf.config.experimental.set_memory_growth(gpu, True)
-    from cytonucs_config import CytoNucsConfig
+    from cytonucs_config import CytoNucsConfig, read_config
     from cytonucs_inference import CytoNucsPredictor, semantic_object_scores
     from cytonucs_model import build_cytonucs_model
     from cytonucs_runtime import normalize_percentiles, read_model_image
@@ -54,7 +54,7 @@ def main():
             self.semantic_maps, self.semantic_grids = semantic, grids
             return nucleus_instances, cytoplasm_instances
 
-    raw = json.loads(Path(args.config).read_text())
+    raw = read_config(args.config)
     raw['mode'] = 'inference'
     raw['inference']['checkpoint_path'] = str(args.weights)
     raw['inference']['semantic_scores'] = True
