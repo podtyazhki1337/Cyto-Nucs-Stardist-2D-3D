@@ -54,7 +54,7 @@ def main():
             self.semantic_maps, self.semantic_grids = semantic, grids
             return nucleus_instances, cytoplasm_instances
 
-    raw = read_config(args.config)
+    raw = read_config(args.config, args.weights)
     raw['mode'] = 'inference'
     raw['inference']['checkpoint_path'] = str(args.weights)
     raw['inference']['semantic_scores'] = True

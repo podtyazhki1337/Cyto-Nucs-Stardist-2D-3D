@@ -37,7 +37,8 @@ METHOD_SETTINGS = {
                        save_predictions=False, threshold_opt_splits=['val'],
                        prob_thresh_range=[0.2, 0.3, 0.4, 0.5, 0.6, 0.65, 0.7], nms_thresh_range=[0.1, 0.2, 0.3, 0.4, 0.5],
                        mask_thresh_range=[0.25, 0.35, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]),
-    'inference': dict(prob_thresh_nucleus=0.4, prob_thresh_cytoplasm=0.3, nms_thresh=0.3, mask_thresh=0.45,
+    'inference': dict(prob_thresh_nucleus='auto', prob_thresh_cytoplasm='auto', nms_thresh=0.3,
+                      inner_min_inside_outer='auto', outer_min_inner_share='auto', mask_thresh=0.45,
                       mask_thresh_nucleus='auto', mask_thresh_cytoplasm='auto', mask_quality_min='auto',
                       mask_quality_use_scores=False, proposal_mode='peaks', proposal_border_nucleus=0,
                       proposal_border_cytoplasm=0, proposal_peak_window_nucleus=None,
@@ -47,10 +48,28 @@ METHOD_SETTINGS = {
                       mask_min_remaining_fraction=0.5, mask_nms_nucleus=0.5, mask_nms_cytoplasm=0.5,
                       mask_overlap_nucleus=0.85, mask_overlap_cytoplasm=0.85, pair_min_overlap=0.1,
                       pair_min_mask_iou=0.25, refinement_adaptive_roi=True, refinement_roi_snap=True,
-                      cell_roi_expansion_steps=2, refinement_batch=32, eval_splits=['val'], save_pred_tiff=True),
+                      cell_roi_expansion_steps=2, refinement_batch=32, eval_splits=['val'], save_pred_tiff=True,
+                      max_prompts_per_head='auto'),
     'output': dict(save_history=True, save_best_dice=True),
     'gpu_config': dict(allow_growth=True, memory_limit=None),
 }
+# Settings of the method that depend only on the dimensionality (model.ndim), filled in the same way.
+NDIM_SETTINGS = {
+    2: {'training': dict(prefetch_workers=4, prefetch_depth=4),
+        'loss_params': dict(containment_margin=1.0, max_assignment_distance=25.0),
+        'augmentation': dict(flip_z_prob=0.0, cell_z_pair_prob=0.0, nucleus_z_pair_prob=0.0),
+        'evaluation': dict(fullval_train_volumes=3),
+        'inference': dict(nms_border_exclude_xy=1)},
+    3: {'training': dict(prefetch_workers=3, prefetch_depth=3),
+        'loss_params': dict(containment_margin=2.0, max_assignment_distance=50.0),
+        'augmentation': dict(flip_z_prob=0.5, cell_z_pair_prob=0.5, nucleus_z_pair_prob=0.5),
+        'evaluation': dict(fullval_train_volumes=2),
+        'inference': dict(nms_border_exclude_xy=2)},
+}
+# Inference settings that 'auto' calibrates on validation at the end of training (cytonucs_calibration.py); training
+# and a checkpoint without a calibration use these values.
+AUTO_INFERENCE_DEFAULTS = dict(prob_thresh_nucleus=0.4, prob_thresh_cytoplasm=0.3,
+                               inner_min_inside_outer=0.0, outer_min_inner_share=0.0)
 # Keys of earlier configs that no longer exist; None removes the whole section.
 REMOVED_SETTINGS = {
     'experiment': ('use_comet', 'comet_api_key', 'comet_project', 'comet_workspace'),   # no tracking service
@@ -77,7 +96,13 @@ def normalize_config_dict(config_dict):
             if key in out[section]:
                 del out[section][key]
                 dropped.append(f'{section}.{key}')
-    for section, settings in METHOD_SETTINGS.items():
+    ndim = out.get('model', {}).get('ndim')
+    settings_of = list(METHOD_SETTINGS.items()) + list(NDIM_SETTINGS.get(ndim, {}).items())
+    grids = [out.get('model', {}).get(name) for name in ('nucleus_grid', 'cytoplasm_grid')]
+    if all(isinstance(g, (list, tuple)) and len(g) == len(grids[0]) for g in grids):
+        # ray targets on the coarser of the two head grids (the grid both heads can read them on)
+        settings_of.append(('training', dict(dist_target_stride=[max(a, b) for a, b in zip(*grids)])))
+    for section, settings in settings_of:
         values = out.setdefault(section, {})
         for key, value in settings.items():
             if key not in values:
@@ -91,10 +116,36 @@ def normalize_config_dict(config_dict):
     return out
 
 
-def read_config(path):
-    """JSON config of a run, normalised (normalize_config_dict)."""
+def calibrated_inference_path(weights_path):
+    """File of the inference settings calibrated for a checkpoint (cytonucs_calibration.calibrate_after_training)."""
+    return Path(str(weights_path) + '.inference.json')
+
+
+def auto_inference_keys(inference):
+    """The settings of an inference section that are 'auto' (calibrated after training)."""
+    return [key for key in AUTO_INFERENCE_DEFAULTS if inference.get(key) == 'auto']
+
+
+def resolve_auto_inference(inference, weights_path=None):
+    """An inference section with every 'auto' of AUTO_INFERENCE_DEFAULTS replaced by the value calibrated for
+    weights_path (when stored) or the default."""
+    calibrated = {}
+    if weights_path and calibrated_inference_path(weights_path).is_file():
+        calibrated = json.loads(calibrated_inference_path(weights_path).read_text()).get('values', {})
+    out = dict(inference)
+    for key in auto_inference_keys(inference):
+        out[key] = float(calibrated.get(key, AUTO_INFERENCE_DEFAULTS[key]))
+    return out
+
+
+def read_config(path, weights_path=None):
+    """JSON config of a run, normalised (normalize_config_dict); with weights_path, the 'auto' inference settings are
+    resolved for that checkpoint (resolve_auto_inference)."""
     with open(path, 'r') as f:
-        return normalize_config_dict(json.load(f))
+        config = normalize_config_dict(json.load(f))
+    if weights_path is not None:
+        config['inference'] = resolve_auto_inference(config.get('inference', {}), weights_path)
+    return config
 
 
 class CytoNucsConfig:
@@ -229,6 +280,7 @@ class CytoNucsConfig:
             median_max_dist_cytoplasm=None,
             large_extent_nucleus=None,
             large_extent_cytoplasm=None,
+            data_settings=None,
             mask_thresh_range=(0.1, 0.9),
             threshold_opt_splits="val",
             eval_splits="test",
@@ -337,6 +389,8 @@ class CytoNucsConfig:
         # median one): bounds the refinement ROI at inference. None in a geometry.json written before it existed.
         self.large_extent_nucleus = large_extent_nucleus
         self.large_extent_cytoplasm = large_extent_cytoplasm
+        # Settings read from the training data (cytonucs_data_settings), written to geometry.json.
+        self.data_settings = data_settings
 
         # Training
         self.use_gpu = use_gpu
@@ -469,7 +523,8 @@ class CytoNucsConfig:
                 nucleus_grid=list(self.nucleus_grid), cytoplasm_grid=list(self.cytoplasm_grid),
                 median_max_dist_nucleus=float(self.median_max_dist_nucleus),
                 median_max_dist_cytoplasm=float(self.median_max_dist_cytoplasm),
-                large_extent_nucleus=self.large_extent_nucleus, large_extent_cytoplasm=self.large_extent_cytoplasm), indent=2))
+                large_extent_nucleus=self.large_extent_nucleus, large_extent_cytoplasm=self.large_extent_cytoplasm,
+                data_settings=self.data_settings), indent=2))
         return self.level_geometry
 
     def has_level(self, role):
@@ -597,8 +652,9 @@ class CytoNucsConfig:
         architecture_plan(self)
         if isinstance(self.refinement_batch, bool) or not isinstance(self.refinement_batch, (int, np.integer)) or self.refinement_batch < 0:
             raise ValueError(f'refinement_batch must be a nonnegative integer, got {self.refinement_batch!r}')
-        if isinstance(self.max_prompts_per_head, bool) or not isinstance(self.max_prompts_per_head, (int, np.integer)) or self.max_prompts_per_head < 0:
-            raise ValueError(f'max_prompts_per_head must be a nonnegative integer (0: no limit), got {self.max_prompts_per_head!r}')
+        if self.max_prompts_per_head != 'auto' and (isinstance(self.max_prompts_per_head, bool) or not isinstance(
+                self.max_prompts_per_head, (int, np.integer)) or self.max_prompts_per_head < 0):
+            raise ValueError(f"max_prompts_per_head must be 'auto' or a nonnegative integer (0: no limit), got {self.max_prompts_per_head!r}")
         if isinstance(self.refinement_iterations, bool) or not isinstance(self.refinement_iterations, (int, np.integer)) or self.refinement_iterations < 1:
             raise ValueError(f'refinement_iterations must be a positive integer (1: one pass), got {self.refinement_iterations!r}')
         if isinstance(self.mask_prompt_start_epoch, bool) or not isinstance(self.mask_prompt_start_epoch, (int, np.integer)) or self.mask_prompt_start_epoch < 0:
@@ -966,6 +1022,7 @@ class CytoNucsConfig:
                 'median_max_dist_cytoplasm': scale(self.median_max_dist_cytoplasm),
                 'large_extent_nucleus': self.large_extent_nucleus,
                 'large_extent_cytoplasm': self.large_extent_cytoplasm,
+                'data_settings': self.data_settings,
             }, f, indent=2)
         print(f"   💾 geometry.json сохранён: {p}")
 
@@ -984,7 +1041,20 @@ class CytoNucsConfig:
         другим набором направлений, и полиэдры выходят чужой геометрии.
         Файл пишет set_anisotropy_from_labels в конце обучающего замера.
         """
-        config_dict = read_config(json_path)
+        return cls.from_dict(read_config(json_path), checkpoint_path)
+
+    @classmethod
+    def from_dict(cls, config_dict, checkpoint_path=None):
+        """Configuration from a normalised config dict (read_config). In training the settings
+        cytonucs_data_settings derives are read from the training data where the dict has none (kept in
+        geometry.json); a checkpoint brings them back from its geometry.json."""
+        import copy
+        config_dict = copy.deepcopy(config_dict)
+        data_settings = {}
+        train_dir = Path(config_dict.get('data', {}).get('dataset_dir', '')) / 'train'
+        if config_dict.get('mode', 'train') == 'train' and config_dict.get('data', {}).get('dataset_dir') and train_dir.is_dir():
+            from cytonucs_data_settings import derive_data_settings
+            data_settings = derive_data_settings(config_dict)
 
         for expected_section, settings in cls.FIXES_SETTINGS.items():
             for section, values in config_dict.items():
@@ -1031,6 +1101,9 @@ class CytoNucsConfig:
         if 'steps_per_epoch' in training_cfg:
             params['train_steps_per_epoch'] = int(training_cfg['steps_per_epoch'])
 
+        # 'auto' inference settings: calibrated for the checkpoint (inference), the defaults while training.
+        inference_cfg = resolve_auto_inference(inference_cfg, checkpoint_path or (
+            inference_cfg.get('checkpoint_path') if config_dict.get('mode', 'train') != 'train' else None))
         # Все inference-настройки кроме физического пути к чекпоинту.
         for key, value in inference_cfg.items():
             if key == 'checkpoint_path':
@@ -1061,6 +1134,11 @@ class CytoNucsConfig:
                     params[k] = geo[k]
             if geo.get('levels'):
                 params['level_geometry'] = geo['levels']        # hierarchy of three or more levels
+            for key, value in (geo.get('data_settings') or {}).items():      # read from the training data
+                section = config_dict.get('model' if key in ('levels', 'n_channel_in') else 'training', {})
+                if key != 'pool_size' and key not in section:
+                    params[key] = value
+                    data_settings.setdefault(key, value)
             print(f"✅ Геометрия обучения подхвачена из {geo_load_path}")
         elif checkpoint:
             raise FileNotFoundError(f'{geo_load_path} missing: cannot interpret checkpoint rays safely')
@@ -1071,6 +1149,7 @@ class CytoNucsConfig:
             if params.get(key) is not None:
                 params[key] = tuple(params[key])
 
+        params['data_settings'] = data_settings or None
         return cls(**params)
 
     def to_base_config(self, head='nucleus'):

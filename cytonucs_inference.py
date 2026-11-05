@@ -448,6 +448,21 @@ def _group_prompt_jobs(jobs, origin_fn):
     return groups.values()
 
 
+def prompt_cap(config, head, shape):
+    """inference.max_prompts_per_head for an image of `shape` (0: no limit); 'auto': eight times the objects of median
+    size (a disc / ball of the median longest ray) that would fill the image; the densest HeLa test image holds 302
+    cells against 754."""
+    value = getattr(config, 'max_prompts_per_head', 0)
+    if value != 'auto':
+        return int(value or 0)
+    radius = float(getattr(config, f'median_max_dist_{head}', 0) or 0)
+    if radius <= 0:
+        return 0
+    aspect = float(np.max(getattr(config, f'rays_anisotropy_{head}', None) or (1,)))
+    volume = np.pi * radius ** 2 if len(shape) == 2 else 4 / 3 * np.pi * radius ** 3 / aspect
+    return int(np.ceil(8 * np.prod(shape) / volume))
+
+
 def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                                cyto_coords=None, cyto_probs=None,
                                mask_thresh=0.5, iou_dedup=0.5, verbose=True,
@@ -1074,11 +1089,10 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                 out[i][1] = cell
         return out
 
-    cap = int(getattr(config, 'max_prompts_per_head', 0) or 0)
-
     def capped(head, items):
         # At most `cap` prompts per head and image, the most probable ones (in their order): an untrained
         # detector can propose thousands per 3D volume, each refined over its ROI.
+        cap = prompt_cap(config, head, shape)
         if not cap or len(items) <= cap:
             return items
         keep = sorted(sorted(range(len(items)), key=lambda i: -float(items[i][2]))[:cap])
@@ -1122,11 +1136,13 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             for index, (head, _, (ctr, d)) in group:
                 n, c = run(ctr, d, head)
                 results[index] = (n if head == 'nucleus' else None, c)
-    # Detection probability of the prompt's peak (0 for a label without a peak), for offline threshold tuning.
-    for (_, _, _, score), pair in zip(anchored, results):
+    # Detection probability of the prompt's peak (0 for a label without a peak) and the head that prompted it, for
+    # threshold tuning (cytonucs_calibration re-assembles with the candidates above another prob_thresh).
+    for (prompt_head, _, _, score), pair in zip(anchored, results):
         for candidate in pair:
             if candidate is not None:
                 candidate['detection_score'] = float(score)
+                candidate['prompt_head'] = prompt_head
     # Restore old candidate ordering: competition tie-breaks and evidence stay stable.
     for (head, _, _), (n, c) in zip(jobs, results):
         if head == 'nucleus':
@@ -1193,7 +1209,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             if new is None:
                 diagnostics[head]['iteration_kept'] = diagnostics[head].get('iteration_kept', 0) + 1
                 return
-            kept = {k: candidate[k] for k in ('detection_score', 'residual') if k in candidate}
+            kept = {k: candidate[k] for k in ('detection_score', 'prompt_head', 'residual') if k in candidate}
             candidate.clear()
             candidate.update(new, **kept)
 
@@ -4143,10 +4159,11 @@ def load_model_from_config(config_path):
     """
     import json
     from pathlib import Path
-    from cytonucs_config import CytoNucsConfig, read_config
+    from cytonucs_config import CytoNucsConfig, read_config, resolve_auto_inference
     from cytonucs_model import build_cytonucs_model
 
     config_dict = read_config(config_path)
+    config_dict['inference'] = resolve_auto_inference(config_dict['inference'], config_dict['inference'].get('checkpoint_path'))
     model_config = CytoNucsConfig.from_json(
         config_path, checkpoint_path=config_dict.get('inference', {}).get('checkpoint_path'))
 

@@ -76,7 +76,7 @@ def evaluate(config_path, weights, splits=('test', 'val'), margin=192, save=None
     from cytonucs_trainer import DiceCallback
     from cytonucs_runtime import accuracy_profile, read_model_image
 
-    raw = read_config(config_path)
+    raw = read_config(config_path, weights)
     dataset = Path(raw['data']['dataset_dir'])
     manifest = json.loads((dataset / 'split_manifest.json').read_text())
     factor = int(manifest.get('xy_downscale', 1))

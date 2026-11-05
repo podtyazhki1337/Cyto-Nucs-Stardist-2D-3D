@@ -5,7 +5,6 @@
   },
   "data": {
     "dataset_dir": "/storage02/miroslavm/data/Cytonucs_Emese_Hela/patches/preprocessed/",
-    "pool_size": null,
     "repool_freq": 10
   },
   "model": {
@@ -25,14 +24,9 @@
       2,
       2
     ],
-    "n_channel_in": 3,
     "unet_n_filter_base": 32,
     "unet_pool_schedule": null,
-    "unet_kernel_schedule": null,
-    "levels": [
-      "nucleus",
-      "cytoplasm"
-    ]
+    "unet_kernel_schedule": null
   },
   "training": {
     "train_patch_size": [
@@ -48,14 +42,9 @@
     "seed": 42,
     "image_batch_size": 1,
     "prompts_per_crop": 2,
-    "prefetch_workers": 3,
-    "prefetch_depth": 3,
     "detector_prompt_slots": 0,
-    "dist_target_stride": null,
     "object_crop_shares": null,
     "train_region_crops": false,
-    "partial_annotation": false,
-    "unknown_label": null,
     "annotated_anchor_share": 0.0,
     "init_weights": null,
     "extra_train_dirs": [],
@@ -67,8 +56,6 @@
     "checkpoint_path": "/storage02/miroslavm/Multi-Nuclear-Stardist-2D-3D/models/cytonucs_emese_HK_3_stardist_3d_patches_fixes_v1/weights_best.weights.h5",
     "refinement_mode": "mask",
     "refine_feature_cache_windows": 1,
-    "inner_min_inside_outer": 0.0,
-    "outer_min_inner_share": 0.0,
     "semantic_scores": false,
     "semantic_min_nucleus": 0.0,
     "semantic_min_cytoplasm": 0.0,
@@ -78,10 +65,8 @@
     "center_vote_radius": 0.25,
     "refinement_patch_size": null,
     "nms_candidate_spacing": 0.12,
-    "nms_border_exclude_xy": 2,
     "tta_flips": false,
     "refinement_windows": false,
-    "max_prompts_per_head": 0,
     "skip_covered_prompts": false,
     "refinement_roi_stride": 0,
     "refinement_roi_size_step": 0
@@ -101,8 +86,6 @@
     "lambda_nuc_mask": 0.4
   },
   "loss_params": {
-    "containment_margin": 2.0,
-    "max_assignment_distance": 50.0,
     "wbr_sigma": 2.0,
     "wbr_warmup_epochs": 30,
     "w_containment_geometric": 1.0,
@@ -129,17 +112,13 @@
     "zoom_range": null,
     "negative_prompt_prob": 0.1,
     "negative_prompt_inside_outer": 0.0,
-    "cell_z_pair_prob": 0.0,
-    "nucleus_z_pair_prob": 0.0,
     "zoom_z_range": null,
-    "flip_z_prob": 0.0,
     "prompt_uniform_prob": 0.0
   },
   "evaluation": {
     "eval_dice_every": 5,
     "min_eval_epoch": 0,
-    "save_every_n_epochs": 10,
-    "fullval_train_volumes": 0
+    "save_every_n_epochs": 10
   },
   "gpu_config": {
     "visible_devices": "0"
