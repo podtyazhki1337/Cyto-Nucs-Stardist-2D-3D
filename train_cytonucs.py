@@ -13,23 +13,21 @@ import sys
 from tqdm import tqdm
 from cytonucs_gpu_setup import setup_gpu, print_gpu_info
 # Import CytoNucs modules
-from cytonucs_config import CytoNucsConfig
+from cytonucs_config import CytoNucsConfig, read_config
 from cytonucs_model import build_cytonucs_model
 from cytonucs_losses import CytoNucsLoss
 from cytonucs_data_generator import (
     CytoNucsDataGenerator,
     cytonucs_augmenter_3d,
-    cytonucs_augmenter_2d,
-    prepare_cytonucs_dataset
+    cytonucs_augmenter_2d
 )
 from cytonucs_trainer import CytoNucsTrainer, DiceCallback
 from cytonucs_inference import CytoNucsPredictor, compute_jtpr, load_gt_assignments
 import tifffile
 
 def load_config(config_path='config_cytonucs.json'):
-    """Load configuration from JSON file"""
-    with open(config_path, 'r') as f:
-        return json.load(f)
+    """Configuration of a run from its JSON file, normalised (cytonucs_config.read_config)."""
+    return read_config(config_path)
 
 
 def run_inference_only(config_dict, config_path):
@@ -730,34 +728,8 @@ def main(config_path='config_cytonucs.json'):
         return run_mask_calibration(config_dict, config_path)
     else:
         print("\n🎓 MODE: TRAINING")
-    # ========== Initialize Experiment Tracking ==========
+    # No experiment tracking service: history.json, the logs and the run folder record a run.
     experiment = None
-    if config_dict['experiment']['use_comet']:
-        from comet_ml import Experiment
-        experiment = Experiment(
-            api_key=config_dict['experiment']['comet_api_key'],
-            project_name=config_dict['experiment']['comet_project'],
-            workspace=config_dict['experiment']['comet_workspace'],
-            auto_output_logging="simple",
-        )
-        experiment.set_name(config_dict['experiment']['name'])
-
-    # ========== Preprocessing (if needed) ==========
-    if config_dict['preprocessing']['run_preprocessing']:
-        print("\nRunning preprocessing...")
-        prepare_cytonucs_dataset(
-            raw_images_dir=config_dict['preprocessing']['raw_images_dir'],
-            raw_nucleus_masks_dir=config_dict['preprocessing']['raw_nucleus_masks_dir'],
-            raw_cytoplasm_masks_dir=config_dict['preprocessing']['raw_cytoplasm_masks_dir'],
-            output_dir=config_dict['preprocessing']['output_dir'],
-            validation_images=config_dict['data'].get('validation_images', []),
-            test_split=config_dict['preprocessing'].get('test_split', 0.1),
-            val_split=config_dict['preprocessing'].get('val_split', 0.1),
-            compute_assignments=config_dict['preprocessing'].get('compute_assignments', True),
-            seed=config_dict['preprocessing'].get('seed', 42),
-            train_patch_size=tuple(config_dict['training']['train_patch_size']),
-            ndim=config_dict['model']['ndim']
-        )
 
     # ========== Create Model Configuration ==========
     model_config = CytoNucsConfig.from_json(config_path)

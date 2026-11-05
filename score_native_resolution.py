@@ -50,14 +50,14 @@ def score(config_path, weights, splits=('val', 'test'), native=None):
     for gpu in tf.config.list_physical_devices('GPU'):
         tf.config.experimental.set_memory_growth(gpu, True)
     from stardist.matching import matching
-    from cytonucs_config import CytoNucsConfig
+    from cytonucs_config import CytoNucsConfig, read_config
     from cytonucs_model import build_cytonucs_model
     from cytonucs_inference import CytoNucsPredictor, compute_jtpr
     from cytonucs_data_generator import CytoNucsDataGenerator
     from cytonucs_trainer import DiceCallback, without_xy_face_objects
     from cytonucs_runtime import accuracy_profile
 
-    raw = json.loads(Path(config_path).read_text())
+    raw = read_config(config_path)
     dataset = Path(raw['data']['dataset_dir'])
     source, factor = downscaling(dataset)
     native = Path(native) if native else source

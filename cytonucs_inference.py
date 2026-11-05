@@ -4143,10 +4143,10 @@ def load_model_from_config(config_path):
     """
     import json
     from pathlib import Path
-    from cytonucs_config import CytoNucsConfig
+    from cytonucs_config import CytoNucsConfig, read_config
     from cytonucs_model import build_cytonucs_model
 
-    config_dict = json.load(open(config_path, 'r'))
+    config_dict = read_config(config_path)
     model_config = CytoNucsConfig.from_json(
         config_path, checkpoint_path=config_dict.get('inference', {}).get('checkpoint_path'))
 

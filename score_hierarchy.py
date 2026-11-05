@@ -166,12 +166,12 @@ def score(config_path, weights, split='test', limit=0, memory_limit=None, predic
             tf.config.set_logical_device_configuration(gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=int(memory_limit))])
         else:
             tf.config.experimental.set_memory_growth(gpu, True)
-    from cytonucs_config import CytoNucsConfig
+    from cytonucs_config import CytoNucsConfig, read_config
     from cytonucs_model import build_cytonucs_model
     from cytonucs_hierarchy import predict_hierarchy, read_calibration
     from cytonucs_runtime import read_model_image
 
-    raw = json.loads(Path(config_path).read_text())
+    raw = read_config(config_path)
     raw['mode'] = 'inference'
     raw['inference']['checkpoint_path'] = str(weights)
     folder = Path(raw['data']['dataset_dir']) / split

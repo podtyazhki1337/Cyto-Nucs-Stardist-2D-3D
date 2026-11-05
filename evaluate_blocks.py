@@ -70,13 +70,13 @@ def evaluate(config_path, weights, splits=('test', 'val'), margin=192, save=None
             tf.config.experimental.set_memory_growth(gpu, True)
     from cytonucs_runtime import normalize_percentiles as normalize
     from stardist.matching import matching
-    from cytonucs_config import CytoNucsConfig
+    from cytonucs_config import CytoNucsConfig, read_config
     from cytonucs_model import build_cytonucs_model
     from cytonucs_inference import CytoNucsPredictor, compute_jtpr
     from cytonucs_trainer import DiceCallback
     from cytonucs_runtime import accuracy_profile, read_model_image
 
-    raw = json.loads(Path(config_path).read_text())
+    raw = read_config(config_path)
     dataset = Path(raw['data']['dataset_dir'])
     manifest = json.loads((dataset / 'split_manifest.json').read_text())
     factor = int(manifest.get('xy_downscale', 1))

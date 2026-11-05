@@ -33,7 +33,7 @@ Training adds to the StarDist losses (probability BCE, ray MAE):
 
 ```
 train_cytonucs.py            training entry point (one JSON configuration)
-config_cytonucs.json         configuration with every option and its default
+config_cytonucs.json         configuration template: the options a user sets
 cytonucs_config.py           configuration loading, validation, ray sets and grids from the object geometry
 cytonucs_model.py            U-Net, StarDist heads, prompted refinement and full-resolution heads
 cytonucs_losses.py           losses and the StarDist targets
@@ -102,15 +102,14 @@ Main options:
 
 | Section | Option | Meaning |
 |---|---|---|
-| model | `ndim`, `levels`, `n_rays` | dimensionality, nested levels (inner first), rays per object |
-| model | `unet_n_filter_base`, `unet_n_depth` | width and depth of the shared U-Net |
+| model | `ndim`, `levels` | dimensionality, nested levels (inner first) |
+| model | `unet_n_filter_base` | width of the shared U-Net |
 | training | `train_patch_size`, `image_batch_size`, `prompts_per_crop` | crop size, crops per step, prompts per crop |
-| training | `train_epochs`, `steps_per_epoch`, `initial_learning_rate`, `weight_decay`, `ema_decay` | schedule and optimiser |
+| training | `train_epochs`, `steps_per_epoch`, `lr_decay_steps` | schedule |
 | training | `object_crop_shares` | [inner, outer]: shares of the crops centred on one object of that level, picked uniformly; the rest at random positions (replaces `fg_crop_prob`) |
 | augmentation | `negative_prompt_prob`, `negative_prompt_inside_outer` | share of empty-target (negative) prompts; share of them placed in an outer object where no inner object lies (hard negatives, e.g. kidney tissue) |
-| training | `keep_epoch_checkpoints` | how many latest epoch checkpoints to keep (best checkpoints are kept apart) |
-| loss_params | `dist_polar_iou_weight`, `prob_iou_aware` | Polar IoU on the rays, IoU-aware probability target |
-| inference | `refinement_batch`, `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride`, `refinement_roi_size_step` | speed of the prompt refinement |
+| loss_weights, loss_params | `lambda_*`, `*_weight`, `wbr_*`, `prob_iou_aware` | loss weights, e.g. `dist_polar_iou_weight` (Polar IoU on the rays), `prob_iou_aware` (IoU-aware probability target), `lambda_wbr` / `wbr_sigma` (within-boundary regularisation) |
+| inference | `refinement_windows`, `skip_covered_prompts`, `refinement_roi_stride`, `refinement_roi_size_step` | speed of the prompt refinement |
 | inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (0 = off) |
 | inference | `outer_min_inner_share` | an outer object is kept only if at least this share of some inner object lies inside it, e.g. a cell needs a nucleus (0 = off; leave off where cells without a nucleus are real) |
 | training | `mask_prompt_fraction`, `mask_prompt_start_epoch` | share of the prompts that also carry the model's own first mask (a pass without gradient), from that epoch: trains the second refinement pass |
@@ -120,8 +119,14 @@ Main options:
 | inference | `quality_gates_override` | per-head quality / size gates replacing the calibrated ones (e.g. from `recalibrate_gates.py`) |
 | inference | `semantic_scores`, `semantic_min_nucleus`, `semantic_min_cytoplasm` | mean semantic foreground probability of every object (saved with `--predictions` in `semantic/`); objects of a role below its minimum are removed (0 = off) |
 
+Everything else comes from the method (`METHOD_SETTINGS` in `cytonucs_config.py`: architecture, optimiser and
+learning-rate schedule, augmentation, mask assembly, calibration grids; the same in every run of the paper). An older
+configuration that still sets such a key keeps its value, with a notice where it differs; keys that no longer exist
+(`REMOVED_SETTINGS`) are ignored with a notice. Inference uses the StarDist tiling (whole image or tiles with an
+overlap of at least the receptive field; in 3D, training-size windows along Z blended with Hann weights).
+
 The ray geometry and grids are measured on the training labels at the start of a run and saved next to the
-weights. The run folder (`output.basedir/experiment.name`) holds the best checkpoints by full validation and by
+weights, with the extent of large objects that bounds the refinement ROI. The run folder (`output.basedir/experiment.name`) holds the best checkpoints by full validation and by
 validation loss, the last epoch checkpoint, the calibrated quality gates and mask thresholds, and the history.
 
 ## Evaluation

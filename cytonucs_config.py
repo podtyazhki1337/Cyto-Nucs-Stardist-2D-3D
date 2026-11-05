@@ -9,6 +9,94 @@ import json
 from pathlib import Path
 
 
+# Settings of the method: the same in every configuration of the paper (2D and 3D), so the configuration template
+# does not carry them and a config without them gets these values. An older config that still sets one keeps its value
+# (its run stays reproducible), with a notice when it differs. The Python constructor keeps its own defaults.
+# Loss weights stay in the config.
+METHOD_SETTINGS = {
+    'model': dict(n_rays=32, unet_n_depth=4, unet_norm_groups=8, net_conv_after_unet=128, mask_refinement_filters=64,
+                  refinement_depth=2, refinement_full_resolution=True, refinement_gradient_scale=0.1,
+                  refinement_pool='auto', mask_quality_head=True, mask_quality_pooling='mask', shared_encoder=True,
+                  dist_activation='linear', use_gpu=True),
+    'training': dict(initial_learning_rate=3e-4, lr_decay_rate=0.85, lr_warmup_epochs=3, lr_staircase=False,
+                     gradient_clip_norm=0.0, weight_decay=0.05, ema_decay=0.999, log_every_steps=20,
+                     val_loss_every_n_epochs=10, keep_epoch_checkpoints=1, reset_best_on_resume=False,
+                     train_batch_size=2, predicted_prompt_fraction=0.25, predicted_prompt_start_epoch=10,
+                     predicted_prompt_sample_peaks=True, cell_predicted_nucleus_fraction=0.5,
+                     nucleus_prob_grid_normalize=True, tile_sampling_by_objects=0.0),
+    'loss_params': dict(checkpoint_w_jtpr=0.5, dist_loss='mae', huber_delta=1.0, mask_overlap_loss='lovasz',
+                        mask_ce_class_balance=False, mask_quality_target='component',
+                        mask_quality_ignore_boundary_targets=True, object_losses_include_crop_cut=True),
+    'augmentation': dict(enable=True, flip_prob=0.5, rotation_yx=True, gamma_range=[0.9, 1.1],
+                         intensity_range=[0.8, 1.2], intensity_offset=[-0.1, 0.1], noise_sigma=0.01,
+                         blur_sigma_range=[0.0, 1.0], elastic_prob=0.5, elastic_alpha=10.0, elastic_sigma=20.0,
+                         saturation_prob=0.0, prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
+                         cyto_center_prompt_prob=0.25, neighbor_cell_prompt_prob=1.0, prompt_inside_target=True,
+                         repeat_cell_prompt_prob=0.25),
+    'evaluation': dict(compute_jtpr=True, refinement_stage_audit=True, optimize_thresholds=False,
+                       save_predictions=False, threshold_opt_splits=['val'],
+                       prob_thresh_range=[0.2, 0.3, 0.4, 0.5, 0.6, 0.65, 0.7], nms_thresh_range=[0.1, 0.2, 0.3, 0.4, 0.5],
+                       mask_thresh_range=[0.25, 0.35, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]),
+    'inference': dict(prob_thresh_nucleus=0.4, prob_thresh_cytoplasm=0.3, nms_thresh=0.3, mask_thresh=0.45,
+                      mask_thresh_nucleus='auto', mask_thresh_cytoplasm='auto', mask_quality_min='auto',
+                      mask_quality_use_scores=False, proposal_mode='peaks', proposal_border_nucleus=0,
+                      proposal_border_cytoplasm=0, proposal_peak_window_nucleus=None,
+                      proposal_peak_window_cytoplasm=None, residual_proposals=False,
+                      mask_assembly_nucleus='object_quality_containment',
+                      mask_assembly_cytoplasm='object_quality_containment', mask_containment_threshold=0.95,
+                      mask_min_remaining_fraction=0.5, mask_nms_nucleus=0.5, mask_nms_cytoplasm=0.5,
+                      mask_overlap_nucleus=0.85, mask_overlap_cytoplasm=0.85, pair_min_overlap=0.1,
+                      pair_min_mask_iou=0.25, refinement_adaptive_roi=True, refinement_roi_snap=True,
+                      cell_roi_expansion_steps=2, refinement_batch=32, eval_splits=['val'], save_pred_tiff=True),
+    'output': dict(save_history=True, save_best_dice=True),
+    'gpu_config': dict(allow_growth=True, memory_limit=None),
+}
+# Keys of earlier configs that no longer exist; None removes the whole section.
+REMOVED_SETTINGS = {
+    'experiment': ('use_comet', 'comet_api_key', 'comet_project', 'comet_workspace'),   # no tracking service
+    'preprocessing': None,                     # datasets are prepared with dataset_prep/ before training
+    'data': ('skip_images', 'validation_images'),
+    'inference': ('bbox_padding_factor', 'tiling_fixed_axes', 'tile_blending'),   # StarDist tiling only
+}
+
+
+def normalize_config_dict(config_dict):
+    """A config dict with the removed keys dropped and the method settings filled in where it has none (one notice
+    line for the dropped keys and one for the settings it overrides)."""
+    import copy
+    out = copy.deepcopy(config_dict)
+    dropped, replaced = [], []
+    for section, keys in REMOVED_SETTINGS.items():
+        if section not in out:
+            continue
+        if keys is None:
+            del out[section]
+            dropped.append(section)
+            continue
+        for key in keys:
+            if key in out[section]:
+                del out[section][key]
+                dropped.append(f'{section}.{key}')
+    for section, settings in METHOD_SETTINGS.items():
+        values = out.setdefault(section, {})
+        for key, value in settings.items():
+            if key not in values:
+                values[key] = copy.deepcopy(value)
+            elif values[key] != value:
+                replaced.append(f'{section}.{key} = {values[key]!r} (method: {value!r})')
+    if dropped:
+        print('config: no longer used, ignored: ' + ', '.join(dropped))
+    if replaced:
+        print('config: sets method settings to other values: ' + ', '.join(replaced))
+    return out
+
+
+def read_config(path):
+    """JSON config of a run, normalised (normalize_config_dict)."""
+    with open(path, 'r') as f:
+        return normalize_config_dict(json.load(f))
+
+
 class CytoNucsConfig:
     """
     Configuration for CytoNucs StarDist model.
@@ -29,11 +117,6 @@ class CytoNucsConfig:
     # channel per pair after the image channels, and pair_view(i) is the config of pair i.
     ROLES = ('nucleus', 'cytoplasm')
 
-    # Keys of earlier configs that no longer do anything (kept readable for the runs that set them).
-    REMOVED_INFERENCE_KEYS = {
-        'tiling_fixed_axes': 'StarDist tiling, fixed windows only along Z in 3D',
-        'tile_blending': 'the fixed Z windows are always Hann-blended',
-    }
     FIXES_SETTINGS = {
         'evaluation': dict(refinement_stage_audit=False, fullval_train_volumes=0),
         'model': dict(unet_pool_schedule=None, unet_kernel_schedule=None,
@@ -901,8 +984,7 @@ class CytoNucsConfig:
         другим набором направлений, и полиэдры выходят чужой геометрии.
         Файл пишет set_anisotropy_from_labels в конце обучающего замера.
         """
-        with open(json_path, 'r') as f:
-            config_dict = json.load(f)
+        config_dict = read_config(json_path)
 
         for expected_section, settings in cls.FIXES_SETTINGS.items():
             for section, values in config_dict.items():
@@ -952,9 +1034,6 @@ class CytoNucsConfig:
         # Все inference-настройки кроме физического пути к чекпоинту.
         for key, value in inference_cfg.items():
             if key == 'checkpoint_path':
-                continue
-            if key in cls.REMOVED_INFERENCE_KEYS:
-                print(f'inference.{key} is no longer used: {cls.REMOVED_INFERENCE_KEYS[key]}')
                 continue
             params[key] = value
 

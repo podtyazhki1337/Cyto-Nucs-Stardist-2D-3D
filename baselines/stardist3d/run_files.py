@@ -173,7 +173,8 @@ StarDistDataBase.get_valid_inds = valid_centres
 
 
 def make_augmenter(like):
-    aug = json.loads(Path(like).read_text())['augmentation'] if like else {}
+    from cytonucs_config import read_config
+    aug = read_config(like)['augmentation'] if like else {}   # the method's augmentation settings included
     cfg = SimpleNamespace(rotation_yx=aug.get('rotation_yx', True), flip_prob=aug.get('flip_prob', .5),
                           flip_z_prob=(aug.get('flip_z_prob') or 0.) if NDIM == 3 else 0.,
                           intensity_range=aug.get('intensity_range', (.8, 1.2)), intensity_offset=aug.get('intensity_offset', (-.1, .1)),
