@@ -29,6 +29,11 @@ class CytoNucsConfig:
     # channel per pair after the image channels, and pair_view(i) is the config of pair i.
     ROLES = ('nucleus', 'cytoplasm')
 
+    # Keys of earlier configs that no longer do anything (kept readable for the runs that set them).
+    REMOVED_INFERENCE_KEYS = {
+        'tiling_fixed_axes': 'StarDist tiling, fixed windows only along Z in 3D',
+        'tile_blending': 'the fixed Z windows are always Hann-blended',
+    }
     FIXES_SETTINGS = {
         'evaluation': dict(refinement_stage_audit=False, fullval_train_volumes=0),
         'model': dict(unet_pool_schedule=None, unet_kernel_schedule=None,
@@ -54,7 +59,7 @@ class CytoNucsConfig:
                           semantic_scores=False, semantic_min_nucleus=0.0, semantic_min_cytoplasm=0.0,
                           quality_gates_override=None,
                           mask_thresh_nucleus=None, mask_thresh_cytoplasm=None,
-                          tiling_fixed_axes=None, refinement_patch_size=None,
+                          refinement_patch_size=None,
                           refinement_adaptive_roi=False, proposal_mode='stardist',
                           cell_roi_expansion_steps=0,
                           proposal_peak_window_nucleus=None, proposal_peak_window_cytoplasm=None,
@@ -67,8 +72,7 @@ class CytoNucsConfig:
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
                           refinement_windows=False, max_prompts_per_head=0,
                           skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0,
-                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25,
-                          tile_blending=False),
+                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1, negative_prompt_inside_outer=0.0,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -140,6 +144,8 @@ class CytoNucsConfig:
             scale_factor_cytoplasm=None,
             median_max_dist_nucleus=None,
             median_max_dist_cytoplasm=None,
+            large_extent_nucleus=None,
+            large_extent_cytoplasm=None,
             mask_thresh_range=(0.1, 0.9),
             threshold_opt_splits="val",
             eval_splits="test",
@@ -244,6 +250,10 @@ class CytoNucsConfig:
         self.scale_factor_cytoplasm = scale_factor_cytoplasm
         self.median_max_dist_nucleus = median_max_dist_nucleus
         self.median_max_dist_cytoplasm = median_max_dist_cytoplasm
+        # Per-axis extent (voxels) of the large objects of the training masks (99th percentile, measured with the
+        # median one): bounds the refinement ROI at inference. None in a geometry.json written before it existed.
+        self.large_extent_nucleus = large_extent_nucleus
+        self.large_extent_cytoplasm = large_extent_cytoplasm
 
         # Training
         self.use_gpu = use_gpu
@@ -334,6 +344,7 @@ class CytoNucsConfig:
             if geometry:
                 setattr(view, 'rays_anisotropy_' + role, tuple(geometry['rays_anisotropy']))
                 setattr(view, 'median_max_dist_' + role, float(geometry['median_max_dist']))
+                setattr(view, 'large_extent_' + role, geometry.get('large_extent'))
         view._build_rays()
         return view
 
@@ -354,12 +365,14 @@ class CytoNucsConfig:
                 if scale is not None:
                     self.level_geometry[level] = dict(
                         rays_anisotropy=[float(v) for v in getattr(view, 'rays_anisotropy_' + role)],
-                        median_max_dist=float(scale))
+                        median_max_dist=float(scale), large_extent=getattr(view, 'large_extent_' + role))
         missing = [level for level in self.levels if level not in self.level_geometry]
         if missing:
             raise ValueError(f'No objects of level(s) {missing} in the training masks')
         for role, members in zip(self.ROLES, (self.levels[:-1], self.levels[1:])):
             setattr(self, 'median_max_dist_' + role, max(self.level_geometry[m]['median_max_dist'] for m in members))
+            large = [self.level_geometry[m].get('large_extent') for m in members]
+            setattr(self, 'large_extent_' + role, None if None in large else [int(v) for v in np.max(large, axis=0)])
         first = self.pair_view(0)
         self.rays_anisotropy_nucleus, self.rays_anisotropy_cytoplasm = first.rays_anisotropy_nucleus, first.rays_anisotropy_cytoplasm
         self._build_rays()
@@ -372,7 +385,8 @@ class CytoNucsConfig:
                 rays_anisotropy_cytoplasm=list(self.rays_anisotropy_cytoplasm),
                 nucleus_grid=list(self.nucleus_grid), cytoplasm_grid=list(self.cytoplasm_grid),
                 median_max_dist_nucleus=float(self.median_max_dist_nucleus),
-                median_max_dist_cytoplasm=float(self.median_max_dist_cytoplasm)), indent=2))
+                median_max_dist_cytoplasm=float(self.median_max_dist_cytoplasm),
+                large_extent_nucleus=self.large_extent_nucleus, large_extent_cytoplasm=self.large_extent_cytoplasm), indent=2))
         return self.level_geometry
 
     def has_level(self, role):
@@ -508,8 +522,6 @@ class CytoNucsConfig:
             raise ValueError(f'mask_prompt_start_epoch must be a nonnegative integer, got {self.mask_prompt_start_epoch!r}')
         if not isinstance(self.refinement_windows, bool):
             raise ValueError(f'refinement_windows must be true or false, got {self.refinement_windows!r}')
-        if not isinstance(self.tile_blending, bool):
-            raise ValueError(f'tile_blending must be true or false, got {self.tile_blending!r}')
         if not isinstance(self.center_vote_grouping, bool):
             raise ValueError(f'center_vote_grouping must be true or false, got {self.center_vote_grouping!r}')
         if (isinstance(self.center_vote_radius, bool) or not isinstance(self.center_vote_radius, (int, float))
@@ -744,6 +756,7 @@ class CytoNucsConfig:
                 res = _measure(lbls)
                 if res is not None:
                     setattr(self, f'median_max_dist_{name}', float(int(round(float(np.linalg.norm(res[1])) / 2.0))))
+                    setattr(self, f'large_extent_{name}', res[2])
                     print(f"   {name}: медианный bbox {tuple(int(round(v)) for v in res[1])} -> median_max_dist "
                           f"{getattr(self, f'median_max_dist_{name}'):.0f} px")
             self._write_geometry()
@@ -758,6 +771,8 @@ class CytoNucsConfig:
                            ('cytoplasm', cytoplasm_labels)):
             key = f'rays_anisotropy_{name}'
             res = _measure(lbls)
+            if res is not None:
+                setattr(self, f'large_extent_{name}', res[2])
             if getattr(self, key) != base:
                 print(f"   {key}: задана в конфиге "
                       f"{tuple(getattr(self, key))}, замер не применяется")
@@ -768,7 +783,7 @@ class CytoNucsConfig:
                 print(f"   {key}: объектов не найдено, оставляю {base}")
                 a = getattr(self, key)
             else:
-                a, ext = res
+                a, ext = res[:2]
                 measured_ext[name] = ext
                 setattr(self, key, a)
                 print(f"   {name}: медианный bbox "
@@ -804,9 +819,9 @@ class CytoNucsConfig:
         return self.rays_anisotropy_nucleus, self.rays_anisotropy_cytoplasm
 
     def _measure_extents(self, lbls):
-        """(integer aspect, median extent per axis) of the objects of label images, every axis on its
-        own: an object counts on an axis where it does not touch the image faces (if at least 30 do).
-        None without objects."""
+        """(integer aspect, median extent per axis, large extent per axis) of the objects of label images, every
+        axis on its own: an object counts on an axis where it does not touch the image faces (if at least 30 do).
+        The large extent is the 99th percentile of the same extents (integers). None without objects."""
         from scipy.ndimage import find_objects
         nd = self.ndim
         if lbls is None or len(lbls) == 0:
@@ -831,8 +846,9 @@ class CytoNucsConfig:
         if not any(len(v) for v in ext_all):
             return None
 
-        ext, src = [], []
+        ext, large, src = [], [], []
         for a in range(nd):
+            large.append(int(np.ceil(np.percentile(ext_in[a] if len(ext_in[a]) >= 30 else ext_all[a], 99))))
             if len(ext_in[a]) >= 30:
                 ext.append(float(np.median(ext_in[a])))
                 src.append(f"ось{a}: {len(ext_in[a])}/{len(ext_all[a])}")
@@ -845,7 +861,7 @@ class CytoNucsConfig:
         print(f"      замер {', '.join(src)}")
         # Аспект объекта, ЦЕЛЫЙ, не меньше 1.
         aniso = tuple(max(1, int(round(float(np.max(ext) / e)))) for e in ext)
-        return aniso, ext
+        return aniso, ext, large
 
     def _write_geometry(self):
         """geometry.json at geometry_path: the rays, grids and scales a checkpoint is read back with (from_json
@@ -865,6 +881,8 @@ class CytoNucsConfig:
                 'cytoplasm_grid': list(self.cytoplasm_grid),
                 'median_max_dist_nucleus': scale(self.median_max_dist_nucleus),
                 'median_max_dist_cytoplasm': scale(self.median_max_dist_cytoplasm),
+                'large_extent_nucleus': self.large_extent_nucleus,
+                'large_extent_cytoplasm': self.large_extent_cytoplasm,
             }, f, indent=2)
         print(f"   💾 geometry.json сохранён: {p}")
 
@@ -935,6 +953,9 @@ class CytoNucsConfig:
         for key, value in inference_cfg.items():
             if key == 'checkpoint_path':
                 continue
+            if key in cls.REMOVED_INFERENCE_KEYS:
+                print(f'inference.{key} is no longer used: {cls.REMOVED_INFERENCE_KEYS[key]}')
+                continue
             params[key] = value
 
         # --- ГЕОМЕТРИЯ ОБУЧЕНИЯ ---
@@ -955,7 +976,8 @@ class CytoNucsConfig:
                     f"конфигом ({params.get('n_rays')}) — веса и лучи от разных прогонов")
             for k in ('rays_anisotropy_nucleus', 'rays_anisotropy_cytoplasm',
                       'nucleus_grid', 'cytoplasm_grid',
-                      'median_max_dist_nucleus', 'median_max_dist_cytoplasm'):
+                      'median_max_dist_nucleus', 'median_max_dist_cytoplasm',
+                      'large_extent_nucleus', 'large_extent_cytoplasm'):
                 if geo.get(k) is not None:
                     params[k] = geo[k]
             if geo.get('levels'):

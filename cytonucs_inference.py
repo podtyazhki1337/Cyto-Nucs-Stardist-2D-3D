@@ -143,6 +143,28 @@ def _window_size(extent, net_shape, grid):
 REFINE_WINDOW_SIZES = (8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)   # head-grid nodes per axis
 
 
+def refinement_roi_limit(config, base_shape, shape):
+    """Largest refinement ROI per axis: the adaptive ROI of the large objects of the training masks (1.5 times their
+    99th-percentile extent, as roi_for takes 3 times the longest ray), at least the base ROI, at most the image. None
+    when the geometry has no large extent (geometry.json written before it was measured): no limit. The backbone and
+    the full-resolution features run over the whole ROI, so memory grows with it: cell ROI expansions on a false
+    object covering most of a KiTS volume grew the ROI to 128 x 480 x 512, which ran out of GPU memory."""
+    extents = [e for e in (getattr(config, f'large_extent_{h}', None) for h in ('nucleus', 'cytoplasm')) if e is not None]
+    if not extents:
+        return None
+    large = np.max(np.asarray(extents, np.float64), axis=0)
+    return tuple(int(min(n, max(b, np.ceil(1.5 * e)))) for n, b, e in zip(shape, base_shape, large))
+    floor = [min(int(f), s) for f, s in zip(floor, size)]
+    padded = lambda: int(np.prod([-(-s // int(m)) * int(m) for s, m in zip(size, multiple)]))
+    while padded() > max_voxels:
+        above = [a for a in range(len(size)) if size[a] > floor[a]]
+        if not above:
+            break
+        a = max(above, key=lambda a: size[a] / floor[a])
+        size[a] = max(floor[a], size[a] - int(multiple[a]))
+    return tuple(size)
+
+
 def _refiner_reach(config):
     """Receptive-field radius of the prompted refiner in head-grid nodes per axis (plus a safety node) and its
     total pooling factor, over both heads (they share the grid when windows are used)."""
@@ -474,7 +496,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     nuc_candidates, cell_candidates, evidence = [], [], []
     diagnostics = {h: dict(attempted=0, empty_threshold=0, missing_component=0,
                           nonfinite=0, quality_nonfinite=0, quality_rejected=0, accepted=0, quality=[],
-                          roi_expansions=0, roi_boundary_remaining=0,
+                          roi_expansions=0, roi_boundary_remaining=0, roi_capped=0,
                           residual_peaks=0, residual_prompts=0, area_gate_removed=0,
                           windowed=0, window_fallbacks=0, prompts_capped=0, prompts_skipped=0)
                    for h in ('nucleus', 'cytoplasm')}
@@ -512,6 +534,18 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         feature_fn, refine_fn = _refinement_runners(model)
         cell_fn = _cytoplasm_refinement_runner(model)
 
+    roi_limit = refinement_roi_limit(config, base_shape, shape)
+
+    def fit_roi(run_shape, floor, head):
+        """run_shape cut to roi_limit (counted as roi_capped), never below floor."""
+        run_shape = tuple(int(v) for v in run_shape)
+        if roi_limit is None:
+            return run_shape
+        fitted = tuple(min(s, max(int(f), l)) for s, f, l in zip(run_shape, floor, roi_limit))
+        if fitted != run_shape:
+            diagnostics[head]['roi_capped'] += 1
+        return fitted
+
     def roi_for(center, distances, head):
         run_shape = base_shape
         if config.refinement_adaptive_roi and distances is not None:
@@ -521,8 +555,9 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             extent = np.ceil(3 * np.max(np.abs(vertices), axis=0)).astype(int)
             if roi_size_step is not None:
                 extent = -(-extent // roi_size_step) * roi_size_step  # a few ROI shapes
-            run_shape = tuple(min(s, max(b, int(e))) for s, b, e in zip(shape, base_shape, extent))
-        origin = tuple(max(0, min(int(c)-s//2, n-s)) for c, s, n in zip(center, run_shape, shape))
+            run_shape = fit_roi(tuple(min(s, max(b, int(e))) for s, b, e in zip(shape, base_shape, extent)),
+                                base_shape, head)
+        origin =tuple(max(0, min(int(c)-s//2, n-s)) for c, s, n in zip(center, run_shape, shape))
         if roi_stride is not None:
             # inference.refinement_roi_stride: origins on a fixed grid, the prompt at most half a stride off the
             # ROI centre; prompts then share overlapping ROIs of the training crop size (backbone features
@@ -628,11 +663,13 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             if axes_to_grow and expansion_step < config.cell_roi_expansion_steps:
                 expanded = tuple(min(shape[a], 2*run_shape[a]) if a in axes_to_grow else run_shape[a]
                                  for a in range(nd))
-                global_center = center + origin
-                new_origin = tuple(max(0, min(int(c)-s//2, n-s))
-                                   for c, s, n in zip(global_center, expanded, shape))
-                diag['roi_expansions'] += 1
-                return expand(global_center, (new_origin, expanded), sigma, expansion_step + 1)
+                expanded = fit_roi(expanded, run_shape, h)    # grows less, or not at all, past the ROI limit
+                if expanded != tuple(int(v) for v in run_shape):
+                    global_center = center + origin
+                    new_origin = tuple(max(0, min(int(c)-s//2, n-s))
+                                       for c, s, n in zip(global_center, expanded, shape))
+                    diag['roi_expansions'] += 1
+                    return expand(global_center, (new_origin, expanded), sigma, expansion_step + 1)
             if axes_to_grow:
                 diag['roi_boundary_remaining'] += 1
         fine_used = fine_enabled and any_foreground
@@ -2134,12 +2171,12 @@ class CytoNucsPredictor:
             отсчётов с padding до кратности сети. Окна перекрываются;
             выход каждого окна записывается только в его центральную область.
 
-        Какие оси фиксированные — задаёт tiling_fixed_axes (см. ниже). Для 3D
-        по умолчанию это Z: препарат 2D-культуры плоский, обучающий патч по Z
-        покрывает его целиком, и сеть откалибрована именно на стек в train_Z
-        срезов вместе с его краевым паддингом; подать другое число срезов —
-        сменить режим целиком. Для 2D фиксированных осей нет, остаётся чистый
-        канонический StarDist tiling.
+        Фиксированная ось одна: Z в 3D (окна по train_Z срезов, перекрытие
+        наполовину, выходы складываются с весом Ханна, так что швов по Z нет).
+        По Z рецептивное поле больше обучающего патча, и тайл с полным
+        контекстом по Z — это почти весь объём, который не помещается в
+        память. В 2D фиксированных осей нет: канонический StarDist tiling
+        (картинка целиком или тайлы с перекрытием >= контекста), без швов.
 
         Отличия от прежней fixed-Z версии:
           * нет `raise ... "рассчитана на ndim=3"` -> 2D работает;
@@ -2224,16 +2261,10 @@ class CytoNucsPredictor:
 
         _tp = tuple(int(v) for v in self.config.train_patch_size)[-nd:]
 
-        # Какие оси фиксированные. По умолчанию для 3D это ось 0 (Z), для 2D —
-        # ни одной. Переопределяется ключом tiling_fixed_axes в inference-секции
-        # конфига: [] даёт канонический tiling по всем осям (изотропные 3D),
-        # [0] — текущее поведение.
-        _fx_cfg = getattr(self.config, 'tiling_fixed_axes', None)
-        if _fx_cfg is None:
-            _fx_cfg = [0] if nd == 3 else []
-        _fx_cfg = sorted({int(a) for a in _fx_cfg})
-        if any(a < 0 or a >= nd for a in _fx_cfg):
-            raise ValueError(f"tiling_fixed_axes={_fx_cfg} вне диапазона [0,{nd})")
+        # Фиксированная ось: Z в 3D, в 2D ни одной (StarDist tiling по всем осям). Окна обучающего
+        # размера по всем осям (прежний inference.tiling_fixed_axes) давали швы на картах: GroupNorm и
+        # контекст у каждого окна свои; канонический tiling на валидации HeLa / TissueNet не хуже и быстрее.
+        _fx_cfg = [0] if nd == 3 else []
         fixed = tuple(a in _fx_cfg for a in range(nd))
 
         for a in _fx_cfg:
@@ -2324,11 +2355,11 @@ class CytoNucsPredictor:
         cyto_shape_tiled = _map_shape(cyto_grid)
 
         _dist_dtype = np.dtype(getattr(self.config, 'dist_map_dtype', 'float32'))
-        # inference.tile_blending: along the fixed axes every window adds its whole output with a Hann weight that
-        # peaks at its centre, instead of writing only its centre. The windows overlap by half (fixed_window_plan),
-        # so the weights cross-fade and the maps have no step where two windows meet (each window sees its own
-        # context and group-norm statistics). Same number of forwards.
-        blend = bool(getattr(self.config, 'tile_blending', False)) and bool(fixed_axes)
+        # Along the fixed axis every window adds its whole output with a Hann weight that peaks at its centre,
+        # instead of writing only its centre. The windows overlap by half (fixed_window_plan), so the weights
+        # cross-fade and the maps have no step where two windows meet (each window sees its own context and
+        # group-norm statistics). Same number of forwards.
+        blend = bool(fixed_axes)
         _alloc = np.zeros if blend else np.empty
         if blend:
             _dist_dtype = np.dtype(np.float32)
@@ -2356,7 +2387,7 @@ class CytoNucsPredictor:
 
         def _put(dst, val, grid_, s_src, s_dst, fx, coverage=None):
             """fx: {axis: (src_lo, dst_lo, dst_hi)} для фиксированных осей.
-            Для свободных осей берутся слайсы tile_iterator. With tile_blending the window's Hann weight multiplies
+            Для свободных осей берутся слайсы tile_iterator. Along the fixed axis the window's Hann weight multiplies
             the values, which are added, and coverage sums the weights."""
             ss, sd = [], []
             for a in range(nd):
