@@ -12,6 +12,10 @@
 !/dataset_prep/
 /dataset_prep/*
 !/dataset_prep/*.py
+!/dataset_prep/synthetic/
+/dataset_prep/synthetic/*
+!/dataset_prep/synthetic/*.py
+!/dataset_prep/synthetic/README.md
 
 # Baselines of the paper: their code (StarDist runs, the vendored HydraStarDist package with its BSD licence),
 # not their models or logs.
