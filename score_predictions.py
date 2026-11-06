@@ -64,7 +64,8 @@ def main():
     os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
     results = {split: score_predictions(args.data, args.predictions, split, args.levels, args.timing) for split in args.split}
     output = Path(args.output or Path(args.predictions) / 'scores.json')
-    output.write_text(json.dumps(results, indent=1))
+    previous = json.loads(output.read_text()) if output.is_file() else {}       # splits scored before stay
+    output.write_text(json.dumps({**previous, **results}, indent=1))
     print('->', output)
 
 

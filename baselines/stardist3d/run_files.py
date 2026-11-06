@@ -293,7 +293,9 @@ def score():
               f" | JTPR {result[f'jtpr_{inner}_{outer}'] or 0:.3f} of {result[f'pairs_{inner}_{outer}']}"
               f" | {result['seconds_per_volume']:.1f} s per volume")
     out = Path(args.basedir) / f'files_{inner_name}_{outer_name}.json'
-    out.write_text(json.dumps(results, indent=1))
+    # Splits scored before (one call per split in the job scripts) stay in the file.
+    previous = json.loads(out.read_text()) if out.is_file() else {}
+    out.write_text(json.dumps({**previous, **results}, indent=1))
     print('->', out)
     if args.drop_cache:
         drop_cache()

@@ -225,7 +225,9 @@ def score():
               f"recall {result['recall50_nucleus']:.2f}) | cells {objects['cytoplasm']}: AP {result['ap_cytoplasm']:.3f} "
               f"(AP50 {result['ap50_cytoplasm']:.3f}, recall {result['recall50_cytoplasm']:.2f}) | JTPR {result['jtpr']:.3f} of {joint[1]} pairs")
     out = Path(args.basedir) / f'blocks_{args.nucleus_model}_{args.cytoplasm_model}.json'
-    out.write_text(json.dumps(results, indent=1))
+    # Splits scored before (one call per split in the job scripts) stay in the file.
+    previous = json.loads(out.read_text()) if out.is_file() else {}
+    out.write_text(json.dumps({**previous, **results}, indent=1))
     print('->', out)
 
 
