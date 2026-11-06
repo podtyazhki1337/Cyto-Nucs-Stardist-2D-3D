@@ -225,7 +225,9 @@ def score():
               f" | paper JTPR inner/outer {best['jtpr_inner_best'] or 0:.3f} / {best['jtpr_outer_best'] or 0:.3f}"
               f" | {result['seconds_per_image']:.1f} s per image")
     out = Path(args.basedir) / args.name / 'scores.json'
-    out.write_text(json.dumps(results, indent=1))
+    # Splits scored before (one call per split in the job scripts) stay in the file.
+    previous = json.loads(out.read_text()) if out.is_file() else {}
+    out.write_text(json.dumps({**previous, **results}, indent=1))
     print('->', out)
 
 

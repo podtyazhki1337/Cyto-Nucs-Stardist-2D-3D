@@ -3,8 +3,9 @@
 the per-image records). Predicted child -> parent links are taken by overlap (as compute_jtpr does without
 predicted pairs) unless <predictions>/<split>/parents/<stem>.json holds them for the inner level.
 
-Predicted labels: <predictions>/<split>/<level>/<name> (as written by score_hierarchy.py --predictions, the
-baseline scorers and baselines/cellpose/run_cellpose.py). Predicted objects lying mostly in
+Predicted labels: <predictions>/<split>/<level>/<name> (as written by the baseline scorers and
+baselines/cellpose/run_cellpose.py) or <predictions>/<level>/<name> (score_hierarchy.py --predictions, which also writes
+the predicted links in parents/). Predicted objects lying mostly in
 <split>/<level>_unknown/<name> are left out. Seconds per image are read from --timing (a JSON of '<split>/<name>'
 -> seconds, e.g. the 'seconds' of a Cellpose training.json) when given.
 
@@ -24,14 +25,16 @@ def score_predictions(data, predictions, split='test', levels=('nucleus', 'cytop
     import tifffile
     from score_hierarchy import ground_truth, score_image, summarise
     data, predictions, levels = Path(data), Path(predictions), list(levels)
+    # <predictions>/<split>/<level>/<name>, or <predictions>/<level>/<name> (score_hierarchy.py --predictions)
+    root = predictions / split if (predictions / split).is_dir() else predictions
     pairs = [(levels[i], levels[i + 1]) for i in range(len(levels) - 1)]
     seconds = json.loads(Path(timing).read_text()) if timing else {}
     seconds = seconds.get('seconds', seconds)
     records = []
     names = sorted(p.name for p in (data / split / 'images').iterdir() if p.suffix.lower() in ('.tif', '.tiff'))
     for name in names:
-        pred = {level: tifffile.imread(predictions / split / level / name) for level in levels}
-        parents_file = predictions / split / 'parents' / (Path(name).stem + '.json')
+        pred = {level: tifffile.imread(root / level / name) for level in levels}
+        parents_file = root / 'parents' / (Path(name).stem + '.json')
         parents = ({levels[0]: {int(k): int(v) for k, v in json.loads(parents_file.read_text()).items()}}
                    if parents_file.is_file() else None)
         gt, truths, ignore = ground_truth(data / split, name, levels, pairs)
@@ -61,7 +64,8 @@ def main():
     os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
     results = {split: score_predictions(args.data, args.predictions, split, args.levels, args.timing) for split in args.split}
     output = Path(args.output or Path(args.predictions) / 'scores.json')
-    output.write_text(json.dumps(results, indent=1))
+    previous = json.loads(output.read_text()) if output.is_file() else {}       # splits scored before stay
+    output.write_text(json.dumps({**previous, **results}, indent=1))
     print('->', output)
 
 

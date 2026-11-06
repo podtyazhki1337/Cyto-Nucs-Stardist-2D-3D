@@ -123,13 +123,17 @@ def score_image(gt, pred, pairs, truths, pred_parents=None, ignore=None):
             _, details = compute_jtpr(pred[inner], pred[outer], gt[inner], gt[outer], iou_thresh=.5,
                                       assignments_pred=(pred_parents or {}).get(inner), assignments_gt=truths[key])
         record['pairs'][key] = dict(joint_tp=int(details['joint_tp']), pairs=int(details['total_pairs']),
+                                    fail_inner=int(details['joint_fail_nucleus']), fail_outer=int(details['joint_fail_cell']),
+                                    fail_link=int(details['joint_fail_link']),
                                     paper=paper_metrics(gt[inner], gt[outer], pred[inner], pred[outer], truths[key]))
     return record, pred
 
 
 def summarise(records, levels, pairs):
     """Summary of the per-image records of score_image: per level AP (mean over TAUS of TP / (TP + FP + FN) of
-    the pooled counts), AP50, recall and precision at 0.5; per pair our JTPR and the means of the paper metrics."""
+    the pooled counts), AP50, recall and precision at 0.5; per pair our JTPR, why the other annotated pairs fail
+    (shares of the pairs: the inner object is not found at IoU 0.5, the inner one is but its outer one is not, both
+    are but the predicted link joins other objects; compute_jtpr) and the means of the paper metrics."""
     from cytonucs_runtime import accuracy_profile
     result = dict(images=len(records), objects={level: sum(r['levels'][level]['objects'] for r in records) for level in levels})
     for level in levels:
@@ -145,6 +149,9 @@ def summarise(records, levels, pairs):
         joint, total = (sum(r['pairs'][key][k] for r in records) for k in ('joint_tp', 'pairs'))
         result[f'jtpr_{key}'] = joint / total if total else None
         result[f'pairs_{key}'] = total
+        if records and all('fail_link' in r['pairs'][key] for r in records):        # older records lack them
+            for kind in ('inner', 'outer', 'link'):
+                result[f'fail_{kind}_{key}'] = sum(r['pairs'][key][f'fail_{kind}'] for r in records) / total if total else None
         result[f'paper_{key}'] = mean_paper_metrics([r['pairs'][key]['paper'] for r in records])
     return result
 
@@ -213,6 +220,10 @@ def score(config_path, weights, split='test', limit=0, memory_limit=None, predic
                     f.write(json.dumps(records[-1]) + '\n')
             if predictions:
                 save_prediction(predictions, name, scored)
+                if pred.get('parents') and pred['parents'].get(levels[0]) is not None:   # predicted links, for rescoring
+                    (Path(predictions) / 'parents').mkdir(parents=True, exist_ok=True)
+                    (Path(predictions) / 'parents' / (Path(name).stem + '.json')).write_text(
+                        json.dumps({int(k): int(v) for k, v in pred['parents'][levels[0]].items()}))
                 if pred.get('semantic'):                                 # per-object semantic scores (semantic_gate.py)
                     (Path(predictions) / 'semantic').mkdir(parents=True, exist_ok=True)
                     (Path(predictions) / 'semantic' / (Path(name).stem + '.json')).write_text(json.dumps(pred['semantic']))
