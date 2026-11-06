@@ -4078,15 +4078,17 @@ def compute_all_metrics(img, nucleus_pred, cytoplasm_pred,
         'n_cells': int(np.count_nonzero(np.unique(cytoplasm_pred)))
     }
 
-    # Compute assignments
-    assignments_heur, unassigned, stats = compute_nucleus_cell_assignments(
-        nucleus_pred, cytoplasm_pred
-    )
+    # Assignments: the predicted links when given, else the nearest-centroid heuristic. Linked and unlinked nuclei
+    # both come from the same links (the unlinked ones used to come from the heuristic even with predicted links, so
+    # their share of the nuclei did not add up).
     if assignments_pred is None:
-        assignments_pred = assignments_heur
+        assignments_pred, _, _ = compute_nucleus_cell_assignments(nucleus_pred, cytoplasm_pred)
+    nucleus_ids = {int(v) for v in np.unique(nucleus_pred) if v}
+    linked = {int(k) for k in assignments_pred} & nucleus_ids
 
-    metrics['n_assigned'] = len(assignments_pred)
-    metrics['n_unassigned'] = len(unassigned)
+    metrics['n_assigned'] = len(linked)
+    metrics['n_unassigned'] = len(nucleus_ids - linked)
+    metrics['unassigned_share'] = metrics['n_unassigned'] / max(len(nucleus_ids), 1)
 
     # Multi-nuclear cells
     cell_counts = Counter(assignments_pred.values())
