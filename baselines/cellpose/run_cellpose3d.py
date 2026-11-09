@@ -257,6 +257,7 @@ def score():
     for split in ('test', 'val'):
         counts = {t: np.zeros((3, len(TAUS)), np.int64) for t in MASKS}
         joint, objects, timing = [0, 0], {t: 0 for t in MASKS}, []
+        fails = dict(fail_nucleus=0, fail_cell=0, fail_link=0)    # why annotated pairs are no joint TP
         for entry in info['windows'][split]:
             block, window = tuple(entry['block']), tuple(entry['window'])
             y0, y1, x0, x1 = window
@@ -272,7 +273,9 @@ def score():
                 _, details = compute_jtpr(pr['nucleus'], pr['cytoplasm'], gt['nucleus'], gt['cytoplasm'], iou_thresh=.5,
                                           assignments_gt=pairs)
             joint[0] += int(details['joint_tp']); joint[1] += int(details['total_pairs'])
-        result = dict(jtpr=joint[0] / max(joint[1], 1), pairs=joint[1], objects=objects, timing=timing)
+            for key in fails:
+                fails[key] += int(details['joint_' + key])
+        result = dict(jtpr=joint[0] / max(joint[1], 1), pairs=joint[1], objects=objects, timing=timing, **fails)
         for t in MASKS:
             tp, fp, fn = counts[t]
             ap = accuracy_profile(tp, fp, fn)

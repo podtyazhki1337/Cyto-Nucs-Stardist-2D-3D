@@ -38,6 +38,7 @@ parser.add_argument('--score', action='store_true', help='score two trained mode
 parser.add_argument('--nucleus-model')
 parser.add_argument('--cytoplasm-model')
 parser.add_argument('--margin', type=int, default=192)
+parser.add_argument('--output', help='score file (default: <basedir>/blocks_<nucleus model>_<cytoplasm model>.json)')
 parser.add_argument('--patch', type=int, nargs=3, default=[16, 320, 320], help='training patch ZYX (160 for half resolution)')
 parser.add_argument('--grid', type=int, nargs=3, default=[1, 4, 4], help='StarDist grid ZYX ((1, 2, 2) for half resolution)')
 parser.add_argument('--backbone', default='resnet', choices=('resnet', 'unet'),
@@ -191,6 +192,7 @@ def score():
     for split in ('test', 'val'):
         counts = {t: np.zeros((3, len(TAUS)), np.int64) for t in MASKS}
         joint, objects, timing = [0, 0], {t: 0 for t in MASKS}, []
+        fails = dict(fail_nucleus=0, fail_cell=0, fail_link=0)    # why annotated pairs are no joint TP
         for _, block, window in block_windows(manifest, split, args.margin, factor):
             y0, y1, x0, x1 = window
             x = normalize(image[:, y0 // factor:y1 // factor, x0 // factor:x1 // factor].astype(np.float32), 1, 99.8,
@@ -213,7 +215,9 @@ def score():
                 _, details = compute_jtpr(pr['nucleus'], pr['cytoplasm'], gt['nucleus'], gt['cytoplasm'], iou_thresh=.5,
                                           assignments_gt=pairs)
             joint[0] += int(details['joint_tp']); joint[1] += int(details['total_pairs'])
-        result = dict(jtpr=joint[0] / max(joint[1], 1), pairs=joint[1], objects=objects, timing=timing)
+            for key in fails:
+                fails[key] += int(details['joint_' + key])
+        result = dict(jtpr=joint[0] / max(joint[1], 1), pairs=joint[1], objects=objects, timing=timing, **fails)
         for t in MASKS:
             tp, fp, fn = counts[t]
             ap = accuracy_profile(tp, fp, fn)
@@ -224,7 +228,7 @@ def score():
         print(f"{split:5s} | nuclei {objects['nucleus']}: AP {result['ap_nucleus']:.3f} (AP50 {result['ap50_nucleus']:.3f}, "
               f"recall {result['recall50_nucleus']:.2f}) | cells {objects['cytoplasm']}: AP {result['ap_cytoplasm']:.3f} "
               f"(AP50 {result['ap50_cytoplasm']:.3f}, recall {result['recall50_cytoplasm']:.2f}) | JTPR {result['jtpr']:.3f} of {joint[1]} pairs")
-    out = Path(args.basedir) / f'blocks_{args.nucleus_model}_{args.cytoplasm_model}.json'
+    out = Path(args.output or Path(args.basedir) / f'blocks_{args.nucleus_model}_{args.cytoplasm_model}.json')
     # Splits scored before (one call per split in the job scripts) stay in the file.
     previous = json.loads(out.read_text()) if out.is_file() else {}
     out.write_text(json.dumps({**previous, **results}, indent=1))
