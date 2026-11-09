@@ -47,6 +47,11 @@ parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_ru
                     help='where the models are written and read')
 parser.add_argument('--unknown-as-background', action='store_true',
                     help='masks with training.unknown_label 65535 (sparse annotation): StarDist cannot ignore voxels, so they become background')
+parser.add_argument('--unknown-masked', action='store_true',
+                    help='sparse annotation: voxels labelled training.unknown_label 65535 are left out of every loss term '
+                         '(masked_loss.py, our modification of the baseline) instead of taken as background')
+parser.add_argument('--val-data', help='dataset whose train_regions give the val blocks (same volume and blocks as --data), '
+                                       'e.g. the fully annotated source of a sparse dataset; default --data')
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
@@ -98,18 +103,31 @@ def blocks(split):
             for v in manifest['volumes'] for b in v['blocks'] if b['split'] == split]
 
 
-def block_volumes(split, target):
+def block_volumes(split, target, data=None, masked=False):
+    """Images and labels of the blocks of a split, from the train_regions of `data` (default DATA; the blocks of
+    DATA). masked: unknown voxels (65535) labelled -1 for masked_loss.MaskedStarDist3D, else background when
+    --unknown-as-background."""
+    data = Path(data) if data else DATA
     name, _ = volume()
-    image = tifffile.imread(DATA / 'train_regions' / 'images' / name)
-    labels = tifffile.imread(DATA / 'train_regions' / MASKS[target] / name)
+    image = tifffile.imread(data / 'train_regions' / 'images' / name)
+    labels = tifffile.imread(data / 'train_regions' / MASKS[target] / name)
     xs, ys = [], []
     for y0, y1, x0, x1 in blocks(split):
         xs.append(normalize(image[:, y0:y1, x0:x1].astype(np.float32), 1, 99.8, axis=(0, 1, 2)).astype(np.float32))
         block = labels[:, y0:y1, x0:x1]
-        if args.unknown_as_background:
-            block = np.where(block == 65535, 0, block)
-        ys.append(fill_label_holes(block.astype(np.uint16)))
+        unknown = block == 65535
+        if args.unknown_as_background or masked:
+            block = np.where(unknown, 0, block)
+        block = fill_label_holes(block.astype(np.uint16))
+        ys.append(np.where(unknown, -1, block).astype(np.int32) if masked else block)
     return xs, ys
+
+
+def unknown_share(split, target, data=None):
+    """Share of the voxels of the blocks of a split labelled unknown (65535) in the train_regions of `data`."""
+    name, _ = volume()
+    labels = tifffile.imread(Path(data or DATA) / 'train_regions' / MASKS[target] / name)
+    return float(np.mean([np.mean(labels[:, y0:y1, x0:x1] == 65535) for y0, y1, x0, x1 in blocks(split)]))
 
 
 def make_augmenter(like):
@@ -133,11 +151,16 @@ def make_augmenter(like):
 
 def train():
     name = args.name or f'stardist3d_fullres_{args.target}'
-    x_train, y_train = block_volumes('train', args.target)
+    if args.unknown_masked and args.unknown_as_background:
+        raise SystemExit('--unknown-masked and --unknown-as-background exclude each other')
+    x_train, y_train = block_volumes('train', args.target, masked=args.unknown_masked)
     keep = [i for i, y in enumerate(y_train) if y.max() > 0]
     x_train, y_train = [x_train[i] for i in keep], [y_train[i] for i in keep]
-    x_val, y_val = block_volumes('val', args.target)
-    extents = [[b[d + 3] - b[d] for d in range(3)] for y in y_train for b in (p.bbox for p in skimage.measure.regionprops(y))]
+    x_val, y_val = block_volumes('val', args.target, data=args.val_data)
+    val_unknown = unknown_share('val', args.target, args.val_data)               # 0 for a fully annotated val
+    y_val = [np.where(y == 65535, 0, y) for y in y_val]
+    extents = [[b[d + 3] - b[d] for d in range(3)] for y in y_train
+               for b in (p.bbox for p in skimage.measure.regionprops(np.maximum(y, 0)))]
     median = np.median(extents, axis=0)
     anisotropy = tuple(float(v) for v in np.max(median) / median)
     augment, aug_values = make_augmenter(args.like)
@@ -152,7 +175,9 @@ def train():
         train_patch_size=PATCH, train_background_reg=1e-4, train_dist_loss='mae', train_loss_weights=(1.0, 0.2),
         train_epochs=args.epochs, train_steps_per_epoch=args.steps, train_learning_rate=3e-4, train_batch_size=2,
         train_n_val_patches=None, train_tensorboard=False, train_reduce_lr=dict(factor=0.5, patience=40, min_delta=0))
-    model = StarDist3D(conf, name=name, basedir=args.basedir)
+    if args.unknown_masked:
+        from masked_loss import MaskedStarDist3D
+    model = (MaskedStarDist3D if args.unknown_masked else StarDist3D)(conf, name=name, basedir=args.basedir)
     params = int(sum(int(np.prod(v.shape)) for v in model.keras_model.trainable_weights))
     print(f'{args.target}: {len(x_train)} train blocks {x_train[0].shape}, median object extent {median}, anisotropy '
           f'{np.round(anisotropy, 2)}, field of view {np.array(model._axes_tile_overlap("ZYX"))}, {params} parameters')
@@ -171,6 +196,7 @@ def train():
                 thresholds={k: float(v) for k, v in dict(thresholds).items()},
                 val_loss=[float(v) for v in history.history.get('val_loss', [])])
     info.update(backbone=args.backbone, data=str(DATA), unknown_as_background=args.unknown_as_background,
+                unknown_masked=args.unknown_masked, val_data=str(args.val_data or DATA), val_unknown_share=val_unknown,
                 field_of_view=[int(v) for v in model._axes_tile_overlap('ZYX')], weights=str(Path(args.basedir) / name / 'weights_best.h5'))
     (Path(args.basedir) / name / 'training.json').write_text(json.dumps(info, indent=2, default=str))
     print(json.dumps({k: info[k] for k in ('training_hours', 'gpu_peak_mem_gb', 'thresholds', 'parameters')}))
