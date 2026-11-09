@@ -1144,12 +1144,16 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                 candidate['detection_score'] = float(score)
                 candidate['prompt_head'] = prompt_head
     # Restore old candidate ordering: competition tie-breaks and evidence stay stable.
+    # inference.outer_from_inner_prompts false (an ablation): outer objects only from the outer head's own prompts; the
+    # outer mask an inner prompt predicts stays link evidence only.
+    from_inner = bool(getattr(config, 'outer_from_inner_prompts', True))
     for (head, _, _), (n, c) in zip(jobs, results):
         if head == 'nucleus':
             if n is not None:
                 nuc_candidates.append(n)
                 evidence.append((n, c))
-            cell_candidates.append(c)
+            if from_inner:
+                cell_candidates.append(c)
         else:
             cell_candidates.append(c)
 
@@ -1183,7 +1187,8 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                 if head == 'nucleus' and n is not None:
                     nuc_candidates.append(flag(n))
                     evidence.append((n, flag(c)))
-                cell_candidates.append(flag(c))
+                if head != 'nucleus' or from_inner:
+                    cell_candidates.append(flag(c))
     iterations = int(getattr(config, 'refinement_iterations', 1) or 1)
     if iterations > 1:
         # inference.refinement_iterations: every candidate is refined again with its own mask in the prompt

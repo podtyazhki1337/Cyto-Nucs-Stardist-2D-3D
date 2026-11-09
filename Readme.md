@@ -113,6 +113,7 @@ Main options:
 | inference | `inner_min_inside_outer` | an inner object is kept only with at least this share of its voxels inside the kept outer objects (`auto`: calibrated after training; 0 = off) |
 | inference | `outer_min_inner_share` | an outer object is kept only if at least this share of some inner object lies inside it, e.g. a cell needs a nucleus (`auto`: calibrated after training; 0 = off, e.g. where cells without a nucleus are real) |
 | training | `mask_prompt_fraction`, `mask_prompt_start_epoch` | share of the prompts that also carry the model's own first mask (a pass without gradient), from that epoch: trains the second refinement pass |
+| inference | `outer_from_inner_prompts` | an inner prompt's predicted outer mask is also an outer candidate (default true); false: outer objects only from the outer head's own prompts, the inner prompt's outer mask only links (an ablation) |
 | inference | `refinement_iterations` | refinement passes per candidate; from the second on the prompt carries the previous mask (`mask_prompt_fraction` must have trained this) |
 | loss_params | `center_offset_weight` | head predicting each voxel's offset to its object's centre (Panoptic-DeepLab), Huber in head-grid nodes (0 = no head) |
 | inference | `center_vote_grouping`, `center_vote_radius` | StarDist candidates whose objects vote for one centre (closer than the radius share of the larger mean ray) are prompted once, as the union of their polygons (needs `center_offset_weight`) |
