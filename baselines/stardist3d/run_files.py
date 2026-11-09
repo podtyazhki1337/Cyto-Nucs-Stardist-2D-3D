@@ -55,6 +55,7 @@ parser.add_argument('--width', type=int, default=32, help='U-Net filters of the 
 parser.add_argument('--foreground-only', type=float, default=0.9,
                     help="share of training patches drawn around objects (StarDist's train_foreground_only)")
 parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/stardist')
+parser.add_argument('--seed', type=int, default=42, help='random seed of the run (42: the default of the code)')
 parser.add_argument('--cache', help='folder of the memory-mapped train volumes (default <basedir>/cache/<parent>_<data name>)')
 parser.add_argument('--score', action='store_true')
 parser.add_argument('--inner', help='LEVEL:MODEL_NAME of the inner level (with --score)')
@@ -92,7 +93,7 @@ for device in tf.config.list_physical_devices('GPU'):
             device, [tf.config.LogicalDeviceConfiguration(memory_limit=int(os.environ['GPU_MEMORY_LIMIT_MB']))])
     else:
         tf.config.experimental.set_memory_growth(device, True)
-SEED = 42
+SEED = args.seed
 np.random.seed(SEED); tf.random.set_seed(SEED)
 UNKNOWN = 65535
 DATA = Path(args.data)
@@ -249,7 +250,7 @@ def train():
     else:
         with contextlib.redirect_stdout(io.StringIO()):
             thresholds = model.optimize_thresholds(x_val, y_val, predict_kwargs=dict(n_tiles=tiles, show_tile_progress=False))
-    info = dict(target=args.target, name=name, data=str(DATA), ndim=NDIM, epochs=args.epochs, steps_per_epoch=args.steps,
+    info = dict(target=args.target, name=name, data=str(DATA), seed=SEED, ndim=NDIM, epochs=args.epochs, steps_per_epoch=args.steps,
                 patch=list(PATCH), batch=args.batch, grid=list(GRID), rays=conf.n_rays, backbone=args.backbone,
                 depth=args.depth, width=args.width, foreground_only=args.foreground_only,
                 anisotropy=None if anisotropy is None else list(anisotropy), median_extent=median.tolist(),

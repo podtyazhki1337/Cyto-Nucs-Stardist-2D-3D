@@ -42,6 +42,9 @@ parser.add_argument('--batch', type=int, default=8)
 parser.add_argument('--split', nargs='+', default=['test'])
 parser.add_argument('--pretrained-only', action='store_true', help='no fine-tuning: the pretrained cyto3 / nuclei models')
 parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/cellpose')
+parser.add_argument('--seed', type=int, default=0,
+                    help="0: Cellpose's own sampling (it seeds numpy with the epoch number); k > 0 offsets those seeds by "
+                         "k * 1000003 and seeds torch with k, so the runs see other crops and augmentations")
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
@@ -54,6 +57,11 @@ UNKNOWN = 65535
 TAUS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 CELLPROB, FLOW = (-1.0, 0.0, 1.0), (0.4, 0.6)
 DATA, OUT = Path(args.data), Path(args.basedir) / args.name
+if args.seed:
+    # train_seg calls np.random.seed(epoch) every epoch: the same crops in every run whatever the global seed.
+    _numpy_seed = np.random.seed
+    np.random.seed = lambda seed=None: _numpy_seed(None if seed is None else (int(seed) + args.seed * 1000003) % 2 ** 32)
+    torch.manual_seed(args.seed)
 LEVELS = {args.outer: dict(pretrained='cyto3', channels=list(args.cell_channels)),
           args.inner: dict(pretrained='nuclei', channels=[args.nucleus_channel, 0])}
 
@@ -112,7 +120,7 @@ def main():
         total = torch.cuda.get_device_properties(0).total_memory / 2 ** 20
         torch.cuda.set_per_process_memory_fraction(min(1.0, limit / total))
     from importlib.metadata import version
-    info = dict(name=args.name, data=str(DATA), pretrained_only=args.pretrained_only, levels={},
+    info = dict(name=args.name, data=str(DATA), seed=args.seed, pretrained_only=args.pretrained_only, levels={},
                 cellpose=version('cellpose'), torch=torch.__version__)
     val_images = [tifffile.imread(DATA / 'val' / 'images' / n) for n in names('val')]
     chosen = {}
