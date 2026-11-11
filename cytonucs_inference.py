@@ -478,9 +478,13 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     residual: {head: dict(coords, probs, dists)} peaks suppressed by the proposal window;
     prompted only where the first assembly left the voxel free, assembled after all
     first-pass candidates (object assembly modes only).
+    model.stage_seconds, when a dict (stage profiling, baselines/time_inference.py), gets the seconds of the prompt
+    refinement and of the assembly with the links added.
     """
+    import time
     from collections import OrderedDict
     from scipy.ndimage import find_objects
+    started = time.perf_counter()
     policy = getattr(config, 'refinement_mode', 'mask')
     if policy == 'legacy_union':
         return _predict_instances_prompted_legacy(
@@ -1226,6 +1230,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
                         again(candidate, head)
     if candidate_sink is not None:
         candidate_sink.update(nucleus=nuc_candidates, cytoplasm=cell_candidates, evidence=evidence)
+    refined = time.perf_counter()
     nuclei, ns = assemble_head(config, 'nucleus', nuc_candidates, shape,
                                stage_audit.get('nucleus') if stage_audit is not None else None)
     cells, cs = assemble_head(config, 'cytoplasm', cell_candidates, shape,
@@ -1251,6 +1256,9 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
             np.quantile(quality_values, [0, .25, .5, .75, 1]).tolist() if quality_values else [])
         diagnostics[h].update(stats)
     model.last_refinement_diagnostics = diagnostics
+    if isinstance(getattr(model, 'stage_seconds', None), dict):
+        for stage, seconds in (('refinement', refined - started), ('assembly_linking', time.perf_counter() - refined)):
+            model.stage_seconds[stage] = model.stage_seconds.get(stage, 0.0) + seconds
     if verbose:
         import json
         print('[refinement diagnostics] ' + json.dumps(diagnostics, sort_keys=True))

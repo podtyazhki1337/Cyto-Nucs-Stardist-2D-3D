@@ -22,7 +22,10 @@ Every method runs through the code that scored it, with the arguments of its sco
   - GPU memory: the framework's peak allocation during the passes (TensorFlow get_memory_info, PyTorch
     max_memory_allocated), and the peak memory used on the device from the start of the script (nvidia-smi every
     0.2 s: CUDA context and allocator pools included);
-  - parameters of all networks of the method.
+  - parameters of all networks of the method;
+  - CytoNucs: the seconds per stage (stage_seconds_per_input): prompt refinement and assembly with the links, as
+    cytonucs_inference.predict_instances_prompted records them, and the rest of the time (normalisation, the network's
+    StarDist outputs and their peaks / NMS), median over the passes of the mean per input.
 Run it with nothing else on the machine.
 
 Usage:
@@ -202,7 +205,7 @@ def cytonucs(split, limit, argv, blocks=False):
                 nuclei, cells, links = DiceCallback._predict_full_volume(runner, predictor, image)
             return dict(nucleus=nuclei, cytoplasm=cells, links=links)
     return SimpleNamespace(names=names, inputs=inputs, predict=predict, parameters=int(model.keras_model.count_params()),
-                           framework='tensorflow', settings=settings, link=None)
+                           framework='tensorflow', settings=settings, link=None, model=model)
 
 
 def stardist(split, limit, argv):
@@ -326,13 +329,19 @@ def main():
     for x in run.inputs[:args.warmup]:
         run.predict(x)
     framework_peak(run.framework, reset=True)
-    passes, link_s, objects = [], [], {}
+    passes, link_s, objects, stages = [], [], {}, []
+    profiled = getattr(run, 'model', None) is not None             # CytoNucs: stage seconds
     for k in range(args.passes):
-        seconds = []
+        seconds, stage = [], []
         for i, x in enumerate(run.inputs):
+            if profiled:
+                run.model.stage_seconds = {}
             t0 = time.perf_counter()
             pred = run.predict(x)
             seconds.append(time.perf_counter() - t0)
+            if profiled:
+                parts = dict(run.model.stage_seconds)
+                stage.append(dict(parts, detection_other=seconds[-1] - sum(parts.values())))
             if k == args.passes - 1:
                 for level in ('nucleus', 'cytoplasm'):
                     objects[level] = objects.get(level, 0) + int(len(np.unique(np.asarray(pred[level]))) - 1)
@@ -341,6 +350,7 @@ def main():
                     run.link(pred)
                     link_s.append(time.perf_counter() - t0)
         passes.append(seconds)
+        stages.append(stage)
         print(f'pass {k + 1}: {np.mean(seconds):.3f} s per input (median {np.median(seconds):.3f})', flush=True)
     result = dict(method=args.method, scorer_args=scorer_argv, split=args.split, inputs=len(run.inputs), names=run.names,
                   input_shapes=sorted({str(tuple(x.shape)) for x in run.inputs}), warmup=args.warmup, passes=args.passes,
@@ -349,6 +359,10 @@ def main():
                   link_seconds_per_input=float(np.mean(link_s)) if link_s else None,
                   objects_last_pass=objects, parameters=int(run.parameters), framework=run.framework,
                   framework_peak_gb=framework_peak(run.framework), load_seconds=load_s, settings=run.settings)
+    if profiled:
+        names = sorted({key for stage in stages for parts in stage for key in parts})
+        result['stage_seconds_per_input'] = {key: statistics.median(float(np.mean([p.get(key, 0.0) for p in stage]))
+                                                                    for stage in stages) for key in names}
     result['device_peak_gb'] = device.stop() / 1024
     gpu = subprocess.run(['nvidia-smi', f'--id={args.gpu}', '--query-gpu=name', '--format=csv,noheader'],
                          capture_output=True, text=True).stdout.strip()
