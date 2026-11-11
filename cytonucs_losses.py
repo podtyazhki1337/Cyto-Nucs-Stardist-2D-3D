@@ -1443,23 +1443,31 @@ def lovasz_jaccard_loss(probability, target):
     batch = tf.shape(probability)[0]
     p = tf.reshape(tf.cast(probability, tf.float32), [batch, -1])
     t = tf.reshape(tf.cast(target > .5, tf.float32), [batch, -1])
-
-    def per_prompt(args):
-        prob, fg = args
-        errors = tf.abs(fg - prob)
-        order = tf.argsort(errors, direction='DESCENDING')
-        errors = tf.gather(errors, order)
-        fg = tf.gather(fg, order)
-        total = tf.reduce_sum(fg)
-        intersection = total - tf.cumsum(fg)
-        union = total + tf.cumsum(1. - fg)
-        jaccard = 1. - intersection / tf.maximum(union, 1e-6)
-        grad = tf.concat([jaccard[:1], jaccard[1:] - jaccard[:-1]], 0)
-        return tf.tensordot(errors, tf.stop_gradient(grad), 1)
-
-    losses = tf.map_fn(per_prompt, (p, t), fn_output_signature=tf.float32)
+    # All prompts in one sort (rows are independent): a loop over prompts costs more than the sort itself.
+    errors, order = tf.math.top_k(tf.abs(t - p), k=tf.shape(p)[1], sorted=True)
+    fg = tf.gather(t, order, batch_dims=1)
+    total = tf.reduce_sum(fg, axis=1, keepdims=True)
+    intersection = total - tf.cumsum(fg, axis=1)
+    union = total + tf.cumsum(1. - fg, axis=1)
+    jaccard = 1. - intersection / tf.maximum(union, 1e-6)
+    grad = tf.concat([jaccard[:, :1], jaccard[:, 1:] - jaccard[:, :-1]], 1)
+    losses = tf.reduce_sum(errors * tf.stop_gradient(grad), axis=1)
     valid = tf.cast(tf.reduce_sum(t, axis=1) > .5, tf.float32)
     return tf.math.divide_no_nan(tf.reduce_sum(losses * valid), tf.reduce_sum(valid))
+
+
+def batch_segments(labels):
+    """Objects of a batch of label images as one set of segments, without a loop over the images.
+
+    IDs are local to each image and may be sparse. Returns (segment index of every voxel, flattened image by image;
+    number of segments; True for the segments of objects, i.e. label > 0)."""
+    labels = tf.cast(labels, tf.int64)
+    batch = tf.shape(labels, out_type=tf.int64)[0]
+    flat = tf.reshape(labels, [batch, -1])
+    low = tf.minimum(tf.reduce_min(flat), 0)
+    width = tf.maximum(tf.reduce_max(flat), 0) - low + 1
+    ids, segment = tf.unique(tf.reshape(flat - low + width * tf.range(batch)[:, None], [-1]))
+    return segment, tf.size(ids), ids % width + low > 0
 
 
 def without_small_objects(full_labels, grid_labels, min_voxels):
@@ -1467,15 +1475,18 @@ def without_small_objects(full_labels, grid_labels, min_voxels):
 
     Counts are taken at full resolution, the unit of the calibrated inference size gate.
     """
-    def per_image(args):
-        full, sampled = args
-        ids, index = tf.unique(tf.reshape(full, [-1]))
-        counts = tf.math.unsorted_segment_sum(tf.ones_like(index, tf.float32), index, tf.size(ids))
-        small = tf.boolean_mask(ids, (ids > 0) & (counts < min_voxels))
-        drop = tf.reduce_any(tf.equal(sampled[..., None], small), axis=-1)
-        return tf.where(drop, tf.zeros_like(sampled), sampled)
-    return tf.map_fn(per_image, (tf.cast(full_labels, tf.int32), tf.cast(grid_labels, tf.int32)),
-                     fn_output_signature=tf.int32)
+    full = tf.cast(full_labels, tf.int32)
+    sampled = tf.cast(grid_labels, tf.int32)
+    batch = tf.shape(full)[0]
+    full = tf.reshape(full, [batch, -1])
+    flat = tf.reshape(sampled, [batch, -1])
+    in_full = tf.concat([tf.ones_like(full, tf.float32), tf.zeros_like(flat, tf.float32)], axis=1)
+    segment, n, _ = batch_segments(tf.concat([full, flat], axis=1))
+    counts = tf.math.unsorted_segment_sum(tf.reshape(in_full, [-1]), segment, n)
+    count = tf.reshape(tf.gather(counts, segment), tf.shape(in_full))[:, tf.shape(full)[1]:]
+    # count 0: a sampled label absent at full resolution is kept, as before.
+    drop = tf.reshape((flat > 0) & (count > 0) & (count < min_voxels), tf.shape(sampled))
+    return tf.where(drop, tf.zeros_like(sampled), sampled)
 
 
 def object_peak_probability(probability, target, instances):
@@ -1488,22 +1499,13 @@ def object_peak_probability(probability, target, instances):
     the arg-max voxel of each object; background keeps the voxel BCE.
     """
     eps = 1e-7
-    def per_image(args):
-        prob, tgt, labels = args
-        ids, segment = tf.unique(tf.reshape(labels, [-1]))
-        n = tf.size(ids)
-        peak = tf.math.unsorted_segment_max(tf.reshape(prob, [-1]), segment, n)
-        wanted = tf.stop_gradient(tf.math.unsorted_segment_max(tf.reshape(tgt, [-1]), segment, n))
-        keep = ids > 0
-        peak = tf.clip_by_value(tf.boolean_mask(peak, keep), eps, 1. - eps)
-        wanted = tf.boolean_mask(wanted, keep)
-        error = -(wanted * tf.math.log(peak) + (1. - wanted) * tf.math.log(1. - peak))
-        return tf.stack([tf.reduce_sum(error), tf.cast(tf.size(error), tf.float32)])
-    rows = tf.map_fn(per_image, (tf.cast(probability, tf.float32), tf.cast(target, tf.float32),
-                                 tf.cast(instances, tf.int32)),
-                     fn_output_signature=tf.TensorSpec([2], tf.float32))
-    totals = tf.reduce_sum(rows, axis=0)
-    return tf.math.divide_no_nan(totals[0], totals[1])
+    segment, n, keep = batch_segments(instances)
+    peak = tf.math.unsorted_segment_max(tf.reshape(tf.cast(probability, tf.float32), [-1]), segment, n)
+    wanted = tf.stop_gradient(tf.math.unsorted_segment_max(tf.reshape(tf.cast(target, tf.float32), [-1]), segment, n))
+    peak = tf.clip_by_value(tf.boolean_mask(peak, keep), eps, 1. - eps)
+    wanted = tf.boolean_mask(wanted, keep)
+    error = -(wanted * tf.math.log(peak) + (1. - wanted) * tf.math.log(1. - peak))
+    return tf.math.divide_no_nan(tf.reduce_sum(error), tf.cast(tf.size(error), tf.float32))
 
 
 def quality_rank_loss(predicted, target, eligible):
@@ -1537,22 +1539,16 @@ def object_balanced_probability(bce, probability, instances):
     """
     tf.debugging.assert_equal(tf.shape(bce), tf.shape(instances))
     tf.debugging.assert_equal(tf.shape(probability), tf.shape(instances))
-    def per_image(args):
-        error, prob, labels = args
-        ids, segment = tf.unique(tf.reshape(labels, [-1]))
-        n = tf.size(ids)
-        total = tf.math.unsorted_segment_sum(tf.reshape(error, [-1]), segment, n)
-        count = tf.math.unsorted_segment_sum(tf.ones_like(tf.reshape(error, [-1])), segment, n)
-        foreground = ids > 0
-        means = tf.boolean_mask(tf.math.divide_no_nan(total, count), foreground)
-        maxima = tf.boolean_mask(tf.math.unsorted_segment_max(
-            tf.reshape(tf.stop_gradient(prob), [-1]), segment, n), foreground)
-        return tf.stack([tf.reduce_sum(means), tf.cast(tf.size(means), tf.float32),
-                         tf.reduce_sum(maxima)] + [tf.reduce_sum(tf.cast(maxima > threshold, tf.float32))
-                                                  for threshold in (.2, .3, .4, .5)])
-    rows = tf.map_fn(per_image, (bce, probability, instances),
-                     fn_output_signature=tf.TensorSpec([7], tf.float32))
-    totals = tf.reduce_sum(rows, axis=0)
+    segment, n, foreground = batch_segments(instances)
+    error = tf.reshape(bce, [-1])
+    total = tf.math.unsorted_segment_sum(error, segment, n)
+    count = tf.math.unsorted_segment_sum(tf.ones_like(error), segment, n)
+    object_means = tf.boolean_mask(tf.math.divide_no_nan(total, count), foreground)
+    maxima = tf.boolean_mask(tf.math.unsorted_segment_max(
+        tf.reshape(tf.stop_gradient(probability), [-1]), segment, n), foreground)
+    totals = tf.stack([tf.reduce_sum(object_means), tf.cast(tf.size(object_means), tf.float32),
+                       tf.reduce_sum(maxima)] + [tf.reduce_sum(tf.cast(maxima > threshold, tf.float32))
+                                                for threshold in (.2, .3, .4, .5)])
     means = tf.math.divide_no_nan(totals, totals[1])
     monitoring = {'prob_sampled_object_count': totals[1], 'prob_gt_max_mean': means[2]}
     monitoring.update({'prob_gt_max_above_' + key: means[i+3]

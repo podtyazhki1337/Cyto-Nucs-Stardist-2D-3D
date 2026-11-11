@@ -88,6 +88,7 @@ def _fine_prompt_mask(head_fn, coarse_logit, hidden, full, grid, lo, shape, run_
 FINE_BATCH_VOXELS = 4_000_000        # full-resolution voxels per batched fine-head call (memory bound)
 REFINE_BATCH_NODES = 1 << 20         # head-grid voxels per batched refinement call (memory bound)
 _PENDING = object()                   # placeholder of a cell candidate prompted again over a larger ROI
+COLLECT_MIN_VOXELS = 1 << 22          # inputs from this size on end with gc.collect() (their maps take gigabytes)
 
 
 def _fine_mask_windows(probability_at, lo, shape, run_shape, net_shape, grid, center, sigma, threshold):
@@ -2179,6 +2180,35 @@ class CytoNucsPredictor:
 
         return self._detection_model
 
+    def _detection_forward(self, x, any_shape=False):
+        """The detection submodel on the batch `x` as a compiled graph: of the shape of `x` (the tiles of one input
+        share it), or, with any_shape, one graph for every input size (whole images, whose sizes differ).
+        Cached on the model: every full validation builds a new predictor, and the graph reads live weights, so
+        retracing per validation is wasted."""
+        if not hasattr(self.model, '_detection_forward_cache'):
+            from collections import OrderedDict
+            self.model._detection_forward_cache = OrderedDict()
+        cache = self._detection_forward_cache = self.model._detection_forward_cache
+        shape = tuple(int(v) for v in x.shape)
+        if any_shape:
+            shape = (shape[0],) + (None,) * (len(shape) - 2) + (shape[-1],)
+        key = shape + (('semantic',) if self._semantic_wanted() else ()) + (('votes',) if self._votes_wanted() else ())
+        fn = cache.get(key)
+        if fn is None:
+            detection_model = self._get_detection_model()
+            fn = tf.function(
+                lambda t: detection_model(t, training=False),
+                input_signature=[tf.TensorSpec(shape, tf.float32)],
+                reduce_retracing=True)
+            cache[key] = fn
+            # Bound retained concrete graphs for heterogeneous volume sizes.
+            if len(cache) > 8:
+                cache.popitem(last=False)
+            if not any_shape:
+                print(f"    [graph] трассировка на форму {key}")
+        cache.move_to_end(key)
+        return fn(tf.convert_to_tensor(x, tf.float32))
+
     def _predict_with_tiling(self, img, n_tiles, normalize_img):
         """
         StarDist/CSBDeep tiled inference для CytoNucs. Работает для 2D и 3D.
@@ -2451,7 +2481,6 @@ class CytoNucsPredictor:
         # DETECTION MODEL
         # ============================================================
 
-        detection_model = self._get_detection_model()
         tiles_done = 0
 
         # ГРАФОВОЕ исполнение обязательно. Eager-вызов функциональной модели
@@ -2462,29 +2491,7 @@ class CytoNucsPredictor:
         # tf.function с КОНКРЕТНОЙ формой (все тайлы одинаковы по построению
         # tile_iterator) даёт планировщику переиспользовать буферы; кэш по
         # форме нужен только на случай отличающегося последнего окна.
-        # Cached on the model: every full validation builds a new predictor, and
-        # the graph reads live weights, so retracing per validation is wasted.
-        if not hasattr(self.model, '_detection_forward_cache'):
-            from collections import OrderedDict
-            self.model._detection_forward_cache = OrderedDict()
-        _fwd_cache = self._detection_forward_cache = self.model._detection_forward_cache
-
-        def _forward(x):
-            shape = tuple(int(v) for v in x.shape)
-            key = shape + (('semantic',) if semantic_full is not None else ()) + (('votes',) if votes_full is not None else ())
-            fn = _fwd_cache.get(key)
-            if fn is None:
-                fn = tf.function(
-                    lambda t: detection_model(t, training=False),
-                    input_signature=[tf.TensorSpec(shape, tf.float32)],
-                    reduce_retracing=True)
-                _fwd_cache[key] = fn
-                # Bound retained concrete graphs for heterogeneous volume sizes.
-                if len(_fwd_cache) > 8:
-                    _fwd_cache.popitem(last=False)
-                print(f"    [graph] трассировка на форму {key}")
-            _fwd_cache.move_to_end(key)
-            return fn(tf.convert_to_tensor(x, tf.float32))
+        _forward = self._detection_forward
 
         def _flip_averaged(y_pred, tile):
             """inference.tta_flips: probability maps averaged over the tile flipped in Y, in X and in both
@@ -2715,7 +2722,10 @@ class CytoNucsPredictor:
             'cytoplasm_grid': cyto_grid,
         }
 
-        gc.collect()
+        # A full collection walks every object of the process (0.2 s with the model's graphs, profile of 2026-11-10):
+        # 16 % of the time of a 520 x 696 image, and nothing next to a volume, whose maps it frees.
+        if np.prod(img_shape, dtype=np.int64) >= COLLECT_MIN_VOXELS:
+            gc.collect()
 
         return nucleus_instances, cytoplasm_instances, details
 
@@ -2784,9 +2794,9 @@ class CytoNucsPredictor:
         if any(p1 for _, p1 in pad):
             img_net = _pad_input(img, pad, getattr(self, 'input_pad_mode', CytoNucsPredictor.input_pad_mode))
 
-        y_pred = self._get_detection_model()(
-            tf.convert_to_tensor(img_net[np.newaxis, ...], tf.float32),
-            training=False)
+        # As a graph, as the tiles: the eager call of the functional model costs more in Python than the network on
+        # the GPU for a 2D image (0.11 s of 0.87 s per TissueNet tile, profile of 2026-11-10).
+        y_pred = self._detection_forward(img_net[np.newaxis, ...], any_shape=True)
 
         def _get(key, grid_):
             """Срез до РЕАЛЬНОГО размера входа в grid-разрешении головы."""
