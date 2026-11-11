@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 
-def score_predictions(data, predictions, split='test', levels=('nucleus', 'cytoplasm'), timing=None):
+def score_predictions(data, predictions, split='test', levels=('nucleus', 'cytoplasm'), timing=None, jtpr_ious=()):
     import tifffile
     from score_hierarchy import ground_truth, score_image, summarise
     data, predictions, levels = Path(data), Path(predictions), list(levels)
@@ -38,7 +38,7 @@ def score_predictions(data, predictions, split='test', levels=('nucleus', 'cytop
         parents = ({levels[0]: {int(k): int(v) for k, v in json.loads(parents_file.read_text()).items()}}
                    if parents_file.is_file() else None)
         gt, truths, ignore = ground_truth(data / split, name, levels, pairs)
-        record, _ = score_image(gt, pred, pairs, truths, pred_parents=parents, ignore=ignore)
+        record, _ = score_image(gt, pred, pairs, truths, pred_parents=parents, ignore=ignore, jtpr_ious=jtpr_ious)
         records.append(dict(record, name=name, seconds=seconds.get(f'{split}/{name}')))
     known = [r['seconds'] for r in records if r['seconds'] is not None]
     result = dict(split=split, data=str(data), predictions=str(predictions / split), volumes=len(records),
@@ -58,11 +58,13 @@ def main():
     parser.add_argument('--split', nargs='+', default=['test'])
     parser.add_argument('--levels', nargs='+', default=['nucleus', 'cytoplasm'], help='inner level first')
     parser.add_argument('--timing')
+    parser.add_argument('--jtpr-ious', type=float, nargs='*', default=[], help='JTPR also at these IoU thresholds, e.g. 0.3 0.7')
     parser.add_argument('--output', help='default: <predictions>/scores.json')
     args = parser.parse_args()
     os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
     os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
-    results = {split: score_predictions(args.data, args.predictions, split, args.levels, args.timing) for split in args.split}
+    results = {split: score_predictions(args.data, args.predictions, split, args.levels, args.timing, args.jtpr_ious)
+               for split in args.split}
     output = Path(args.output or Path(args.predictions) / 'scores.json')
     previous = json.loads(output.read_text()) if output.is_file() else {}       # splits scored before stay
     output.write_text(json.dumps({**previous, **results}, indent=1))

@@ -99,12 +99,13 @@ def ground_truth(folder, name, levels, pairs):
     return gt, truths, ignore
 
 
-def score_image(gt, pred, pairs, truths, pred_parents=None, ignore=None):
+def score_image(gt, pred, pairs, truths, pred_parents=None, ignore=None, jtpr_ious=()):
     """Scores of one image (the record kept per image, so that any summary or interval is computed again
     without predicting): per level the objects and TP / FP / FN at every tau of TAUS; per adjacent pair our
     joint TP over the annotated pairs (predicted links pred_parents[inner] when given, else by overlap as
     compute_jtpr does) and the HydraStarDist-paper metrics. Predicted objects lying mostly in ignore[level]
-    are dropped first; returns (record, the predictions as scored)."""
+    are dropped first; jtpr_ious: further IoU thresholds of the joint TP (record pairs[key]['joint_tp_at']);
+    returns (record, the predictions as scored)."""
     import contextlib
     import io
     from stardist.matching import matching
@@ -126,6 +127,11 @@ def score_image(gt, pred, pairs, truths, pred_parents=None, ignore=None):
                                     fail_inner=int(details['joint_fail_nucleus']), fail_outer=int(details['joint_fail_cell']),
                                     fail_link=int(details['joint_fail_link']),
                                     paper=paper_metrics(gt[inner], gt[outer], pred[inner], pred[outer], truths[key]))
+        for iou in jtpr_ious:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _, at = compute_jtpr(pred[inner], pred[outer], gt[inner], gt[outer], iou_thresh=float(iou),
+                                     assignments_pred=(pred_parents or {}).get(inner), assignments_gt=truths[key])
+            record['pairs'][key].setdefault('joint_tp_at', {})[str(float(iou))] = int(at['joint_tp'])
     return record, pred
 
 
@@ -153,6 +159,9 @@ def summarise(records, levels, pairs):
             for kind in ('inner', 'outer', 'link'):
                 result[f'fail_{kind}_{key}'] = sum(r['pairs'][key][f'fail_{kind}'] for r in records) / total if total else None
         result[f'paper_{key}'] = mean_paper_metrics([r['pairs'][key]['paper'] for r in records])
+        for iou in (records[0]['pairs'][key].get('joint_tp_at', {}) if records else {}):   # JTPR at further IoUs
+            if all(iou in r['pairs'][key].get('joint_tp_at', {}) for r in records):
+                result[f'jtpr_iou{iou}_{key}'] = sum(r['pairs'][key]['joint_tp_at'][iou] for r in records) / total if total else None
     return result
 
 
