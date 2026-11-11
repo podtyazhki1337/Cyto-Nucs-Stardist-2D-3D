@@ -17,6 +17,7 @@ the user's 3d-oids recipe, grid (1, 4, 4) for objects 50-200 px wide, thresholds
 Usage:
   python run_fullres.py --target nucleus --gpu 0 --like ../../_exp/cyto_fullres.json [--epochs 300]
   python run_fullres.py --score --gpu 0 --nucleus-model NAME --cytoplasm-model NAME
+  pretraining on synthetic volumes, then the blocks:  --train-from SYN --epochs 40 --name PRE;  --init-from PRE --name NAME
 """
 import argparse
 import json
@@ -50,6 +51,13 @@ parser.add_argument('--unknown-as-background', action='store_true',
 parser.add_argument('--unknown-masked', action='store_true',
                     help='sparse annotation: voxels labelled training.unknown_label 65535 are left out of every loss term '
                          '(masked_loss.py, our modification of the baseline) instead of taken as background')
+parser.add_argument('--train-from', help='train (and validate) on the train / val volumes of this dataset of one file per '
+                                         'volume instead of the blocks of --data, e.g. the synthetic hela_v1 for pretraining; '
+                                         'the rays and anisotropy still come from the training objects of --data')
+parser.add_argument('--mix-from', help='dataset of one file per volume whose train volumes are mixed into the training '
+                                       '(e.g. the synthetic hela_v1, as CytoNucs e_zaug: extra_train_dirs)')
+parser.add_argument('--mix-share', type=float, default=0.3, help='share of the training crops from --mix-from')
+parser.add_argument('--init-from', help='model name in --basedir whose last weights (weights_last.h5) start the training')
 parser.add_argument('--val-data', help='dataset whose train_regions give the val blocks (same volume and blocks as --data), '
                                        'e.g. the fully annotated source of a sparse dataset; default --data')
 args = parser.parse_args()
@@ -123,6 +131,16 @@ def block_volumes(split, target, data=None, masked=False):
     return xs, ys
 
 
+def file_volumes(data, split, target):
+    """Images (normalised per channel as the blocks) and labels of the <split> volumes of a dataset of one file per volume."""
+    folder = Path(data) / split
+    xs, ys = [], []
+    for name in sorted(p.name for p in (folder / 'images').iterdir() if p.suffix.lower() in ('.tif', '.tiff')):
+        xs.append(normalize(tifffile.imread(folder / 'images' / name).astype(np.float32), 1, 99.8, axis=(0, 1, 2)).astype(np.float32))
+        ys.append(fill_label_holes(tifffile.imread(folder / MASKS[target] / name).astype(np.uint16)))
+    return xs, ys
+
+
 def unknown_share(split, target, data=None):
     """Share of the voxels of the blocks of a split labelled unknown (65535) in the train_regions of `data`."""
     name, _ = volume()
@@ -136,7 +154,8 @@ def make_augmenter(like):
     cfg = SimpleNamespace(rotation_yx=aug.get('rotation_yx', True), flip_prob=aug.get('flip_prob', .5),
                           intensity_range=aug.get('intensity_range', (.8, 1.2)), intensity_offset=aug.get('intensity_offset', (-.1, .1)),
                           gamma_range=aug.get('gamma_range', (.9, 1.1)), noise_sigma=aug.get('noise_sigma', .01),
-                          blur_sigma_range=aug.get('blur_sigma_range'))
+                          blur_sigma_range=aug.get('blur_sigma_range'), flip_z_prob=aug.get('flip_z_prob', 0.0),
+                          saturation_prob=aug.get('saturation_prob', 0.0))   # Z zoom of the CytoNucs crops: not here
     elastic = float(aug.get('elastic_prob', 0.)), float(aug.get('elastic_alpha', 0.)), float(aug.get('elastic_sigma', 8.))
     rng = np.random.default_rng(SEED)
 
@@ -163,6 +182,15 @@ def train():
                for b in (p.bbox for p in skimage.measure.regionprops(np.maximum(y, 0)))]
     median = np.median(extents, axis=0)
     anisotropy = tuple(float(v) for v in np.max(median) / median)
+    if args.train_from:                                    # the rays above stay those of --data's objects
+        x_train, y_train = file_volumes(args.train_from, 'train', args.target)
+        x_val, y_val = file_volumes(args.train_from, 'val', args.target)
+    n_main = len(x_train)
+    if args.mix_from:                                      # mixed_sampling.py draws --mix-share of the crops from them
+        if args.unknown_masked:
+            raise SystemExit('--mix-from and --unknown-masked cannot be combined')
+        x_mix, y_mix = file_volumes(args.mix_from, 'train', args.target)
+        x_train, y_train = x_train + x_mix, y_train + y_mix
     augment, aug_values = make_augmenter(args.like)
     backbone = (dict(backbone='resnet', resnet_n_blocks=4, resnet_kernel_size=(3, 3, 3), resnet_kernel_init='he_normal',
                      resnet_n_filter_base=32, resnet_n_conv_per_block=3, resnet_activation='relu', resnet_batch_norm=False,
@@ -177,7 +205,14 @@ def train():
         train_n_val_patches=None, train_tensorboard=False, train_reduce_lr=dict(factor=0.5, patience=40, min_delta=0))
     if args.unknown_masked:
         from masked_loss import MaskedStarDist3D
-    model = (MaskedStarDist3D if args.unknown_masked else StarDist3D)(conf, name=name, basedir=args.basedir)
+        model = MaskedStarDist3D(conf, name=name, basedir=args.basedir)
+    elif args.mix_from:
+        from mixed_sampling import MixedStarDist3D
+        model = MixedStarDist3D(conf, name=name, basedir=args.basedir, n_main=n_main, share=args.mix_share)
+    else:
+        model = StarDist3D(conf, name=name, basedir=args.basedir)
+    if args.init_from:
+        model.keras_model.load_weights(str(Path(args.basedir) / args.init_from / 'weights_last.h5'))
     params = int(sum(int(np.prod(v.shape)) for v in model.keras_model.trainable_weights))
     print(f'{args.target}: {len(x_train)} train blocks {x_train[0].shape}, median object extent {median}, anisotropy '
           f'{np.round(anisotropy, 2)}, field of view {np.array(model._axes_tile_overlap("ZYX"))}, {params} parameters')
@@ -197,6 +232,8 @@ def train():
                 val_loss=[float(v) for v in history.history.get('val_loss', [])])
     info.update(backbone=args.backbone, data=str(DATA), unknown_as_background=args.unknown_as_background,
                 unknown_masked=args.unknown_masked, val_data=str(args.val_data or DATA), val_unknown_share=val_unknown,
+                train_from=args.train_from, init_from=args.init_from, mix_from=args.mix_from,
+                mix_share=args.mix_share if args.mix_from else None, main_train_volumes=n_main,
                 field_of_view=[int(v) for v in model._axes_tile_overlap('ZYX')], weights=str(Path(args.basedir) / name / 'weights_best.h5'))
     (Path(args.basedir) / name / 'training.json').write_text(json.dumps(info, indent=2, default=str))
     print(json.dumps({k: info[k] for k in ('training_hours', 'gpu_peak_mem_gb', 'thresholds', 'parameters')}))
