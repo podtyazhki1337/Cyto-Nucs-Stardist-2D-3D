@@ -1,0 +1,311 @@
+{
+  "mode": "train",
+  "experiment": {
+    "name": "helacytonuc_e7_clean_cells_only"
+  },
+  "data": {
+    "dataset_dir": "data/HeLaCytoNuc/cytonucs_clean/",
+    "pool_size": 600,
+    "repool_freq": 10
+  },
+  "model": {
+    "ndim": 2,
+    "n_rays": 32,
+    "anisotropy": [
+      1,
+      1
+    ],
+    "nucleus_grid": [
+      2,
+      2
+    ],
+    "cytoplasm_grid": [
+      2,
+      2
+    ],
+    "shared_encoder": true,
+    "n_channel_in": 3,
+    "use_gpu": true,
+    "unet_n_depth": 4,
+    "unet_n_filter_base": 64,
+    "net_conv_after_unet": 128,
+    "mask_refinement_filters": 64,
+    "dist_activation": "linear",
+    "unet_pool_schedule": [
+      [
+        2,
+        2
+      ],
+      [
+        2,
+        2
+      ],
+      [
+        2,
+        2
+      ],
+      [
+        2,
+        2
+      ]
+    ],
+    "unet_kernel_schedule": [
+      [
+        3,
+        3
+      ],
+      [
+        3,
+        3
+      ],
+      [
+        3,
+        3
+      ],
+      [
+        3,
+        3
+      ],
+      [
+        3,
+        3
+      ]
+    ],
+    "refinement_depth": 2,
+    "refinement_gradient_scale": 0.1,
+    "mask_quality_head": true,
+    "mask_quality_pooling": "mask",
+    "refinement_pool": "auto",
+    "refinement_full_resolution": true,
+    "unet_norm_groups": 8,
+    "levels": [
+      "cytoplasm"
+    ]
+  },
+  "training": {
+    "train_patch_size": [
+      256,
+      256
+    ],
+    "train_batch_size": 2,
+    "train_epochs": 400,
+    "steps_per_epoch": 100,
+    "initial_learning_rate": 0.0003,
+    "lr_decay_steps": 6667,
+    "lr_decay_rate": 0.85,
+    "lr_warmup_epochs": 3,
+    "lr_staircase": false,
+    "gradient_clip_norm": 0.0,
+    "fg_crop_prob": 0.9,
+    "resume_from_checkpoint": null,
+    "seed": 42,
+    "image_batch_size": 32,
+    "prompts_per_crop": 3,
+    "log_every_steps": 20,
+    "prefetch_workers": 4,
+    "prefetch_depth": 4,
+    "predicted_prompt_fraction": 0.25,
+    "predicted_prompt_start_epoch": 10,
+    "predicted_prompt_sample_peaks": true,
+    "reset_best_on_resume": false,
+    "nucleus_prob_grid_normalize": true,
+    "detector_prompt_slots": 1,
+    "cell_predicted_nucleus_fraction": 0.5,
+    "dist_target_stride": [
+      2,
+      2
+    ],
+    "tile_sampling_by_objects": 0.0,
+    "train_region_crops": false,
+    "partial_annotation": false,
+    "unknown_label": null,
+    "annotated_anchor_share": 0.0,
+    "init_weights": null,
+    "weight_decay": 0.05,
+    "ema_decay": 0.999,
+    "extra_train_dirs": [],
+    "extra_train_share": 0.0,
+    "val_loss_every_n_epochs": 10,
+    "keep_epoch_checkpoints": 1
+  },
+  "inference": {
+    "checkpoint_path": "runs/helacytonuc_e7_clean_cells_only/weights_best.weights.h5",
+    "mask_thresh": 0.45,
+    "eval_splits": [
+      "val"
+    ],
+    "save_pred_tiff": true,
+    "refinement_mode": "mask",
+    "refine_feature_cache_windows": 32,
+    "mask_nms_nucleus": 0.5,
+    "mask_nms_cytoplasm": 0.5,
+    "pair_min_overlap": 0.1,
+    "pair_min_mask_iou": 0.25,
+    "mask_thresh_nucleus": "auto",
+    "mask_thresh_cytoplasm": "auto",
+    "refinement_patch_size": [
+      256,
+      256
+    ],
+    "refinement_adaptive_roi": true,
+    "proposal_mode": "peaks",
+    "mask_containment_threshold": 0.95,
+    "mask_quality_min": "auto",
+    "mask_quality_use_scores": false,
+    "mask_overlap_nucleus": 0.85,
+    "mask_overlap_cytoplasm": 0.85,
+    "mask_assembly_nucleus": "object_quality_containment",
+    "mask_assembly_cytoplasm": "object_quality_containment",
+    "mask_min_remaining_fraction": 0.5,
+    "cell_roi_expansion_steps": 2,
+    "proposal_peak_window_nucleus": null,
+    "proposal_peak_window_cytoplasm": null,
+    "proposal_border_nucleus": 0,
+    "proposal_border_cytoplasm": 0,
+    "nms_candidate_spacing": 0.25,
+    "nms_border_exclude_xy": 1,
+    "residual_proposals": false,
+    "refinement_roi_snap": true,
+    "tta_flips": false,
+    "refinement_batch": 32,
+    "skip_covered_prompts": true,
+    "refinement_roi_stride": 128
+  },
+  "loss_weights": {
+    "lambda_prob_nucleus": 1.0,
+    "lambda_dist_nucleus": 0.2,
+    "lambda_prob_cytoplasm": 1.0,
+    "lambda_dist_cytoplasm": 0.5,
+    "lambda_containment": 0.1,
+    "lambda_wbr": 0.15,
+    "lambda_consistency": 0,
+    "enable_consistency": false,
+    "lambda_fragmentation": 0.0,
+    "lambda_background_penalty": 0,
+    "lambda_cyto_mask": 0.4,
+    "lambda_nuc_mask": 0.4
+  },
+  "loss_params": {
+    "containment_margin": 1.0,
+    "max_assignment_distance": 25.0,
+    "wbr_sigma": 1.0,
+    "wbr_warmup_epochs": 30,
+    "w_containment_geometric": 1.0,
+    "w_containment_distance": 0.0,
+    "w_center_separation": 0.0,
+    "w_cyto_support": 0.15,
+    "dist_loss": "mae",
+    "huber_delta": 1.0,
+    "checkpoint_w_jtpr": 0.5,
+    "mask_ce_empty_weight": 0.25,
+    "prompt_consistency_weight": 0.1,
+    "mask_quality_weight": 0.1,
+    "mask_ce_class_balance": false,
+    "cell_prompt_separation_weight": 0.1,
+    "cell_z_dice_weight": 0.0,
+    "nucleus_z_dice_weight": 0.0,
+    "mask_quality_target": "component",
+    "mask_quality_ignore_boundary_targets": true,
+    "nucleus_prob_object_weight": 0.25,
+    "cytoplasm_prob_object_weight": 0.25,
+    "prob_object_peak_weight": 0.25,
+    "mask_quality_rank_weight": 0.1,
+    "object_losses_include_crop_cut": true,
+    "mask_overlap_loss": "lovasz",
+    "object_losses_min_area_from_gate": true,
+    "semantic_foreground_weight": 1.0,
+    "dist_polar_iou_weight": 1.0,
+    "prob_iou_aware": 1.0
+  },
+  "augmentation": {
+    "enable": true,
+    "flip_prob": 0.5,
+    "rotation_yx": true,
+    "intensity_range": [
+      0.8,
+      1.2
+    ],
+    "intensity_offset": [
+      -0.1,
+      0.1
+    ],
+    "gamma_range": [
+      0.9,
+      1.1
+    ],
+    "noise_sigma": 0.01,
+    "zoom_range": null,
+    "blur_sigma_range": [
+      0.0,
+      1.0
+    ],
+    "cyto_center_prompt_prob": 0.25,
+    "negative_prompt_prob": 0.1,
+    "prompt_center_jitter": 0.1,
+    "prompt_sigma_jitter": 0.1,
+    "repeat_cell_prompt_prob": 0.25,
+    "prompt_inside_target": true,
+    "neighbor_cell_prompt_prob": 1.0,
+    "cell_z_pair_prob": 0.0,
+    "nucleus_z_pair_prob": 0.0,
+    "elastic_prob": 0.5,
+    "elastic_alpha": 10.0,
+    "elastic_sigma": 20.0,
+    "zoom_z_range": null,
+    "flip_z_prob": 0.0,
+    "saturation_prob": 0.0
+  },
+  "evaluation": {
+    "eval_dice_every": 40,
+    "min_eval_epoch": 40,
+    "prob_thresh_range": [
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.65,
+      0.7
+    ],
+    "nms_thresh_range": [
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5
+    ],
+    "mask_thresh_range": [
+      0.25,
+      0.35,
+      0.45,
+      0.5,
+      0.55,
+      0.6,
+      0.65,
+      0.7,
+      0.75,
+      0.8,
+      0.85,
+      0.9
+    ],
+    "threshold_opt_splits": [
+      "val"
+    ],
+    "compute_jtpr": true,
+    "save_predictions": false,
+    "save_every_n_epochs": 50,
+    "optimize_thresholds": false,
+    "refinement_stage_audit": true,
+    "fullval_train_volumes": 3
+  },
+  "gpu_config": {
+    "allow_growth": true,
+    "memory_limit": null,
+    "visible_devices": "0"
+  },
+  "output": {
+    "basedir": "runs",
+    "save_best_dice": true,
+    "save_history": true
+  }
+}
