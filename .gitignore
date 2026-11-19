@@ -1,13 +1,25 @@
-# Only the code of the method, its baselines and the dataset converters is tracked. Models, data, run results,
-# tests, audits, notes and old configuration versions stay local.
+# Only the code of the method, its baselines, the dataset converters, the configurations of the paper's models and
+# the paper's analysis scripts are tracked. Models, data, run results, notes and local scripts stay local.
 /*
 !/.gitignore
-!/Readme.md
+!/README.md
+!/LICENSE
+!/requirements.txt
 !/*.py
 !/config_cytonucs.json
 /overfit.py
 /paper_queue.py
 /run_inference.py
+
+!/configs/
+/configs/*
+!/configs/*.json
+!/configs/README.md
+
+!/paper/
+/paper/*
+!/paper/*.py
+!/paper/README.md
 
 !/dataset_prep/
 /dataset_prep/*
@@ -17,8 +29,7 @@
 !/dataset_prep/synthetic/*.py
 !/dataset_prep/synthetic/README.md
 
-# Baselines of the paper: their code (StarDist runs, the vendored HydraStarDist package with its BSD licence),
-# not their models or logs.
+# Baselines: their code (the vendored HydraStarDist package keeps its BSD licence), not their models or logs.
 !/baselines/
 /baselines/*
 !/baselines/*.py
@@ -32,7 +43,12 @@
 !/baselines/hydrastardist/hydrastardist/
 !/baselines/cellpose/
 /baselines/cellpose/*
-!/baselines/cellpose/*.py
+!/baselines/cellpose/run_cellpose.py
+!/baselines/cellpose/run_cellpose3d.py
+!/baselines/cellpose/run_cellpose3d_files.py
+!/baselines/instanseg/
+/baselines/instanseg/*
+!/baselines/instanseg/*.py
 !/baselines/nnunet/
 /baselines/nnunet/*
 !/baselines/nnunet/*.py
