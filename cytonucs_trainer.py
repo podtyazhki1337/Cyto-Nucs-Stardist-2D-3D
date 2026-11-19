@@ -20,11 +20,11 @@ def _calculate_ap(precision, recall):
     Calculate average precision from precision and recall values.
     Expects precision and recall to be arrays of values in [0, 1].
     """
-    # Очистка и преобразование
+    # cleaning and conversion
     precision = np.array([p if isinstance(p, (int, float)) and not np.isnan(p) else 0.0 for p in precision])
     recall = np.array([r if isinstance(r, (int, float)) and not np.isnan(r) else 0.0 for r in recall])
 
-    # === ВАЖНАЯ ПРОВЕРКА: нормализация, если данные > 1 ===
+    # normalised if the values exceed 1
     if len(precision) > 0 and np.max(precision) > 1.0:
         print(f"⚠️ WARNING: precision contains values > 1.0 (max={np.max(precision)}), normalizing...")
         precision = precision / np.max(precision)
@@ -33,24 +33,24 @@ def _calculate_ap(precision, recall):
         print(f"⚠️ WARNING: recall contains values > 1.0 (max={np.max(recall)}), normalizing...")
         recall = recall / np.max(recall)
 
-    # Проверка на пустые массивы
+    # empty arrays
     if len(precision) == 0 or len(recall) == 0:
         return 0.0
 
-    # Сортировка по recall
+    # sorted by recall
     sorted_indices = np.argsort(recall)
     recall = recall[sorted_indices]
     precision = precision[sorted_indices]
 
-    # Добавление конечных точек
+    # end points
     precision = np.concatenate(([1.], precision, [0.]))
     recall = np.concatenate(([0.], recall, [1.]))
 
-    # Интерполяция precision (максимум справа)
+    # interpolated precision (maximum to the right)
     for i in range(len(precision) - 2, -1, -1):
         precision[i] = np.maximum(precision[i], precision[i + 1])
 
-    # Вычисление площади под кривой
+    # area under the curve
     x = np.where(recall[1:] != recall[:-1])[0] + 1
     ap = np.sum((recall[x] - recall[x - 1]) * precision[x])
 
@@ -386,7 +386,7 @@ class CytoNucsTrainer:
                 decay_rate=lr_decay_rate,
                 staircase=lr_staircase
             )
-            # ИСПРАВЛЕНО: БЕЗ clipnorm (будет применяться clip_by_global_norm вручную)
+            # no clipnorm here: clip_by_global_norm is applied in the training step
             self.optimizer = Adam(learning_rate=schedule)
         else:
             self.optimizer = optimizer
@@ -471,8 +471,6 @@ class CytoNucsTrainer:
         print(f'Restored Adam and epoch {int(self.state_epoch.numpy())}')
         return True
 
-        # cytonucs_trainer.py - ЛУЧШИЙ ВАРИАНТ с tf.py_function
-
     def _detection(self, x_batch):
         """model.detection_model in training mode, the first call of the two-call step. training.jit_compile: compiled
         with XLA (the same operations, fused: GroupNorm and the activations are chains of element-wise passes over
@@ -528,21 +526,15 @@ class CytoNucsTrainer:
             self.loss_fn.last_components['mask_prompt_fraction'] = mask_prompt_share
         gradients = tape.gradient(loss, self.model.keras_model.trainable_variables)
 
-        # Имена слоёв статичны на этапе трейса — группируем по веткам.
-        # ВАЖНО: в Keras 3 var.name = 'kernel'/'bias' БЕЗ префикса слоя, полный путь
-        # в var.path -> группируем по var.path, иначе всё валится в один backbone.
-        # refinement (mask/boundary) stop_gradient'нут от декодера -> его градиент
-        # НЕ течёт в общий encoder/decoder, клипаем его ОТДЕЛЬНОЙ группой (когда он
-        # снова включён), чтобы его Dice-градиент не масштабировал вниз prob/dist.
+        # Gradient groups by branch, from the layer names (static at trace time). In Keras 3 var.name is
+        # 'kernel' / 'bias' without the layer, so the groups use var.path. The refinement has a group of its own.
         prob_layers = {'nucleus_prob', 'cytoplasm_prob',
                        'nucleus_prob_logit', 'cytoplasm_prob_logit'}
         dist_layers = {'nucleus_dist', 'cytoplasm_dist'}
         refine_subs = ('_refine', 'prompt_gate', 'nucleus_mask', 'cytoplasm_mask',
                        'geo_dist_compress')
-        # Декодер цитоплазмы — ОТДЕЛЬНАЯ группа. Он не разделяется с ядром
-        # (общий только энкодер), а его градиент пришёл к насыщению обеих
-        # цито-голов при целом ядре. В общей группе backbone его норма
-        # усреднялась с энкодером и декодером ядра, и всплеск был не виден.
+        # The cytoplasm decoder is a group of its own (only the encoder is shared), so that its gradient norm is
+        # logged apart from the encoder and the nucleus decoder.
         cyto_dec_subs = ('cyto_dec_', 'cyto_features')
 
         prob_grads, prob_vars = [], []
@@ -579,14 +571,9 @@ class CytoNucsTrainer:
                 return tf.constant(0.0, tf.float32)
             return tf.linalg.global_norm(grads)
 
-        # Нормы — ТОЛЬКО для лога. Канон (base.py:308) применяет Adam без
-        # клиппинга вообще. Клип по группам множит градиент на 20/norm, а norm
-        # скачет по шагам (prob 499 -> 68 -> 1.4): постоянный множитель Adam
-        # сокращает, ПЕРЕМЕННЫЙ — нет, потому что v накоплен по одному масштабу,
-        # а m по другому. Плюс группы режутся независимо, и заданный конфигом
-        # баланс lambda_prob/lambda_dist = 1/0.2 динамически переопределяется
-        # каждым шагом. gradient_clip_norm=0 отключает клип (каноническое
-        # поведение); >0 оставлен как аварийный тормоз.
+        # The group norms are for the log only. StarDist (base.py:308) applies Adam without clipping; clipping each
+        # group would rescale the gradients by a factor that changes every step and override the loss weights.
+        # gradient_clip_norm = 0: no clipping (as StarDist); > 0: one global clip as a safety brake.
         prob_norm = _group_norm(prob_grads)
         dist_norm = _group_norm(dist_grads)
         bb_norm = _group_norm(backbone_grads)
@@ -598,8 +585,7 @@ class CytoNucsTrainer:
         all_grads, all_vars = map(list, zip(*active))
 
         if clip_norm > 0:
-            # ОДИН глобальный клип на всю сеть, эквивалент global_clipnorm:
-            # относительный баланс между группами сохраняется.
+            # one global clip for the whole network (as global_clipnorm): the balance between groups is kept
             all_grads, _ = tf.clip_by_global_norm(all_grads, clip_norm)
 
         self.optimizer.apply_gradients(zip(all_grads, all_vars))
@@ -766,10 +752,9 @@ class CytoNucsTrainer:
         Returns:
             loss: scalar loss value
         """
-        # Forward pass (БЕЗ training=True)
+        # forward pass in inference mode
         y_pred = self.model.keras_model(x_batch, training=False)
 
-        # ИСПРАВЛЕНИЕ: убрать assignments=None
         loss = self.loss_fn(self._mask_quality_inputs(x_batch, y_batch), y_pred,
                             current_epoch=self.current_epoch_var)
 
@@ -790,7 +775,7 @@ class CytoNucsTrainer:
             trainer.current_epoch_var.assign(self.current_epoch_var)
         return trainer
 
-    # Основной цикл тренировки
+    # main training loop
 
 
     def train(
@@ -915,11 +900,8 @@ class CytoNucsTrainer:
                     if experiment:
                         experiment.log_metric("val_loss", val_loss, epoch=epoch + 1)
 
-                        # СНАРУЖИ if experiment: при use_comet=false чекпоинт
-                        # не сохранялся вовсе.
-                        # Состав лосса меняется на warmup -> val_loss несравним
-                        # между регимами. Сбрасываем отсчёт, когда warmup доехал
-                        # до 1.0, иначе best замерзает на предпоследней эпохе hold.
+                    # The loss changes during the warmup, so val_loss is not comparable across it: the best value is
+                    # reset when the warmup is complete.
                     _warm = int(getattr(self.config, 'loss_warmup_epochs',
                                         getattr(self.config, 'wbr_warmup_epochs', 20)))
                     if (epoch + 1) == 2 * _warm:
@@ -928,8 +910,8 @@ class CytoNucsTrainer:
                         best_val_loss = val_loss
                         self.state_best_val.assign(val_loss)
 
-                        # val_loss считается на deterministic train-sized patches.
-                        # Это полезная training diagnostic, но НЕ production quality metric.
+                        # val_loss is computed on deterministic train-sized patches: a training diagnostic, not the
+                        # quality metric (that is the full validation of DiceCallback).
                         best_path = (
                                 self.checkpoint_dir
                                 / 'weights_best_val_loss.weights.h5'
@@ -1014,20 +996,17 @@ class DiceCallback:
         """
         Full-volume quality validation.
 
-        val_loss по-прежнему считается отдельно на deterministic patches.
+        val_loss is computed separately, on deterministic patches.
 
-        Этот callback:
+        This callback:
             full validation volume
             -> production-like tiled inference
             -> sparse StarDist NMS
             -> prompted refinement
             -> AP / AP@50 / semantic Dice / JTPR
 
-        Лучший checkpoint выбирается по:
-            mean(AP_nucleus, AP_cytoplasm)
-
-        где AP = mean accuracy TP/(TP+FP+FN)
-        по IoU thresholds 0.50...0.95.
+        The best checkpoint maximises the checkpoint metric: loss_params.checkpoint_w_jtpr x linked JTPR + the rest x
+        the mean AP of the levels, AP = mean over IoU 0.50..0.95 of TP / (TP + FP + FN).
         """
 
         self.model = model
@@ -1070,10 +1049,9 @@ class DiceCallback:
     @staticmethod
     def _semantic_dice(gt, pred):
         """
-        Foreground/background Dice по полному volume.
+        Foreground / background Dice over the whole volume.
 
-        В отличие от compute_dice(), штрафует и FP, и FN,
-        потому что считается по всей бинарной маске.
+        Unlike compute_dice() it penalises both FP and FN (computed on the whole binary mask).
         """
         g = np.asarray(gt) > 0
         p = np.asarray(pred) > 0
@@ -1159,11 +1137,9 @@ class DiceCallback:
             img
     ):
         """
-        Тот же выбор tiled/non-tiled inference,
-        который используется в run_inference_only().
+        The tiled / untiled inference of run_inference_only().
 
-        img уже нормализован на полном volume внутри
-        val_generator.repool().
+        img is already normalised over the whole volume (val_generator.repool()).
         """
         config = self.model.config
 
@@ -1206,8 +1182,7 @@ class DiceCallback:
                 )
             )
 
-            # Z полностью обрабатывается fixed-Z
-            # логикой внутри _predict_with_tiling().
+            # Z is handled by the fixed-Z windows of _predict_with_tiling().
             if ndim == 3:
                 n_tiles = (
                     1,
@@ -1265,15 +1240,8 @@ class DiceCallback:
         # VALIDATION DATA
         # ============================================================
         #
-        # ВАЖНО:
-        # НЕ используем:
-        #
-        #     self.val_generator[i]
-        #
-        # потому что __getitem__ возвращает train-sized patch.
-        #
-        # data_pool содержит исходные ПОЛНЫЕ volumes,
-        # нормализованные один раз по всему тому.
+        # Not self.val_generator[i] (__getitem__ returns a train-sized patch): data_pool holds the whole volumes,
+        # normalised once over each volume.
         # ============================================================
 
         data_pool = getattr(
@@ -1294,18 +1262,18 @@ class DiceCallback:
         ):
             raise RuntimeError(
                 "DiceCallback: "
-                "val_generator не содержит "
+                "val_generator has no "
                 "data_pool/image_files"
             )
 
         if len(data_pool) != len(image_files):
             raise RuntimeError(
-                "Full-volume validation требует "
-                "ВСЮ validation выборку в data_pool. "
+                "Full-volume validation needs "
+                "the whole validation set in data_pool. "
                 f"data_pool={len(data_pool)}, "
                 f"image_files={len(image_files)}. "
-                "Для val_generator не задавайте "
-                "уменьшенный pool_size."
+                "Do not set a smaller pool_size "
+                "for val_generator."
             )
 
         print(
@@ -1395,13 +1363,12 @@ class DiceCallback:
         fullval_lengths = {k: len(v) for k, v in history.items() if k.startswith('fullval_')}
 
         # ============================================================
-        # НАКАПЛИВАЕМ СЧЁТЧИКИ, А НЕ МАСКИ
+        # COUNTS ARE ACCUMULATED, NOT MASKS
         # ============================================================
         #
-        # matching_dataset агрегирует пулом — складывает tp/fp/fn по
-        # изображениям. Складываем сами сразу после прогона тома и отпускаем
-        # маски: числа те же, но в памяти не висит 4 набора полных масок по
-        # всей валидации. JTPR и semantic Dice тоже считаются на месте.
+        # The TP / FP / FN of each volume are added up right after it is predicted and its masks are released
+        # (the same numbers as matching_dataset's pooled counts, without keeping every mask). JTPR and the semantic
+        # Dice are accumulated the same way.
         # ============================================================
 
         from stardist.matching import matching
@@ -1477,7 +1444,7 @@ class DiceCallback:
             finally:
                 predictor._refinement_stage_audit = None
 
-            # Никакого silent cropping validation результатов.
+            # no silent cropping of the validation results
             if nucleus_pred.shape != nucleus_gt.shape:
                 raise RuntimeError(
                     f"{filename}: nucleus shape mismatch: "
@@ -1559,8 +1526,7 @@ class DiceCallback:
                     jtpr=float(jtpr), pair_failures=jtpr_details), diagnostic_file, default=int)
                 diagnostic_file.write('\n')
 
-            # Визуализация — только первый том: она стоит дороже самого
-            # прогона и на 61 картинке в эпоху не нужна.
+            # visualisation of the first volume only (it costs more than the prediction)
             if i == 0:
                 self._save_epoch_visualization_full(
                     epoch=epoch_num, img=img,
@@ -1572,7 +1538,7 @@ class DiceCallback:
             del nucleus_pred, cytoplasm_pred, details
 
         # ============================================================
-        # АГРЕГАЦИЯ
+        # AGGREGATION
         # ============================================================
 
         print(f'  Pair failure counts: {pair_failures}')
@@ -1720,12 +1686,8 @@ class DiceCallback:
         # CHECKPOINT METRIC
         # ============================================================
         #
-        # compute_dice() здесь СПЕЦИАЛЬНО не используем:
-        # он считает Dice только по matched instances и
-        # не штрафует достаточным образом FP/FN.
-        #
-        # AP/accuracy учитывает:
-        # TP, FP и FN.
+        # Not compute_dice() (it averages over matched objects only and hardly penalises FP / FN); the AP counts
+        # TP, FP and FN.
         # ============================================================
         from cytonucs_runtime import checkpoint_jtpr_weight
         _w_jtpr = checkpoint_jtpr_weight(self.model.config)
@@ -1749,8 +1711,8 @@ class DiceCallback:
             "\n  FULL-VOLUME METRICS"
         )
         print(
-            f"  GT объектов: nuc={s_n.tp + s_n.fn} cyto={s_c.tp + s_c.fn} | "
-            f"ступенька accuracy ~1/{max(1, s_n.tp + s_n.fp + s_n.fn)}"
+            f"  GT objects: nuc={s_n.tp + s_n.fn} cyto={s_c.tp + s_c.fn} | "
+            f"accuracy step ~1/{max(1, s_n.tp + s_n.fp + s_n.fn)}"
         )
         print(
             f"  Nucleus   | "
@@ -1914,7 +1876,7 @@ class DiceCallback:
                 selection_metric
             )
 
-            # Главный production checkpoint.
+            # the main checkpoint (best checkpoint metric)
             save_path = (
                     Path(
                         self.model.basedir
@@ -2007,7 +1969,7 @@ class DiceCallback:
 
     def _save_epoch_visualization_full(self, epoch, img, nuc_gt, cyto_gt, nuc_pred, cyto_pred, details, viz_dir, filename=None):
         """
-        Save visualization with КОНТРАСТНЫМИ цветами и чёткими границами.
+        Save a visualisation with contrasting colours and sharp boundaries.
         """
         import matplotlib.pyplot as plt
         from skimage.segmentation import find_boundaries
@@ -2016,19 +1978,15 @@ class DiceCallback:
         def _quick_dice(gt, pred):
             g, p = np.asarray(gt) > 0, np.asarray(pred) > 0
             if g.shape != p.shape:
-                return 0.0  # размеры разошлись (пустой pred в grid-разрешении) — пропускаем
+                return 0.0  # shapes differ (empty prediction at grid resolution): skipped
             denom = g.sum() + p.sum()
             return float(2 * np.logical_and(g, p).sum() / denom) if denom else 0.0
         dice_nuc = _quick_dice(nuc_gt, nuc_pred)
         dice_cyto = _quick_dice(cyto_gt, cyto_pred)
 
         def _n_obj(a):
-            """Число объектов = уникальные ненулевые лейблы.
-            `.max()` даёт максимальный ID: GT-маска после кропа сохраняет
-            нумерацию исходного тома (ядра 3, 7, 10 -> max 10 при трёх
-            объектах), а предсказание перенумеровано подряд -> панели GT и
-            Pred считали разное, и «10 GT против 3 Pred» выглядело как
-            недодетекция там, где было попадание 3/3."""
+            """Number of objects = distinct non-zero labels (not .max(): a cropped ground truth keeps the ids of the
+            whole volume)."""
             return int(len(np.unique(np.asarray(a))) - (1 if 0 in np.unique(np.asarray(a)) else 0))
 
         _vmax = {}
@@ -2057,11 +2015,10 @@ class DiceCallback:
             img = img[..., :channels]
         if img.ndim == 3 and img.shape[-1] == 1:
             img = img[..., 0]
-        # Конвертируем и нормализуем
+        # conversion and normalisation
         if img.ndim == 3 and img.shape[-1] in [3, 4]:
             import cv2
-            # перцентильная нормализация для показа (как вход модели, устойчиво
-            # к горячим пикселям) — иначе один яркий выброс гасит всю картинку.
+            # percentile normalisation for display (as the model input; robust to hot pixels)
             img_display = img.astype(np.float32)
             p_lo = np.percentile(img_display, 1)
             p_hi = np.percentile(img_display, 99.5)
@@ -2075,24 +2032,24 @@ class DiceCallback:
             img_display = np.clip(img_display, 0, 1)
 
         # ============================================================
-        # СОЗДАЁМ КОНТРАСТНУЮ COLORMAP
+        # A CONTRASTING COLORMAP
         # ============================================================
 
-        # Генерируем яркие, насыщенные цвета
+        # bright, saturated colours
 
         n_colors = max(nuc_pred.max(), cyto_pred.max(), nuc_gt.max(), cyto_gt.max()) + 1
 
-        # HSV colorspace для максимальной контрастности
+        # HSV colours for maximal contrast
         from matplotlib.colors import hsv_to_rgb
 
         colors = []
         colors.append([0, 0, 0])  # Background = black
 
         for i in range(1, n_colors):
-            # Фиксированная saturation и value для яркости
-            hue = (i * 137.508) % 360  # Golden angle для максимальной separation
-            saturation = 0.8 + 0.2 * (i % 2)  # Чередуем 0.8 и 1.0
-            value = 0.9 + 0.1 * ((i + 1) % 2)  # Чередуем 0.9 и 1.0
+            # high saturation and value
+            hue = (i * 137.508) % 360  # golden angle: neighbouring labels far apart in hue
+            saturation = 0.8 + 0.2 * (i % 2)  # alternating 0.8 / 1.0
+            value = 0.9 + 0.1 * ((i + 1) % 2)  # alternating 0.9 / 1.0
 
             rgb = hsv_to_rgb([hue / 360.0, saturation, value])
             colors.append(rgb)
@@ -2139,7 +2096,7 @@ class DiceCallback:
         if nuc_gt.max() > 0:
             axes[0, 1].imshow(nuc_gt, cmap=cmap_contrast, interpolation='nearest',
                               vmin=0, vmax=n_colors - 1, alpha=0.8)
-            # Границы белым
+            # boundaries in white
             boundaries = find_boundaries(nuc_gt, mode='thick')
             axes[0, 1].contour(boundaries, colors='white', linewidths=1.5, levels=[0.5])
         axes[0, 1].set_title(f' Nucleus GT\n({_n_obj(nuc_gt)} objects)',
@@ -2237,7 +2194,7 @@ class DiceCallback:
         cyto_prob = details.get('cytoplasm_prob')
         nuc_dist = details.get('nucleus_dist')
         cyto_dist = details.get('cytoplasm_dist')
-        # карты могут отсутствовать или быть None (убраны для экономии RAM) — дефолты
+        # the maps may be missing or None (dropped to save memory): defaults
         if nuc_prob is None:  nuc_prob = np.zeros_like(nuc_gt, dtype=float)
         if cyto_prob is None: cyto_prob = np.zeros_like(cyto_gt, dtype=float)
         if nuc_dist is None:  nuc_dist = np.zeros((*nuc_gt.shape, 1), dtype=float)
@@ -2245,16 +2202,16 @@ class DiceCallback:
 
         # 9. Nucleus Probability
         im1 = axes[2, 0].imshow(nuc_prob, cmap='hot', vmin=0, vmax=1)
-        axes[2, 0].set_title(f' Nucleus Prob\nMax(срез)={nuc_prob.max():.3f} '
-                             f'Max(том)={_vmax["nucleus_prob"]:.3f}',
+        axes[2, 0].set_title(f' Nucleus Prob\nMax(slice)={nuc_prob.max():.3f} '
+                             f'Max(volume)={_vmax["nucleus_prob"]:.3f}',
                              fontsize=14, fontweight='bold', pad=10)
         axes[2, 0].axis('off')
         plt.colorbar(im1, ax=axes[2, 0], fraction=0.046, pad=0.04)
 
         # 10. Cytoplasm Probability
         im2 = axes[2, 1].imshow(cyto_prob, cmap='hot', vmin=0, vmax=1)
-        axes[2, 1].set_title(f' Cytoplasm Prob\nMax(срез)={cyto_prob.max():.3f} '
-                             f'Max(том)={_vmax["cytoplasm_prob"]:.3f}',
+        axes[2, 1].set_title(f' Cytoplasm Prob\nMax(slice)={cyto_prob.max():.3f} '
+                             f'Max(volume)={_vmax["cytoplasm_prob"]:.3f}',
                              fontsize=14, fontweight='bold', pad=10)
         axes[2, 1].axis('off')
         plt.colorbar(im2, ax=axes[2, 1], fraction=0.046, pad=0.04)
@@ -2308,8 +2265,8 @@ def compute_dice(gt, pred):
     Compute instance-level Dice coefficient.
 
     Args:
-        gt: ground truth instance mask (H, W) с unique IDs
-        pred: predicted instance mask (H, W) с unique IDs
+        gt: ground truth instance mask (H, W) with unique ids
+        pred: predicted instance mask (H, W) with unique ids
 
     Returns:
         dice: mean Dice score for matched instances [0, 1]
@@ -2317,14 +2274,14 @@ def compute_dice(gt, pred):
     from scipy.optimize import linear_sum_assignment
     from skimage.measure import regionprops
 
-    # Если обе пустые - идеально
+    # both empty: perfect
     if gt.max() == 0 and pred.max() == 0:
         return 1.0
-    # Если одна пустая - провал
+    # one empty: failure
     if gt.max() == 0 or pred.max() == 0:
         return 0.0
 
-    # Получаем регионы
+    # regions
     gt_props = regionprops(gt.astype(np.int32))
     pred_props = regionprops(pred.astype(np.int32))
 
@@ -2333,7 +2290,7 @@ def compute_dice(gt, pred):
     if len(gt_props) == 0 or len(pred_props) == 0:
         return 0.0
 
-    # IoU matrix для matching
+    # IoU matrix for the matching
     iou_matrix = np.zeros((len(gt_props), len(pred_props)))
     for i, gt_prop in enumerate(gt_props):
         gt_mask = (gt == gt_prop.label)
@@ -2346,7 +2303,7 @@ def compute_dice(gt, pred):
     # Hungarian matching
     row_ind, col_ind = linear_sum_assignment(-iou_matrix)
 
-    # Dice для matched pairs (IoU > 0.5)
+    # Dice of the matched pairs (IoU > 0.5)
     dice_scores = []
     for i, j in zip(row_ind, col_ind):
         if iou_matrix[i, j] > 0.5:
@@ -2359,5 +2316,5 @@ def compute_dice(gt, pred):
     if len(dice_scores) == 0:
         return 0.0
 
-    # Mean Dice по matched instances
+    # mean Dice over the matched objects
     return np.mean(dice_scores)

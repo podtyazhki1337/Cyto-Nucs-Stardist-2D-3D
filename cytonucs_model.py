@@ -19,9 +19,8 @@ class MaskQualityPool(layers.Layer):
 
 
 class ScalarGate(layers.Layer):
-    """Обучаемый скалярный гейт в (0,1) через sigmoid. Масштабирует вход.
-    Используется чтобы цитоплазма получала контекст ядра ОСЛАБЛЕННЫМ —
-    модель сама калибрует силу влияния ядра."""
+    """Learned scalar gate in (0, 1) (sigmoid) that scales its input: the cytoplasm decoder receives the nucleus
+    context attenuated, with a strength the model learns."""
 
     def __init__(self, init_value=0.3, **kwargs):
         super().__init__(**kwargs)
@@ -81,15 +80,15 @@ class CytoNucsStarDistModel:
         # load them: Keras .weights.h5 files address layers by graph order, not by layer name.
         self.fine_wiring = fine_wiring
         self.ndim = config.ndim
-        # Инициализатор backbone-свёрток; выставляется в _build_model,
-        # дефолт нужен на случай раннего вызова _build_block.
+        # Initializer of the backbone convolutions; set in _build_model (this default covers an earlier
+        # _build_block call).
         self._kinit = 'he_normal'
         self.keras_model = self._build_model()
 
     def _build_block(self, x, n_filters, ConvLayer, prefix):
         """UNet conv block: 2x Conv3x3 ReLU; with model.unet_norm_groups each convolution is
         followed by GroupNorm before its activation (a batch is one or a few crops).
-        Инициализатор — self._kinit, обоснование в _build_model."""
+        Initializer: self._kinit (see _build_model)."""
         _k = getattr(self, '_kinit', 'he_normal')
         import re
         level = re.search(r'_l(\d+)', prefix)
@@ -130,15 +129,15 @@ class CytoNucsStarDistModel:
         mask_n_filter = getattr(cfg, 'mask_refinement_filters', 64)
 
         # ============================================================
-        # ИНИЦИАЛИЗАЦИЯ СВЁРТОК С ReLU
+        # INITIALIZATION OF THE ReLU CONVOLUTIONS
         # ============================================================
         # Preserve legacy initializers; the complete activation path is now configurable.
         self._kinit = ('he_normal'
                        if str(unet_activation).lower() in
                           ('relu', 'leaky_relu', 'relu6', 'gelu')
                        else 'glorot_uniform')
-        print(f"  ✓ Инициализация backbone-свёрток: {self._kinit} "
-              f"(активация {unet_activation})")
+        print(f"  ✓ Backbone initializer: {self._kinit} "
+              f"(activation {unet_activation})")
 
         _aniso = tuple(getattr(cfg, 'anisotropy', (1,) * self.ndim))
         if len(_aniso) != self.ndim:
@@ -156,7 +155,7 @@ class CytoNucsStarDistModel:
         self._cytoplasm_grid = cytoplasm_grid
 
         # ============================================================
-        # ДВА РАЗНЫХ ПУЛИНГА — КАК В КАНОНЕ (model3d.py:365-380)
+        # TWO KINDS OF POOLING, AS IN STARDIST (model3d.py:365-380)
         # ============================================================
         # Explicit schedules override the legacy shape-derived pooling plan.
         # Kernel/pooling ablations change the architecture and need separate checkpoints.
@@ -174,23 +173,22 @@ class CytoNucsStarDistModel:
         self._base_steps = base_steps
         self._input_multiple = plan['input_multiple']
 
-        print(f"  ✓ Прореживание входа до grid {base_grid}: {base_steps}")
-        print(f"  ✓ UNet pooling по уровням: {unet_pools}")
-        print(f"  ✓ Бутылочное горлышко: {tuple(_sz)}; "
-              f"вход должен быть кратен {self._input_multiple}")
-        print(f"  ✓ Головы: nucleus {nucleus_grid} (skip {nuc_skip}), "
+        print(f"  ✓ Input subsampled to grid {base_grid}: {base_steps}")
+        print(f"  ✓ U-Net pooling per level: {unet_pools}")
+        print(f"  ✓ Bottleneck: {tuple(_sz)}; "
+              f"input must be a multiple of {self._input_multiple}")
+        print(f"  ✓ Heads: nucleus {nucleus_grid} (skip {nuc_skip}), "
               f"cytoplasm {cytoplasm_grid} (skip {cyto_skip})")
 
         # ============================================================
-        # ВХОД
+        # INPUT
         # ============================================================
-        # K наборов промптов лежат в КАНАЛАХ, а не в копиях батча.
+        # The K prompt sets lie in the channels, not in copies of the batch.
         #
         # Legacy refinement uses stop_gradient; v2 can train decoder features.
         # (nuc/cyto_decoder_stop_grad_for_refine, cyto_ctx_stop_grad_for_refine,
-        # _geo_prior), поэтому backbone можно посчитать ОДИН раз, а ветку
-        # применить K раз с общими весами: память растёт только на её
-        # активации (2 conv по mask_refinement_filters), а не на весь UNet.
+        # _geo_prior), so the backbone runs once and the branch K times with shared weights: memory grows only by
+        # the branch's activations (2 convolutions of mask_refinement_filters), not by the whole U-Net.
         #
         # K is prompts_per_crop; image_batch_size controls independent crops.
         # ============================================================
@@ -217,18 +215,16 @@ class CytoNucsStarDistModel:
         _AvgPool = layers.AveragePooling3D if self.ndim == 3 else layers.AveragePooling2D
 
         def _prompt_with_coords(p_full, steps, tag, grid):
-            """Промпт + ОТНОСИТЕЛЬНЫЕ КООРДИНАТЫ до его центра.
-            Рефайн-ветка это несколько conv3, её собственное рецептивное поле
-            мало по сравнению с объектом, поэтому воксель на краю не видит
-            гауссиану в центре. Смещение до центра он знает локально."""
+            """The prompt and the coordinates relative to its centre. The refinement branch is a few 3x3
+            convolutions whose receptive field is small next to an object, so a voxel at the border would not see
+            the Gaussian at the centre; the offset gives it locally."""
             p = p_full
             for _i, st in enumerate(steps):
                 if any(v > 1 for v in st):
                     p = _AvgPool(st, name=f'prompt_pool_{tag}_{_i}')(p)
 
-            # Смещения в ФИЗИЧЕСКИХ единицах: шаг вокселя на своём разрешении
-            # равен anisotropy[a]*grid[a], нормируем на физический размер
-            # самой длинной оси патча.
+            # Offsets in physical units (the voxel step at this resolution is anisotropy[a] * grid[a]), normalised
+            # by the physical size of the longest axis of the patch.
             _step = [float(_aniso[a]) * float(grid[a]) for a in range(self.ndim)]
             _extent = max(float(cfg.train_patch_size[a]) * float(_aniso[a])
                           for a in range(self.ndim))
@@ -261,8 +257,8 @@ class CytoNucsStarDistModel:
             rel = layers.Lambda(_rel, name=f'prompt_rel_{tag}')(p)
             return layers.Concatenate(name=f'prompt_full_{tag}')([p, rel])
 
-        # Промпт живёт на разрешении СВОЕЙ головы: сначала прореживание входа
-        # до base_grid, затем столько же уровней UNet, сколько пропускает голова.
+        # A prompt lives at the resolution of its head: the input subsampling to base_grid, then as many U-Net levels
+        # as the head skips.
         _nuc_prompt_steps = base_steps + unet_pools[:nuc_skip]
         _cyto_prompt_steps = base_steps + unet_pools[:cyto_skip]
 
@@ -274,7 +270,7 @@ class CytoNucsStarDistModel:
                      for k in range(n_pr)]
 
         # ============================================================
-        # ПРОРЕЖИВАНИЕ ВХОДА ДО base_grid (канон model3d.py:365-375)
+        # INPUT SUBSAMPLED TO base_grid (StarDist model3d.py:365-375)
         # ============================================================
         pooled = inputs
         full_res_features = None
@@ -293,7 +289,7 @@ class CytoNucsStarDistModel:
             pooled = PoolLayer(st, name=f'pre_pool{i}')(pooled)
 
         # ============================================================
-        # ENCODER (общий) — ПОВЕРХ прореженного входа, пулинг по ВСЕМ осям
+        # ENCODER (shared), on the subsampled input, pooling on all axes
         # ============================================================
         encoder_features = []
         x = pooled
@@ -323,9 +319,8 @@ class CytoNucsStarDistModel:
                     x = PoolLayer(unet_pools[i], name=f'cell_enc_l{i}_pool')(x)
 
         def _decode(bottleneck, enc_feats, skip, prefix, ctx=None, ctx_skip=0):
-            """Симметричный декодер: с уровня unet_n_depth обратно до `skip`.
-            Пулинг/апсемплинг на уровне i — unet_pools[i], тот же, что в
-            энкодере, поэтому skip-connection сходится по форме на всех осях."""
+            """Symmetric decoder from level unet_n_depth back to `skip`. Pooling / upsampling at level i is
+            unet_pools[i], as in the encoder, so the skip connections match in shape on every axis."""
             x = bottleneck
             for i in reversed(range(skip, unet_n_depth)):
                 n_filters = unet_n_filter_base * (2 ** i)
@@ -343,37 +338,30 @@ class CytoNucsStarDistModel:
             return x
 
         # ============================================================
-        # ГОЛОВЫ prob/dist. Отклонение от канона (model3d.py:379-386, где обе
-        # растут из ОДНОГО features): слои раздельные, активация dist задаётся
-        # конфигом (dist_activation).
+        # prob / dist HEADS. Unlike StarDist (model3d.py:379-386, both from one feature map) the layers are separate;
+        # the dist activation is dist_activation.
         #
-        # prob отдаётся И логитом, И вероятностью: BCE считается из логита
-        # (sigmoid_cross_entropy_with_logits), где производная (sigmoid(z) - t)
-        # не обнуляется при насыщении. Прежний путь через clip_by_value давал
-        # РОВНО НОЛЬ градиента ниже 1e-7, и голова замерзала необратимо.
+        # prob is returned as a logit and as a probability: the BCE uses the logit
+        # (sigmoid_cross_entropy_with_logits), whose derivative sigmoid(z) - t does not vanish when saturated.
         #
-        # Выходные слои — glorot, за ними ReLU нет.
+        # Output layers: glorot initializer, no ReLU after them.
         # ============================================================
         _dist_act = str(getattr(cfg, 'dist_activation', 'linear')).lower()
         _n_geo = int(getattr(cfg, 'refine_geom_channels', 8))
 
         def _dist_head(feat, name, bias_key, fallback_key, default):
-            """softplus с bias = масштаб объекта, либо канонический linear.
+            """softplus with the object scale as bias, or StarDist's linear head (the method's setting).
 
-            ВНИМАНИЕ: dist_bias_init_* сейчас НЕ заполняется замером геометрии
-            (расчёт был удалён при переписывании set_anisotropy_from_labels),
-            поэтому softplus-ветка падает на fallback median_max_dist_*, а это
-            САМЫЙ ДЛИННЫЙ луч (полудиагональ bbox) — втрое выше медианы длин
-            лучей, замеренной по star_dist3D. Пока замер не восстановлен,
-            корректен только dist_activation='linear'. Печать ниже показывает,
-            откуда взято значение.
+            Note: dist_bias_init_* is not measured from the geometry, so the softplus head falls back to
+            median_max_dist_*, the longest ray (half the bounding-box diagonal), about three times the median ray
+            length. Only dist_activation='linear' is meant to be used; the printout says where the value came from.
             """
             if _dist_act == 'softplus':
                 _measured = getattr(cfg, bias_key, None)
                 b = float(_measured or getattr(cfg, fallback_key, default))
                 print(f"  {'✓' if _measured else '⚠️ '} {name}: softplus, "
                       f"bias={b:.1f} px "
-                      f"({'замер' if _measured else 'ФОЛБЭК на max-луч'})")
+                      f"({'measured' if _measured else 'fallback to the longest ray'})")
                 return ConvLayer(
                     cfg.n_rays, 1, padding='same', activation='softplus',
                     kernel_initializer='glorot_uniform',
@@ -386,10 +374,9 @@ class CytoNucsStarDistModel:
                 name=name)(feat)
 
         def _geo_prior(prob_t, dist_t, scale, tag):
-            """Coarse-оценка StarDist на вход рефайна, ЗА stop_gradient.
-            Рефайн иначе сегментирует с нуля, игнорируя уже посчитанную
-            геометрию. dist нормируется на масштаб объекта и сжимается с
-            n_rays до _n_geo: 96 сырых каналов забили бы вход числом каналов."""
+            """The coarse StarDist estimate as an input of the refinement, behind stop_gradient, so that the
+            refinement does not segment from scratch. dist is normalised by the object scale and compressed from
+            n_rays to _n_geo channels (96 raw channels would dominate the input)."""
             _p = layers.Lambda(lambda t: tf.stop_gradient(t),
                                name=f'{tag}_geo_prob_sg')(prob_t)
             _s = max(float(scale), 1e-3)
@@ -401,8 +388,8 @@ class CytoNucsStarDistModel:
             return _p, _d
 
         def _stack_prompts(tensors, name):
-            """K выходов рефайна -> ось БАТЧА. Строка k*B + b отвечает промпту k
-            сэмпла b; в том же порядке генератор обязан сложить *_target."""
+            """K refinement outputs -> the batch axis. Row k*B + b is prompt k of sample b; the generator stacks
+            the *_target arrays in the same order."""
             if len(tensors) == 1:
                 return layers.Lambda(lambda t: t, name=name)(tensors[0])
             return layers.Lambda(lambda ts: tf.concat(ts, axis=0),
@@ -470,8 +457,8 @@ class CytoNucsStarDistModel:
         print(f"  ✓ Nucleus head: split prob/dist features, dist={_dist_act}")
 
         # Decoder gradient is controlled by refinement_gradient_scale; geometry remains detached.
-        # Слои создаются ОДИН раз, применяются к каждому из K промптов: веса
-        # общие, а примеров за шаг в K раз больше.
+        # The layers are made once and applied to each of the K prompts: shared weights, K times more examples per
+        # step.
         x_nucleus_for_refine = layers.Lambda(
             _feature_gradient, name='nuc_decoder_stop_grad_for_refine'
         )(x_nucleus)
@@ -523,12 +510,11 @@ class CytoNucsStarDistModel:
             lambda t: tf.nn.softmax(t, axis=-1)[..., 1:2], name='nucleus_mask'
         )(_nuc_mask_logit)
         print(f"  ✓ Nucleus refinement: 3-class prompted mask ({mask_n_filter} ch) "
-              f"+ geometry prior ({_n_geo} ch), промптов за форвард: {n_pr}")
+              f"+ geometry prior ({_n_geo} ch), prompts per forward pass: {n_pr}")
 
         # ============================================================
-        # КОНТЕКСТ ЯДРА -> цитоплазма. Только в ДЕКОДЕР, не в головы и не в
-        # рефайн. Вход контекста застопорен, поэтому декодер ядра от
-        # цитоплазмы не зависит.
+        # NUCLEUS CONTEXT -> cytoplasm, into the decoder only (not the heads or the refinement). The context input
+        # is behind stop_gradient, so the nucleus decoder does not depend on the cytoplasm.
         # ============================================================
         x_nucleus_for_ctx = layers.Lambda(
             lambda t: tf.stop_gradient(t), name='nucleus_ctx_input_stop_grad'
@@ -542,8 +528,7 @@ class CytoNucsStarDistModel:
             name='nucleus_context_gate'
         )(nucleus_prob_context)
 
-        # Приведение с уровня nuc_skip на уровень cyto_skip теми же пулингами,
-        # что использует UNet на этих уровнях.
+        # From level nuc_skip to level cyto_skip with the U-Net's own pooling of those levels.
         nucleus_context_at_cyto = nucleus_context_gated
         for j in range(nuc_skip, cyto_skip):
             if any(v > 1 for v in unet_pools[j]):
@@ -641,7 +626,7 @@ class CytoNucsStarDistModel:
             lambda t: tf.nn.softmax(t, axis=-1)[..., 1:2], name='cytoplasm_mask'
         )(_cyto_mask_logit)
         print(f"  ✓ Cytoplasm refinement: 3-class prompted mask ({mask_n_filter} ch) "
-              f"+ geometry prior ({_n_geo} ch), промптов за форвард: {n_pr}")
+              f"+ geometry prior ({_n_geo} ch), prompts per forward pass: {n_pr}")
 
         # ============================================================
         # LEVELS THE RUN DOES NOT HAVE (model.levels)

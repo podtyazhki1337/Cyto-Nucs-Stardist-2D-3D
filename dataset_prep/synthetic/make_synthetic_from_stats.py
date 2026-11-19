@@ -1054,55 +1054,55 @@ def comparison_table(real, synth):
         if isinstance(d, (list, tuple)):
             return '(' + ', '.join(f'{x:.1f}' for x in d) + ')'
         return f'{d:.{digits}f}'
-    rows = ['| статистика | реальные (train) | синтетика |', '|---|---|---|']
-    for level, title in (('cells', 'клетки'), ('nuclei', 'ядра')):
-        for k, name in (('volume', 'объём, воксели'), ('extent_z', 'экстент Z, срезы'), ('radius_xy', 'экв. радиус XY'),
-                        ('elongation', 'вытянутость XY'), ('flatness', 'сплюснутость'), ('sphericity', 'сферичность / круглость'),
-                        ('solidity', 'solidity'), ('mode2', 'мода 2 log r'), ('rough_low', 'шероховатость 3–8'),
-                        ('rough_high', 'шероховатость 9–24'), ('nonstar', 'не-звёздные лучи')):
+    rows = ['| statistic | real (train) | synthetic |', '|---|---|---|']
+    for level, title in (('cells', 'cells'), ('nuclei', 'nuclei')):
+        for k, name in (('volume', 'volume, voxels'), ('extent_z', 'Z extent, slices'), ('radius_xy', 'equivalent radius XY'),
+                        ('elongation', 'elongation XY'), ('flatness', 'flatness'), ('sphericity', 'sphericity / circularity'),
+                        ('solidity', 'solidity'), ('mode2', 'mode 2 of log r'), ('rough_low', 'roughness, modes 3–8'),
+                        ('rough_high', 'roughness, modes 9–24'), ('nonstar', 'non-star-convex rays')):
             a, b = real.get(level, {}).get(k), synth.get(level, {}).get(k)
             if a or b:
                 rows.append(f'| {title}: {name} | {f(a, 0 if k == "volume" else 2)} | {f(b, 0 if k == "volume" else 2)} |')
     if 'nucleoli' in synth:
-        for k, name in (('volume', 'объём, воксели'), ('radius_xy', 'экв. радиус XY')):
-            rows.append(f"| ядрышки (приняты): {name} | – | {f(synth['nucleoli'].get(k), 1)} |")
+        for k, name in (('volume', 'volume, voxels'), ('radius_xy', 'equivalent radius XY')):
+            rows.append(f"| nucleoli (assumed): {name} | – | {f(synth['nucleoli'].get(k), 1)} |")
     hr, hs = real['hierarchy'], synth['hierarchy']
-    for k, name in (('multinucleated_share', 'доля многоядерных'), ('without_nucleus_share', 'доля без ядра'),
-                    ('outside_share_voxels', 'вокселей ядер вне клетки')):
+    for k, name in (('multinucleated_share', 'multinucleated share'), ('without_nucleus_share', 'share without a nucleus'),
+                    ('outside_share_voxels', 'nucleus voxels outside their cell')):
         rows.append(f'| {name} | {f(hr.get(k), 3)} | {f(hs.get(k), 3)} |')
-    for k, name in (('volume_ratio', 'объём ядра / клетки'), ('offset_xy', 'смещение ядра XY / радиус')):
+    for k, name in (('volume_ratio', 'nucleus / cell volume'), ('offset_xy', 'nucleus offset XY / radius')):
         rows.append(f'| {name} | {f(hr.get(k))} | {f(hs.get(k))} |')
     pr, ps = real['packing'], synth['packing']
-    for k, name in (('touching_share', 'доля касающихся клеток'), ('clusters_per_cell', 'кластеров на клетку')):
+    for k, name in (('touching_share', 'touching cells'), ('clusters_per_cell', 'clusters per cell')):
         rows.append(f'| {name} | {f(pr.get(k))} | {f(ps.get(k))} |')
-    for k, name in (('contact_fraction', 'доля границы на контакте'), ('nn_gap_ratio', 'зазор до ближайшего (отношение)'),
-                    ('nn_distance', 'расстояние до ближайшего, px'), ('envelope_density', 'плотность в оболочке'),
-                    ('window_cell_share', 'доля клеток в окне')):
+    for k, name in (('contact_fraction', 'boundary share in contact'), ('nn_gap_ratio', 'gap to the nearest (ratio)'),
+                    ('nn_distance', 'distance to the nearest, px'), ('envelope_density', 'density in the envelope'),
+                    ('window_cell_share', 'cell share in a window')):
         rows.append(f'| {name} | {f(pr.get(k))} | {f(ps.get(k))} |')
     if 'appearance' in real and 'appearance' in synth:
         ar, as_ = real['appearance'], synth['appearance']
         for cls in ('background', 'cytoplasm', 'nucleus'):
-            for k, name in (('mean', 'среднее'), ('between_object_std', 'σ между объектами'), ('texture_std', 'текстура σ'),
-                            ('noise_sigma', 'шум σ')):
+            for k, name in (('mean', 'mean'), ('between_object_std', 'σ between objects'), ('texture_std', 'texture σ'),
+                            ('noise_sigma', 'noise σ')):
                 if k in ar[cls] or k in as_[cls]:
                     rows.append(f'| {cls}: {name} | {f(ar[cls].get(k))} | {f(as_[cls].get(k))} |')
             tl = lambda a: a[cls].get('texture_length', {}).get('x')
             if tl(ar) or tl(as_):
-                rows.append(f'| {cls}: длина корреляции текстуры X, px | {f(tl(ar))} | {f(tl(as_))} |')
-        for k, name in (('sigma_xy', 'края относительно GT: σ_xy ядра, px'), ('sigma_z', 'края относительно GT: σ_z ядра, срезы'),
-                        ('halo_weight', 'края относительно GT: доля ореола')):
+                rows.append(f'| {cls}: texture correlation length X, px | {f(tl(ar))} | {f(tl(as_))} |')
+        for k, name in (('sigma_xy', 'edges vs GT: core σ_xy, px'), ('sigma_z', 'edges vs GT: core σ_z, slices'),
+                        ('halo_weight', 'edges vs GT: halo weight')):
             rows.append(f"| {name} | {f(ar['blur'].get(k), 2)} | {f(as_['blur'].get(k), 2)} |")
         for cls in ('cytoplasm', 'nucleus'):
             if ar[cls].get('coherence') is not None or as_[cls].get('coherence') is not None:
-                rows.append(f"| {cls}: когерентность тонкой текстуры | {f(ar[cls].get('coherence'))} | {f(as_[cls].get('coherence'))} |")
-        for k, name in (('contact', 'мембраны: контраст на контактах клеток'), ('free', 'мембраны: контраст на свободной границе')):
+                rows.append(f"| {cls}: coherence of the fine texture | {f(ar[cls].get('coherence'))} | {f(as_[cls].get('coherence'))} |")
+        for k, name in (('contact', 'membranes: contrast at cell contacts'), ('free', 'membranes: contrast at free boundaries')):
             m = lambda a: a.get('membranes', {}).get(k)
             if m(ar) or m(as_):
                 rows.append(f"| {name} | {f(m(ar))} | {f(m(as_))} |")
         if as_.get('nucleolus_contrast') is not None:
-            rows.append(f"| ядрышки (приняты): яркость в ядрышке / в остальном ядре после размытия | – | {f(as_['nucleolus_contrast'])} |")
-        for k, name in (('sharpness_xy', 'резкость: D(2)/D(16) по XY'), ('sharpness_z', 'резкость: D(1)/D(3) по Z'),
-                        ('haze_excess', 'дымка: фон в 8–32 px от клеток минус дальний фон')):
+            rows.append(f"| nucleoli (assumed): brightness in the nucleolus / rest of the nucleus after blur | – | {f(as_['nucleolus_contrast'])} |")
+        for k, name in (('sharpness_xy', 'sharpness: D(2)/D(16) in XY'), ('sharpness_z', 'sharpness: D(1)/D(3) in Z'),
+                        ('haze_excess', 'haze: background 8–32 px from cells minus far background')):
             if ar.get(k) is not None or as_.get(k) is not None:
                 rows.append(f"| {name} | {f(ar.get(k), 3)} | {f(as_.get(k), 3)} |")
     return '\n'.join(rows)
@@ -1115,7 +1115,7 @@ def preview(profile, volumes, path, reals=()):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from skimage.segmentation import find_boundaries
-    items = [(title, v) for title, v in reals] + [(f'синтетика {i + 1}', v) for i, v in enumerate(volumes)]
+    items = [(title, v) for title, v in reals] + [(f'synthetic {i + 1}', v) for i, v in enumerate(volumes)]
     cols = 5 if profile.ndim == 3 else 2
     fig, axes = plt.subplots(len(items), cols, figsize=(4.5 * cols, 4.5 * len(items)), squeeze=False)
 
@@ -1129,13 +1129,13 @@ def preview(profile, volumes, path, reals=()):
         img, cells, nuclei, nucleoli = v['image'], v['cells'], v['nuclei'], v.get('nucleoli')
         z = int(np.argmax((cells > 0).reshape(cells.shape[0], -1).sum(1)))
         row[0].imshow(img[z])
-        row[0].set_title(f'{title}: XY, срез {z}')
+        row[0].set_title(f'{title}: XY, slice {z}')
         row[1].imshow(overlay(img[z], [cells[z], nuclei[z], None if nucleoli is None else nucleoli[z]]))
-        row[1].set_title('клетки, ядра, ядрышки')
+        row[1].set_title('cells, nuclei, nucleoli')
         if cols == 5:
             zu = max(z - 8, 0)
             row[2].imshow(img[zu])
-            row[2].set_title(f'XY, срез {zu} (выше на {z - zu})')
+            row[2].set_title(f'XY, slice {zu} ({z - zu} above)')
             y = int(np.argmax((cells[z] > 0).sum(1)))
             rep = max(1, int(round(profile.spacing_z)))
             xz = lambda a: np.repeat(a[:, y], rep, axis=0)
@@ -1245,11 +1245,11 @@ def generate(stats_path, profile_name, output, counts=(60, 8, 8), shape=None, se
     (output / 'split_info.json').write_text(json.dumps(split_info, indent=2))
     if looks:
         (output / 'render_params.json').write_text(json.dumps({profile.volumes[vi]['name']: l.params() for vi, l in looks.items()}, indent=2))
-    report = [f'# Синтетика {profile_name}', '', usage_notes(profile, shape, counts, appearance, noise)]
+    report = [f'# Synthetic data {profile_name}', '', usage_notes(profile, shape, counts, appearance, noise)]
     if compare:
         summary, big = compared(profile, shape, seed, compare, appearance, noise, looks, packing)
-        report += ['', '## Сравнение с разметкой', '', f'Синтетика: {compare} отдельных объёмов {list(big)} с теми же параметрами '
-                   '(XY вдвое больше, чтобы край реже обрезал целые объекты).', '', comparison_table(stats['datasets'][profile_name], summary)]
+        report += ['', '## Comparison with the annotation', '', f'Synthetic: {compare} separate volumes {list(big)} with the same parameters '
+                   '(twice the XY size, so that the border cuts fewer whole objects).', '', comparison_table(stats['datasets'][profile_name], summary)]
     (output / 'synthetic_report.md').write_text('\n'.join(report) + '\n')
     print('->', output)
 
@@ -1257,22 +1257,22 @@ def generate(stats_path, profile_name, output, counts=(60, 8, 8), shape=None, se
 def usage_notes(profile, shape, counts, appearance, noise):
     n = NUCLEOLUS
     return '\n'.join([
-        f'Профиль {profile.name}: {profile.source["description"]} Объёмы {list(shape)}, train/val/test = {list(counts)}, '
-        f'заливка: {"по измеренным статистикам с калибровкой" if appearance == "realistic" else f"случайная, шум {noise}"}.',
+        f'Profile {profile.name}: {profile.source["description"]} Volumes {list(shape)}, train/val/test = {list(counts)}, '
+        f'fill: {"from the measured statistics, calibrated" if appearance == "realistic" else f"random, noise {noise}"}.',
         '',
-        'Использование: `data.dataset_dir` = эта папка; `training.train_region_crops` = false (папки train_regions нет). '
-        'Два уровня — `model.levels` ["nucleus", "cytoplasm"] (nucleolus_masks не читаются); три уровня — '
-        '["nucleolus", "nucleus", "cytoplasm"] (пары берут assignments и assignments_nucleolus_nucleus).',
+        'Use: `data.dataset_dir` = this folder; `training.train_region_crops` = false (there is no train_regions folder). '
+        'Two levels: `model.levels` ["nucleus", "cytoplasm"] (nucleolus_masks are not read); three levels: '
+        '["nucleolus", "nucleus", "cytoplasm"] (the pairs read assignments and assignments_nucleolus_nucleus).',
         '',
-        'Измерено по разметке (train): формы клеток и ядер (радиальная функция по срезам и её спектр), размеры, ядра на клетку, '
-        'смещение ядер, упаковка (доля клеток, зазоры, направления к соседям, кластеры, плотность), цвета объектов, '
-        'текстура, размытие, шум, мембраны, профиль по глубине.',
+        'Measured on the annotation (train): shapes of cells and nuclei (radial function per slice and its spectrum), sizes, '
+        'nuclei per cell, nucleus offsets, packing (cell share, gaps, directions to neighbours, clusters, density), object '
+        'colours, texture, blur, noise, membranes, depth profile.',
         '',
-        f'Принято без измерений (разметки ядрышек нет): ядрышек на ядро 1 + Пуассон({n["count_mean"]}), не больше {n["count_max"]}; '
-        f'экв. радиус {n["radius_ratio"][0]}–{n["radius_ratio"][1]} радиуса ядра; вытянутость {n["elongation"][0]}–{n["elongation"][1]}; '
-        f'яркость {n["darkness"][0]}–{n["darkness"][1]} яркости ядра; отступ от края ядра {n["margin"]} px. '
-        'Ядро целиком внутри своей клетки, ядрышко — внутри своего ядра (в разметке '
-        f'{profile.summary["hierarchy"]["outside_share_voxels"]:.1%} вокселей ядер лежат вне своей клетки).'])
+        f'Assumed without measurement (no nucleolus annotation): nucleoli per nucleus 1 + Poisson({n["count_mean"]}), at most {n["count_max"]}; '
+        f'equivalent radius {n["radius_ratio"][0]}–{n["radius_ratio"][1]} of the nucleus radius; elongation {n["elongation"][0]}–{n["elongation"][1]}; '
+        f'brightness {n["darkness"][0]}–{n["darkness"][1]} of the nucleus brightness; margin from the nucleus border {n["margin"]} px. '
+        'A nucleus lies entirely inside its cell, a nucleolus inside its nucleus (in the annotation '
+        f'{profile.summary["hierarchy"]["outside_share_voxels"]:.1%} of the nucleus voxels lie outside their cell).'])
 
 
 def run_preview(stats_path, profile_name, path, n=3, shape=None, seed=0, appearance='realistic', noise=0.02, max_overlap=0.3,
@@ -1289,13 +1289,13 @@ def run_preview(stats_path, profile_name, path, n=3, shape=None, seed=0, appeara
     volumes = [make_volume(profile, shape, np.random.default_rng([seed, 7, i]), appearance, noise, looks, **packing) for i in range(n)]
     print(f'{len(volumes)} volumes in {time.time() - t0:.0f} s', flush=True)
     reals = real_windows(profile_name, shape)
-    preview(profile, volumes, path, [(f'реальные (train), доля клеток {r["share"]:.2f}', r) for r in reals])
+    preview(profile, volumes, path, [(f'real (train), cell share {r["share"]:.2f}', r) for r in reals])
     if looks:
         Path(path).with_suffix('.json').write_text(json.dumps({profile.volumes[vi]['name']: l.params() for vi, l in looks.items()}, indent=2))
     if compare:
         summary, big = compared(profile, shape, seed, compare, appearance, noise, looks, packing)
         table = comparison_table(stats['datasets'][profile_name], summary)
-        Path(path).with_suffix('.md').write_text(f'# Превью синтетики {profile_name}\n\nСинтетика: {compare} объёмов {list(big)}.\n\n{table}\n')
+        Path(path).with_suffix('.md').write_text(f'# Synthetic preview {profile_name}\n\nSynthetic: {compare} volumes {list(big)}.\n\n{table}\n')
         print(table)
 
 

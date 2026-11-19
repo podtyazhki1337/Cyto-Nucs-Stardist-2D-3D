@@ -329,7 +329,7 @@ class CytoNucsConfig:
             'memory_limit': None,
             'visible_devices': None
         })
-        # Проверка и исправление anisotropy
+        # anisotropy checked and completed
         if len(self.anisotropy) != self.ndim:
             print(f"⚠️  Fixing anisotropy: {self.anisotropy} -> {(1,) * self.ndim}")
             self.anisotropy = (1,) * self.ndim
@@ -411,26 +411,22 @@ class CytoNucsConfig:
         self.save_pred_tiff = save_pred_tiff
         self.eval_splits=eval_splits
         # ============================================================
-        # ЛУЧИ
+        # RAYS
         # ============================================================
-        # Канон StarDist 3D (examples/3D/2_training.ipynb):
-        #     extents    = calculate_extents(Y)            # медиана bbox объектов
-        #     anisotropy = tuple(np.max(extents)/extents)  # АСПЕКТ ОБЪЕКТА
+        # StarDist 3D (examples/3D/2_training.ipynb):
+        #     extents    = calculate_extents(Y)            # median bounding box of the objects
+        #     anisotropy = tuple(np.max(extents)/extents)  # aspect of the objects
         #     grid       = tuple(1 if a > 1.5 else 2 for a in anisotropy)
         #     rays       = Rays_GoldenSpiral(n_rays, anisotropy=anisotropy)
-        # То есть anisotropy у StarDist — форма объектов в вокселях, а НЕ
-        # физический шаг между срезами.
+        # So StarDist's anisotropy is the shape of the objects in voxels, not the physical slice spacing.
         #
-        # Rays_GoldenSpiral делает verts = dir/anisotropy, поэтому она
-        # распределяет направления: сколько лучей ляжет в плоскость объекта, а
-        # сколько упрётся в его верх и низ. При физической [5,1,1] на плоской
-        # 2D-культуре контур цитоплазмы (полутолщина ~2.5 вокселя, радиус
-        # ~100 px) задают 12 лучей из 96 — остальные 84 меряют толщину слоя и
-        # забирают 2/3 MAE. При анизотропии, равной аспекту (100/2.5 = 40),
-        # контур задают 68 лучей и все длины лежат в одном масштабе.
+        # Rays_GoldenSpiral sets verts = dir / anisotropy, i.e. it decides how many rays lie in the plane of an object
+        # and how many hit its top and bottom. With the physical [5, 1, 1] on a flat culture, 12 of 96 rays would
+        # trace the contour of a cell (half-thickness ~2.5 voxels, radius ~100 px) and the other 84 its thickness;
+        # with the anisotropy equal to the aspect (100 / 2.5 = 40) 68 rays trace the contour.
         #
-        # Ядро и цитоплазма — объекты разной формы, наборы лучей раздельные.
-        # n_rays общий, поэтому формы выходов голов не меняются.
+        # Nuclei and cells have different shapes, so the two levels have separate ray sets. n_rays is shared, so
+        # the output shapes of the heads are the same.
         self.rays_anisotropy_nucleus = self._coerce_aniso(
             kwargs.get('rays_anisotropy_nucleus'), self.anisotropy)
         self.rays_anisotropy_cytoplasm = self._coerce_aniso(
@@ -770,15 +766,15 @@ class CytoNucsConfig:
             raise ValueError('Nucleus Z training requires ndim=3')
         if self.nucleus_z_pair_prob and self.prompts_per_crop < 2:
             raise ValueError('nucleus_z_pair_prob requires prompts_per_crop >= 2')
-        if self.refinement_mode not in ('mask', 'polyhedron', 'legacy_union'):
+        if self.refinement_mode not in ('mask', 'polyhedron'):
             raise ValueError(f'Unknown refinement_mode: {self.refinement_mode!r}')
 
     # ============================================================
-    # === ЛУЧИ И АНИЗОТРОПИЯ ===
+    # === RAYS AND ANISOTROPY ===
     # ============================================================
 
     def _coerce_aniso(self, value, fallback):
-        """Приводит анизотропию к кортежу длины ndim. None и мусор -> fallback."""
+        """The anisotropy as a tuple of length ndim; None or an invalid value -> fallback."""
         if value is None:
             return tuple(float(v) for v in fallback)
         try:
@@ -790,31 +786,29 @@ class CytoNucsConfig:
         return a
 
     def _poolable_axes(self):
-        """Оси, по которым декодер реально делает pooling.
+        """Axes on which the decoder pools.
 
-        Модель считает pool_size как `2 if a < 2*min(a) else 1` по
-        self.anisotropy. Grid по НЕпулящейся оси обязан оставаться 1: иначе GT
-        прорежен, а выход сети нет, и формы разъедутся. Дублируем правило
-        здесь, чтобы канонический grid не сломал сеть."""
+        The model sets pool_size = `2 if a < 2*min(a) else 1` from self.anisotropy. The grid of an axis without
+        pooling must stay 1 (else the targets would be subsampled and the network output not); the rule is repeated
+        here so that the StarDist grid fits the network."""
         a = tuple(float(v) for v in self.anisotropy)
         m = min(a)
         return tuple(v < 2.0 * m for v in a)
 
     def canonical_grid(self, aniso):
-        """grid = tuple(1 if a > 1.5 else 2 for a in anisotropy) — канон
-        StarDist, с поправкой на непулящиеся оси сети."""
+        """grid = tuple(1 if a > 1.5 else 2 for a in anisotropy), as StarDist, with 1 on the axes the network does
+        not pool."""
         ok = self._poolable_axes()
         return tuple(2 if (a <= 1.5 and ok[i]) else 1
                      for i, a in enumerate(aniso))
 
     def _build_rays(self):
-        """Строит наборы лучей из текущих rays_anisotropy_*.
-        Вызывается из __init__ и повторно из set_anisotropy_from_labels."""
+        """Ray sets from the current rays_anisotropy_* (called from __init__ and again from
+        set_anisotropy_from_labels)."""
         n_rays = int(self.n_rays)
 
         if self.ndim == 2:
-            # 2D: направления равномерно по окружности, анизотропия не нужна.
-            # Первый луч вверх, как в StarDist 2D.
+            # 2D: directions evenly spaced on the circle, no anisotropy; the first ray points up, as in StarDist 2D.
             phi = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
             vertices_2d = np.stack([np.sin(phi), -np.cos(phi)],
                                    axis=-1).astype(np.float32)
@@ -842,43 +836,31 @@ class CytoNucsConfig:
             n_rays, anisotropy=self.rays_anisotropy_nucleus)
         self.rays_cytoplasm = Rays_GoldenSpiral(
             n_rays, anisotropy=self.rays_anisotropy_cytoplasm)
-        # Обратная совместимость: старый код, читающий config.rays, получает
-        # набор ЯДРА. Наборы больше не совпадают — все новые обращения должны
-        # брать rays_nucleus / rays_cytoplasm явно.
+        # config.rays is the nucleus set; code that needs a level's rays reads rays_nucleus / rays_cytoplasm.
         self.rays = self.rays_nucleus
 
-        print(f"✅ 3D rays: {n_rays} на голову, наборы РАЗНЫЕ")
+        print(f"✅ 3D rays: {n_rays} per head, one set per level")
         print(f"   nucleus   anisotropy={tuple(round(v, 1) for v in self.rays_anisotropy_nucleus)}")
         print(f"   cytoplasm anisotropy={tuple(round(v, 1) for v in self.rays_anisotropy_cytoplasm)}")
 
     def set_anisotropy_from_labels(self, nucleus_labels, cytoplasm_labels,
                                    update_grid=True):
-        """Замер геометрии по GT: анизотропия -> лучи -> гриды -> масштаб.
+        """Geometry measured on the ground truth: anisotropy -> rays -> grids -> object scale.
 
-        Канон (examples/3D/2_training.ipynb):
+        As StarDist (examples/3D/2_training.ipynb):
             extents    = calculate_extents(Y)
             anisotropy = tuple(np.max(extents)/extents)
             grid       = tuple(1 if a > 1.5 else 2 for a in anisotropy)
 
-        ОТЛИЧИЕ ОТ ПРЕЖНЕЙ ВЕРСИИ — фильтр обрезки ПО ОСЯМ, а не по объекту
-        целиком. Прежде объект попадал в замер, только если не касался грани
-        НИ ПО ОДНОЙ оси; на тайлах 16x448x448 это оставляло единицы объектов
-        из тысяч, срабатывал фолбэк «по ВСЕМ», и обрезка входила в замер
-        асимметрично: по Z тайл в 16 срезов режет каждую клетку, по XY 448 —
-        почти нет. Z-размер занижался, аспект раздувался (замерено 25 при
-        физических 5). Объект, срезанный по X, даёт корректный размер по Z —
-        поэтому решение принимается для каждой оси отдельно.
+        Objects cut by a tile face are left out per axis, not as a whole: an object cut along X still gives its true
+        size along Z. (On tiles of 16 x 448 x 448, a whole-object filter would keep a handful of objects, and the
+        16-slice Z extent would cut nearly every cell and shrink its Z size.)
 
-        Анизотропия ОКРУГЛЯЕТСЯ ДО ЦЕЛОГО: это аспект объекта в вокселях,
-        дробная точность в нём бессмысленна, а целое значение делает
-        geometry.json воспроизводимым между прогонами.
+        The anisotropy is rounded to an integer: it is the aspect of the objects in voxels, and an integer keeps
+        geometry.json reproducible between runs.
 
-        median_max_dist считается как половина наибольшего измеренного
-        размера, без box-аппроксимации лучей: прежняя формула
-        t_k = min_a(h_a/|v_ka|) меряла расстояние до границы ПАРАЛЛЕЛЕПИПЕДА
-        и завышала масштаб (107 против замеренных по star_dist3D 87).
-        dist_bias_init не выставляется вовсе — канонический StarDist обходится
-        нулевым bias.
+        median_max_dist is half the largest measured extent. dist_bias_init is not set (StarDist uses a zero
+        bias).
         """
         # A level the run does not have (model.levels) has no objects: it takes the geometry of
         # the level the run has, so grids, rays and scales stay defined and equal.
@@ -891,13 +873,13 @@ class CytoNucsConfig:
         if self.ndim != 3:
             # 2D: rays are isotropic and grids come from the config; only the object scale is measured.
             self._build_rays()
-            print("\n📐 Замер масштаба объектов по GT (2D):")
+            print("\n📐 Object scale measured on the ground truth (2D):")
             for name, lbls in (('nucleus', nucleus_labels), ('cytoplasm', cytoplasm_labels)):
                 res = _measure(lbls)
                 if res is not None:
                     setattr(self, f'median_max_dist_{name}', float(int(round(float(np.linalg.norm(res[1])) / 2.0))))
                     setattr(self, f'large_extent_{name}', res[2])
-                    print(f"   {name}: медианный bbox {tuple(int(round(v)) for v in res[1])} -> median_max_dist "
+                    print(f"   {name}: median bounding box {tuple(int(round(v)) for v in res[1])} -> median_max_dist "
                           f"{getattr(self, f'median_max_dist_{name}'):.0f} px")
             self._write_geometry()
             return self.rays_anisotropy_nucleus, self.rays_anisotropy_cytoplasm
@@ -906,7 +888,7 @@ class CytoNucsConfig:
         base_grid = tuple(int(v) for v in self.grid)
         measured_ext = {}
 
-        print("\n📐 Замер геометрии по GT (фильтр обрезки по осям):")
+        print("\n📐 Geometry measured on the ground truth (cut objects left out per axis):")
         for name, lbls in (('nucleus', nucleus_labels),
                            ('cytoplasm', cytoplasm_labels)):
             key = f'rays_anisotropy_{name}'
@@ -914,43 +896,41 @@ class CytoNucsConfig:
             if res is not None:
                 setattr(self, f'large_extent_{name}', res[2])
             if getattr(self, key) != base:
-                print(f"   {key}: задана в конфиге "
-                      f"{tuple(getattr(self, key))}, замер не применяется")
+                print(f"   {key}: set in the configuration "
+                      f"{tuple(getattr(self, key))}, measurement not used")
                 a = getattr(self, key)
                 if res is not None:
                     measured_ext[name] = res[1]
             elif res is None:
-                print(f"   {key}: объектов не найдено, оставляю {base}")
+                print(f"   {key}: no objects found, keeping {base}")
                 a = getattr(self, key)
             else:
                 a, ext = res[:2]
                 measured_ext[name] = ext
                 setattr(self, key, a)
-                print(f"   {name}: медианный bbox "
+                print(f"   {name}: median bounding box "
                       f"{tuple(int(round(v)) for v in ext)} -> anisotropy {a}")
 
             if update_grid:
                 cur = tuple(int(v) for v in getattr(self, f'{name}_grid'))
                 if cur != base_grid:
-                    print(f"   {name}_grid: {cur} (из конфига, замер не применён)")
+                    print(f"   {name}_grid: {cur} (from the configuration, measurement not used)")
                 else:
                     g = self.canonical_grid(a)
                     setattr(self, f'{name}_grid', g)
-                    print(f"   {name}_grid: {g} (канон, с поправкой на pooling)")
+                    print(f"   {name}_grid: {g} (StarDist rule, fitted to the pooling)")
 
         self._build_rays()
 
-        # --- МАСШТАБ ОБЪЕКТА ---
+        # --- OBJECT SCALE ---
         for name in ('nucleus', 'cytoplasm'):
             ext = measured_ext.get(name)
             if ext is None:
                 continue
-            # Половина наибольшего измеренного размера — это и есть длина
-            # самого длинного луча из центра. Идёт в r_hint промптов,
-            # в нормировку _geo_prior и в окно preselection на инференсе.
+            # Half the largest measured extent: the longest ray from the centre. Used for the prompt radius hint,
+            # the normalisation of _geo_prior and the preselection window at inference.
             setattr(self, f'median_max_dist_{name}',
                     float(int(round(float(np.linalg.norm(ext)) / 2.0))))
-            # Канон: нулевой bias у dist-головы.
 
             print(f"   {name}: median_max_dist -> "
                   f"{getattr(self, f'median_max_dist_{name}'):.0f} px")
@@ -967,8 +947,8 @@ class CytoNucsConfig:
         if lbls is None or len(lbls) == 0:
             return None
 
-        ext_in = [[] for _ in range(nd)]  # не срезан по этой оси
-        ext_all = [[] for _ in range(nd)]  # все
+        ext_in = [[] for _ in range(nd)]  # not cut along this axis
+        ext_all = [[] for _ in range(nd)]  # all
         for lbl in lbls:
             lbl = np.asarray(lbl)
             if lbl.ndim != nd or lbl.max() == 0:
@@ -991,15 +971,15 @@ class CytoNucsConfig:
             large.append(int(np.ceil(np.percentile(ext_in[a] if len(ext_in[a]) >= 30 else ext_all[a], 99))))
             if len(ext_in[a]) >= 30:
                 ext.append(float(np.median(ext_in[a])))
-                src.append(f"ось{a}: {len(ext_in[a])}/{len(ext_all[a])}")
+                src.append(f"axis {a}: {len(ext_in[a])}/{len(ext_all[a])}")
             else:
                 ext.append(float(np.median(ext_all[a])))
-                src.append(f"ось{a}: ВСЕ {len(ext_all[a])} (целых мало)")
+                src.append(f"axis {a}: all {len(ext_all[a])} (few uncut)")
         ext = np.asarray(ext, np.float64)
         if np.any(ext <= 0):
             return None
-        print(f"      замер {', '.join(src)}")
-        # Аспект объекта, ЦЕЛЫЙ, не меньше 1.
+        print(f"      measured on {', '.join(src)}")
+        # Aspect of the objects, an integer >= 1.
         aniso = tuple(max(1, int(round(float(np.max(ext) / e)))) for e in ext)
         return aniso, ext, large
 
@@ -1025,22 +1005,18 @@ class CytoNucsConfig:
                 'large_extent_cytoplasm': self.large_extent_cytoplasm,
                 'data_settings': self.data_settings,
             }, f, indent=2)
-        print(f"   💾 geometry.json сохранён: {p}")
+        print(f"   💾 geometry.json saved: {p}")
 
     # ============================================================
-    # === ЗАГРУЗКА ===
+    # === LOADING ===
     # ============================================================
 
     @classmethod
     def from_json(cls, json_path, checkpoint_path=None):
         """Load configuration from JSON file.
 
-        Плюс подхватывает geometry.json рядом с чекпоинтом, если он есть.
-        Без этого inference/optimize_thresholds строили лучи из ФИЗИЧЕСКОЙ
-        anisotropy, тогда как веса обучены под ЗАМЕРЕННУЮ (аспект объекта):
-        формы совпадают, n_rays тот же, ошибок нет — но dist интерпретируется
-        другим набором направлений, и полиэдры выходят чужой геометрии.
-        Файл пишет set_anisotropy_from_labels в конце обучающего замера.
+        Also reads geometry.json next to the checkpoint (written by set_anisotropy_from_labels at the start of
+        training), so that inference uses the ray sets the weights were trained with.
         """
         return cls.from_dict(read_config(json_path), checkpoint_path)
 
@@ -1073,8 +1049,7 @@ class CytoNucsConfig:
         inference_cfg = config_dict.get('inference', {})
         gpu_cfg = config_dict.get('gpu_config', {})
         evaluation_cfg = config_dict.get('evaluation', {})
-        # augmentation и data читались через getattr с дефолтами, но в params
-        # не попадали — zoom_range/intensity_range/pool_size молча игнорировались.
+        # augmentation and data settings go into params as well.
         augmentation_cfg = config_dict.get('augmentation', {})
         data_cfg = config_dict.get('data', {})
 
@@ -1105,13 +1080,13 @@ class CytoNucsConfig:
         # 'auto' inference settings: calibrated for the checkpoint (inference), the defaults while training.
         inference_cfg = resolve_auto_inference(inference_cfg, checkpoint_path or (
             inference_cfg.get('checkpoint_path') if config_dict.get('mode', 'train') != 'train' else None))
-        # Все inference-настройки кроме физического пути к чекпоинту.
+        # Every inference setting except the checkpoint path.
         for key, value in inference_cfg.items():
             if key == 'checkpoint_path':
                 continue
             params[key] = value
 
-        # --- ГЕОМЕТРИЯ ОБУЧЕНИЯ ---
+        # --- GEOMETRY OF THE TRAINING RUN ---
         geo_path = (Path(config_dict.get('output', {}).get('basedir', 'models')) /
                     config_dict.get('experiment', {}).get('name', 'model') /
                     'geometry.json')
@@ -1125,8 +1100,8 @@ class CytoNucsConfig:
             geo = json.loads(geo_load_path.read_text(encoding='utf-8'))
             if int(geo.get('n_rays', params.get('n_rays', 0))) != int(params.get('n_rays', 0)):
                 raise ValueError(
-                    f"n_rays в {geo_path} ({geo.get('n_rays')}) не совпадает с "
-                    f"конфигом ({params.get('n_rays')}) — веса и лучи от разных прогонов")
+                    f"n_rays in {geo_path} ({geo.get('n_rays')}) differs from the "
+                    f"configuration ({params.get('n_rays')}): weights and rays of different runs")
             for k in ('rays_anisotropy_nucleus', 'rays_anisotropy_cytoplasm',
                       'nucleus_grid', 'cytoplasm_grid',
                       'median_max_dist_nucleus', 'median_max_dist_cytoplasm',
@@ -1140,7 +1115,7 @@ class CytoNucsConfig:
                 if key != 'pool_size' and key not in section:
                     params[key] = value
                     data_settings.setdefault(key, value)
-            print(f"✅ Геометрия обучения подхвачена из {geo_load_path}")
+            print(f"✅ Geometry of the training run read from {geo_load_path}")
         elif checkpoint:
             raise FileNotFoundError(f'{geo_load_path} missing: cannot interpret checkpoint rays safely')
 
