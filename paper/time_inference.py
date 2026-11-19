@@ -270,7 +270,7 @@ def cellpose(split, limit, argv):
     import torch
     from cellpose import models as cp_models
     info = json.loads((m.OUT / 'training.json').read_text())['levels']
-    chosen = {level: (cp_models.CellposeModel(gpu=torch.cuda.is_available(), pretrained_model=spec['weights']), spec['diameter'],
+    chosen = {level: (cp_models.CellposeModel(gpu=torch.cuda.is_available(), pretrained_model=str(spec['weights'] if Path(spec['weights']).is_absolute() else m.OUT / spec['weights'])), spec['diameter'],
                       spec['cellprob_threshold'], spec['flow_threshold']) for level, spec in info.items()}
     names = spread(m.names(split), limit)
 
@@ -288,7 +288,7 @@ def cellpose_blocks(split, limit, argv):
     import torch
     from cellpose import models as cp_models
     info = json.loads((m.OUT / 'training.json').read_text())['levels']
-    chosen = {level: (cp_models.CellposeModel(gpu=torch.cuda.is_available(), pretrained_model=spec['weights']), spec['diameter'],
+    chosen = {level: (cp_models.CellposeModel(gpu=torch.cuda.is_available(), pretrained_model=str(spec['weights'] if Path(spec['weights']).is_absolute() else m.OUT / spec['weights'])), spec['diameter'],
                       (spec['mode'], spec['stitch_threshold'], spec['cellprob_threshold'])) for level, spec in info.items()}
     image = m.read_volume()
     windows = list(m.block_windows(m.manifest(), split, m.args.margin))

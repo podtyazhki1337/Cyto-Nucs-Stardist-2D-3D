@@ -90,7 +90,7 @@ def method(name, gpu, argv):
         info = json.loads((m.OUT / 'training.json').read_text())
         chosen = {level: ((cp_models.Cellpose(gpu=torch.cuda.is_available(), model_type=spec['pretrained'])
                            if info.get('pretrained_only') else
-                           cp_models.CellposeModel(gpu=torch.cuda.is_available(), pretrained_model=spec['weights'])),
+                           cp_models.CellposeModel(gpu=torch.cuda.is_available(), pretrained_model=str(spec['weights'] if Path(spec['weights']).is_absolute() else m.OUT / spec['weights']))),
                           spec['diameter']) for level, spec in info['levels'].items()}
         settings = {level: {f'c{c:+.1f}_f{f:.1f}': [c, f] for c in m.CELLPROB for f in m.FLOW} for level in chosen}
 
