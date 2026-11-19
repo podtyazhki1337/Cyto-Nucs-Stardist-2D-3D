@@ -64,12 +64,14 @@ Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1
 
 ## Quick start
 
-Pretrained models of the paper (weights, calibrated inference settings and `geometry.json` per model): [Hugging Face
-link]. Download a model folder, e.g. `runs/helacytonuc_e7_clean/`, and segment a folder of images:
+Pretrained models of the paper are on Hugging Face: [Podtyazhki1337/cytonucs](https://huggingface.co/Podtyazhki1337/cytonucs)
+(TissueNet, HeLaCytoNuc, BBBC020, KiTS23 and the three-level synthetic model; the model card lists their inputs and
+scores). Download one and segment a folder of images:
 
 ```bash
-python predict.py --config configs/helacytonuc_e7_clean.json \
-    --weights runs/helacytonuc_e7_clean/weights_best.weights.h5 --input my_images/ --output my_labels/
+hf download Podtyazhki1337/cytonucs --include "helacytonuc_e7_clean/*" --local-dir models
+python predict.py --config models/helacytonuc_e7_clean/config.json \
+    --weights models/helacytonuc_e7_clean/weights_best.weights.h5 --input my_images/ --output my_labels/
 ```
 
 This writes `my_labels/nucleus/<name>` and `my_labels/cytoplasm/<name>` (instance labels) and
