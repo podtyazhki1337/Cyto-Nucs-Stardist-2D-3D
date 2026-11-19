@@ -233,7 +233,7 @@ def score(config_path, weights, split='test', limit=0, memory_limit=None, predic
                     (Path(predictions) / 'parents').mkdir(parents=True, exist_ok=True)
                     (Path(predictions) / 'parents' / (Path(name).stem + '.json')).write_text(
                         json.dumps({int(k): int(v) for k, v in pred['parents'][levels[0]].items()}))
-                if pred.get('semantic'):                                 # per-object semantic scores (semantic_gate.py)
+                if pred.get('semantic'):                                 # per-object semantic scores (paper/semantic_gate.py)
                     (Path(predictions) / 'semantic').mkdir(parents=True, exist_ok=True)
                     (Path(predictions) / 'semantic' / (Path(name).stem + '.json')).write_text(json.dumps(pred['semantic']))
     result = dict(split=split, volumes=len(names), seconds_per_volume=float(np.mean([r['seconds'] for r in records])),

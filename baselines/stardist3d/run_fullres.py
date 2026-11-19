@@ -29,7 +29,7 @@ from types import SimpleNamespace
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument('--target', choices=('nucleus', 'cytoplasm'))
-parser.add_argument('--data', default='/storage02/miroslavm/data/Cytonucs_Emese_Hela/patches_split_hela')
+parser.add_argument('--data', default='data/Cytonucs_Emese_Hela/patches_split_hela')
 parser.add_argument('--gpu', default='')
 parser.add_argument('--epochs', type=int, default=300)
 parser.add_argument('--steps', type=int, default=100)
@@ -45,7 +45,7 @@ parser.add_argument('--patch', type=int, nargs=3, default=[16, 320, 320], help='
 parser.add_argument('--grid', type=int, nargs=3, default=[1, 4, 4], help='StarDist grid ZYX ((1, 2, 2) for half resolution)')
 parser.add_argument('--backbone', default='resnet', choices=('resnet', 'unet'),
                     help='resnet: the 3d-oids recipe (field of view 17x49x49 px); unet: depth 3, pool (2,2,2) (32x128x128 px)')
-parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/stardist',
+parser.add_argument('--basedir', default='runs/stardist',
                     help='where the models are written and read')
 parser.add_argument('--unknown-as-background', action='store_true',
                     help='masks with training.unknown_label 65535 (sparse annotation): StarDist cannot ignore voxels, so they become background')

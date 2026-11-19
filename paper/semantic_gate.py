@@ -6,13 +6,16 @@ it and without the gate (score_hierarchy.score_image, links by overlap), and the
 inference.semantic_min_<role> of the config.
 
 Usage:
-  python semantic_gate.py --data DATASET --level mass --select PRED_DIR:val --select-names VAL16/val/images \\
+  python paper/semantic_gate.py --data DATASET --level mass --select PRED_DIR:val --select-names VAL16/val/images \\
       --apply PRED_TEST:test PRED_VAL73:val --output FILE
 """
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # the repository root: the CytoNucs modules
 
 import numpy as np
 

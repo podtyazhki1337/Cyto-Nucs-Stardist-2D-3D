@@ -40,8 +40,8 @@ import numpy as np
 import tifffile
 from scipy import ndimage as ndi
 
-EMESE = Path('/storage02/miroslavm/data/Cytonucs_Emese_Hela')
-HOLLANDI = Path('/storage02/miroslavm/data/Cytonucs_Hollandi')
+EMESE = Path('data/Cytonucs_Emese_Hela')
+HOLLANDI = Path('data/Cytonucs_Hollandi')
 HELA_REGIONS = EMESE / 'patches_split_hela_xy2' / 'train_regions'
 EA_MANIFEST = EMESE / 'patches_split' / 'split_manifest.json'
 HOLLANDI_HELD_OUT = ('Image0019.tiff', 'Image0036.tiff')

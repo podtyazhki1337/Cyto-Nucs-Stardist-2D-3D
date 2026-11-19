@@ -478,7 +478,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     residual: {head: dict(coords, probs, dists)} peaks suppressed by the proposal window;
     prompted only where the first assembly left the voxel free, assembled after all
     first-pass candidates (object assembly modes only).
-    model.stage_seconds, when a dict (stage profiling, baselines/time_inference.py), gets the seconds of the prompt
+    model.stage_seconds, when a dict (stage profiling, paper/time_inference.py), gets the seconds of the prompt
     refinement and of the assembly with the links added.
     """
     import time
@@ -1608,7 +1608,7 @@ class CytoNucsPredictor:
         # and stored with the checkpoint. Calibration passes (full validation,
         # threshold search) set calibrating=True and see ungated candidates.
         # inference.quality_gates_override replaces some or all of them (e.g. gates chosen for AP alone by
-        # recalibrate_gates.py from the full validation of the checkpoint).
+        # paper/recalibrate_gates.py from the full validation of the checkpoint).
         override = getattr(config, 'quality_gates_override', None)
         self.quality_gates = (dict(getattr(model, 'loaded_quality_gates', None) or {}, **override) if override
                               else getattr(model, 'loaded_quality_gates', None)) if config.mask_quality_min == 'auto' else None

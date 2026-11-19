@@ -14,14 +14,17 @@ out-of-fold probabilities (folds by image) for the AP of the level; then it is a
 both are scored with score_hierarchy.score_image (links by overlap before and after, so the JTPRs compare).
 
 Usage:
-  python pair_decisions.py --data DATASET_DIR --level cytoplasm --train val=PRED_FOLDER [--train ...]
+  python paper/pair_decisions.py --data DATASET_DIR --level cytoplasm --train val=PRED_FOLDER [--train ...]
                            --test test=PRED_FOLDER [--output-predictions FOLDER] [--output FILE]
 (PRED_FOLDER holds <level>/<name>; several --train sets pool their pairs, with sizes relative to each image.)
 """
 import argparse
 import json
 from multiprocessing import Pool
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # the repository root: the CytoNucs modules
 
 import numpy as np
 

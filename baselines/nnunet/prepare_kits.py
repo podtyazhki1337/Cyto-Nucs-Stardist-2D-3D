@@ -24,8 +24,8 @@ import tifffile
 from scipy import ndimage as ndi
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument('--data', default='/storage02/miroslavm/data/KiTS23/cytonucs_3x078')
-parser.add_argument('--kits', default='/storage02/miroslavm/data/KiTS23/kits23', help='kits23 git repository')
+parser.add_argument('--data', default='data/KiTS23/cytonucs_3x078')
+parser.add_argument('--kits', default='data/KiTS23/kits23', help='kits23 git repository')
 parser.add_argument('--output', required=True)
 parser.add_argument('--preprocessed', required=True, help='nnU-Net preprocessed folder of the dataset (splits_final.json)')
 args = parser.parse_args()

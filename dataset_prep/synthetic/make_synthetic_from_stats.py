@@ -61,7 +61,7 @@ training.train_region_crops to false.
 
 Usage:
   python dataset_prep/synthetic/make_synthetic_from_stats.py --stats DIR/gt_statistics.json --profile hela \
-      --output /storage02/miroslavm/data/Cytonucs_Synthetic/NAME [--counts 60 8 8] [--shape 32 256 256]
+      --output data/Cytonucs_Synthetic/NAME [--counts 60 8 8] [--shape 32 256 256]
   python dataset_prep/synthetic/make_synthetic_from_stats.py ... --preview PNG     (a few volumes and a comparison)
 """
 import argparse

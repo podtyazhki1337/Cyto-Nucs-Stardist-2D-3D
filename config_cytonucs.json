@@ -1,10 +1,10 @@
 {
   "mode": "train",
   "experiment": {
-    "name": "cytonucs_emese_HK_3_stardist_3d_patches_fixes_v1"
+    "name": "my_run"
   },
   "data": {
-    "dataset_dir": "/storage02/miroslavm/data/Cytonucs_Emese_Hela/patches/preprocessed/",
+    "dataset_dir": "data/my_dataset",
     "repool_freq": 10
   },
   "model": {
@@ -53,7 +53,7 @@
     "mask_prompt_start_epoch": 20
   },
   "inference": {
-    "checkpoint_path": "/storage02/miroslavm/Multi-Nuclear-Stardist-2D-3D/models/cytonucs_emese_HK_3_stardist_3d_patches_fixes_v1/weights_best.weights.h5",
+    "checkpoint_path": "runs/my_run/weights_best.weights.h5",
     "refinement_mode": "mask",
     "refine_feature_cache_windows": 1,
     "semantic_scores": false,
@@ -124,6 +124,6 @@
     "visible_devices": "0"
   },
   "output": {
-    "basedir": "models"
+    "basedir": "runs"
   }
 }

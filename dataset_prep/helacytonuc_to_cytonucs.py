@@ -10,8 +10,8 @@ the test masks were drawn by hand; the CellProfiler masks of the test images are
     StarDist / HydraStarDist thresholds; all of them in val_all); test (manual masks); test_cellprofiler.
 
 Usage:
-  python dataset_prep/helacytonuc_to_cytonucs.py --extracted /storage02/miroslavm/data/HeLaCytoNuc/extracted \\
-      --output /storage02/miroslavm/data/HeLaCytoNuc/cytonucs [--val-count 128] [--seed 0]
+  python dataset_prep/helacytonuc_to_cytonucs.py --extracted data/HeLaCytoNuc/extracted \\
+      --output data/HeLaCytoNuc/cytonucs [--val-count 128] [--seed 0]
 Cite De, Urbanski, Thangamani, Wyrzykowska, Yakimovich, HeLaCytoNuc, RODARE 2024.
 """
 import argparse

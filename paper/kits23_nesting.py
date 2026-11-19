@@ -10,7 +10,7 @@ mass is a tumour when its number is at most the count of connected tumours (26-c
 segmentation, read from the git history of the kits23 repository as baselines/nnunet/prepare_kits.py does.
 
 Writes <output>/masses.csv, kidneys.csv and summary.json.
-Usage: python kits23_nesting.py --data DIR --kits KITS23_REPO --output DIR [--workers 6]
+Usage: python paper/kits23_nesting.py --data DIR --kits KITS23_REPO --output DIR [--workers 6]
 """
 import argparse
 import csv
@@ -188,8 +188,8 @@ def summary(rows, kidney_rows):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--data', default='/storage02/miroslavm/data/KiTS23/cytonucs_3x078')
-    parser.add_argument('--kits', default='/storage02/miroslavm/data/KiTS23/kits23')
+    parser.add_argument('--data', default='data/KiTS23/cytonucs_3x078')
+    parser.add_argument('--kits', default='data/KiTS23/kits23')
     parser.add_argument('--output', required=True)
     parser.add_argument('--ring', type=float, default=5.0, help='width (mm) of the tissue rings around a mass')
     parser.add_argument('--workers', type=int, default=6)
