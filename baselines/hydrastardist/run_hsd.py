@@ -55,7 +55,7 @@ parser.add_argument('--like', help='CytoNucs config whose augmentation values ar
 parser.add_argument('--name', required=True)
 parser.add_argument('--seed', type=int, default=42, help='random seed of the run (42: the default of the code)')
 parser.add_argument('--wbr', action='store_true', help="HSD-WBR: the paper's within-boundary regularisation, lambda_3 = 1")
-parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/hydrastardist')
+parser.add_argument('--basedir', default='runs/hydrastardist')
 parser.add_argument('--score', action='store_true')
 parser.add_argument('--split', nargs='+', default=['test'])
 parser.add_argument('--predictions', help='with --score: folder for the predicted labels (<split>/<level>/<name>)')

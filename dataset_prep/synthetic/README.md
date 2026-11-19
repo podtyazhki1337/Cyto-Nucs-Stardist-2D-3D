@@ -31,7 +31,7 @@ the paths of the source data are the constants at the top of `measure_gt_statist
 ```bash
 python dataset_prep/synthetic/measure_gt_statistics.py --output STATS --datasets hela
 python dataset_prep/synthetic/make_synthetic_from_stats.py --stats STATS/gt_statistics.json --profile hela \
-    --output /storage02/miroslavm/data/Cytonucs_Synthetic/hela_v1 --counts 60 8 8 --shape 32 256 256 --seed 0
+    --output data/Cytonucs_Synthetic/hela_v1 --counts 60 8 8 --shape 32 256 256 --seed 0
 ```
 
 60 / 8 / 8 volumes of 32 × 256 × 256 voxels, appearance `realistic` (the default), seed 0. The partial-annotation

@@ -230,14 +230,12 @@ class CytoNucsDataGenerator(Sequence):
         self._cyto_rays = getattr(config, 'rays_cytoplasm', rays)
         self._nuc_aniso = getattr(config, 'rays_anisotropy_nucleus', config.anisotropy)
         self._cyto_aniso = getattr(config, 'rays_anisotropy_cytoplasm', config.anisotropy)
-        # Зум переносим в __getitem__ (по патчу, а не по полному тому).
-        # ndzoom на 17x1024x1024x3 стоил секунды и вызывался на каждый сэмпл.
+        # Zoom is applied in __getitem__ to the patch, not to the whole volume.
 
         # Load file lists
         def find_all_images(path):
-            """Находит все изображения в разных форматах"""
+            """All image files of the supported formats (any case of the extension)."""
             files = []
-            # КРИТИЧНО: добавить все варианты написания расширений
             for ext in ['*.tif', '*.tiff', '*.TIF', '*.TIFF', '*.png', '*.PNG', '*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
                 files.extend(list(path.glob(ext)))
             return sorted(set(files))
@@ -337,7 +335,7 @@ class CytoNucsDataGenerator(Sequence):
 
     def repool(self, seed=0):
         """Reload a random subset of data into memory.
-        Нормализация и координаты foreground считаются ЗДЕСЬ, один раз на том."""
+        Normalisation and foreground coordinates are computed here, once per volume."""
         print(f'Repooling (seed={seed})...')
 
         r_ = random.Random(seed)
@@ -351,7 +349,7 @@ class CytoNucsDataGenerator(Sequence):
             # Channels of the image files; a hierarchy adds its pair code in __getitem__.
             channels = int(getattr(self.config, 'n_image_channels', self.config.n_channel_in))
             img = read_model_image(self.image_files[idx], nd, channels)
-            # 3D RGB-стек сохранён как (Z, C, H, W) -> канал в конец (Z, H, W, C)
+            # 3D multichannel stack stored as (Z, C, H, W) -> channels last (Z, H, W, C)
             if nd == 3 and img.ndim == 4 and img.shape[-1] != channels and img.shape[1] == channels:
                 img = np.moveaxis(img, 1, -1)
             nucleus_mask, cytoplasm_mask = (
@@ -364,12 +362,8 @@ class CytoNucsDataGenerator(Sequence):
                 raise ValueError(f'{self.image_files[idx].name}: unknown_label in {self.subset} masks; '
                                  'validation and test masks must be complete')
 
-            # ПЕРЦЕНТИЛЬНАЯ НОРМАЛИЗАЦИЯ — ОДИН РАЗ НА ТОМ.
-            # Раньше normalize(1, 99.8) звался в __getitem__ по ПОЛНОМУ тому на
-            # каждый сэмпл каждого шага: np.percentile делает partition по всем
-            # ~10^8 элементам. Это и есть основной вклад в 50 с/батч.
-            # Статистика глобальная по тому и от кропа с аугментацией не
-            # зависит, поэтому кэшируется без изменения результата.
+            # Percentile normalisation, once per volume: the statistics are global to the volume and do not depend
+            # on the crop or its augmentation.
             if nd == 2 and img.ndim == 3 and img.shape[-1] in (3, 4):
                 img = normalize_percentiles(img, 1, 99.8, axis=(0, 1))
             else:
@@ -377,8 +371,7 @@ class CytoNucsDataGenerator(Sequence):
                                 axis=tuple(range(nd)))
             img = np.ascontiguousarray(img, dtype=np.float32)
 
-            # Координаты foreground — тоже один раз: np.argwhere по полному тому
-            # аллоцировал массив на каждый сэмпл.
+            # Foreground coordinates, also once per volume.
             seed_mask = nucleus_mask if nucleus_mask.max() > 0 else cytoplasm_mask
 
             from scipy.ndimage import maximum_filter
@@ -389,7 +382,7 @@ class CytoNucsDataGenerator(Sequence):
             _vi = np.where(_cover[_bs])
             fg_coords = np.stack([v + s.start for s, v in zip(_bs, _vi)],
                                  axis=1).astype(np.int32)
-            if len(fg_coords) == 0:  # фолбэк как в каноне
+            if len(fg_coords) == 0:  # fallback, as StarDist
                 fg_coords = np.argwhere(seed_mask > 0).astype(np.int32)
             # training.object_crop_shares: bounding-box centres of the objects of each level, for crops centred
             # on one object picked uniformly (a small cyst as often as a large tumour).
@@ -435,7 +428,7 @@ class CytoNucsDataGenerator(Sequence):
             })
 
         print(f'  Loaded {len(self.data_pool)} samples into pool '
-              f'(нормализовано и проиндексировано один раз)')
+              f'(normalised and indexed once)')
         self._pool_seed = seed
         counts = np.array([s['object_count'] for s in self.data_pool], np.float64)
         self._tile_weights = counts / counts.sum() if counts.sum() > 0 else None
@@ -596,35 +589,24 @@ class CytoNucsDataGenerator(Sequence):
 
     def __len__(self):
         """
-        Число батчей за эпоху.
-        При маленьком пуле (1-2 тома) деление на batch_size давало 1 батч из
-        1 элемента: срез indices[0:bs] из массива длиной 1. Поэтому
-        train_batch_size вообще ни на что не влиял, а трейнер крутил
-        steps_per_epoch шагов по одному и тому же батчу (batch_idx = step % 1).
-        Для train опираемся на steps_per_epoch — каждый вызов собирает свежий
-        батч случайными кропами; для val сохраняем детерминированный проход.
+        Batches per epoch: steps_per_epoch for training (every call draws a new batch of random crops, also from a
+        pool of one or two volumes); a deterministic pass for validation.
         """
         if self.subset == 'train':
             return max(1, int(getattr(self.config, 'train_steps_per_epoch', 1)))
         return max(1, len(self.data_pool))
 
     def __getitem__(self, idx):
-        """Кроп СНАЧАЛА, аугментация ПОТОМ — по патчу, а не по полному тому.
-        Изображение приходит из пула уже нормализованным.
+        """Crop first, then augment the patch (the image comes from the pool already normalised).
 
-        K ПРОМПТОВ УХОДЯТ В КАНАЛЫ ОДНОГО КРОПА, А НЕ В КОПИИ БАТЧА.
-        Прежняя схема размножала кроп bs раз, то есть платила ПОЛНЫМ форвардом
-        backbone за каждый промпт — именно это не влезало в память, из-за чего
-        bs=1 и рефайн видел один промпт на шаг ("валидных сэмплов: 1 / 1" в
-        логе). Рефайн стоит за stop_gradient по всем входам, поэтому backbone
-        считается один раз, а ветка применяется K раз общими весами.
+        The K prompts of a crop go into the channels of that crop, not into copies of the batch: the backbone runs
+        once and the refinement branch K times with shared weights.
 
-        K = train_batch_size, ровно как читает модель. Порядок каналов
-        [img..., prompt_nuc_0, prompt_cyto_0, prompt_nuc_1, ...] обязан
-        совпадать с Lambda-срезами в _build_model.
+        K = train_batch_size, as the model reads it. The channel order [img..., prompt_nuc_0, prompt_cyto_0,
+        prompt_nuc_1, ...] matches the Lambda slices of _build_model.
 
-        *_target складываются в батч K*B в порядке k*B + b — так же, как
-        модель склеивает K выходов рефайна.
+        The *_target arrays are stacked into a batch of K*B in the order k*B + b, as the model concatenates the K
+        refinement outputs.
         """
         bs = int(self.config.train_batch_size)
         nd = int(self.config.ndim)
@@ -633,8 +615,7 @@ class CytoNucsDataGenerator(Sequence):
         is_train = (self.subset == 'train')
         n_pr = max(1, int(getattr(self.config, 'prompts_per_crop', bs)))
 
-        # локальный rng: __getitem__ вызывается из НЕСКОЛЬКИХ потоков
-        # префетчера, глобальный np.random между ними шарится
+        # a local generator: __getitem__ runs in several prefetch threads, which would share the global np.random
         pick = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch if is_train else 0, int(idx)]))
         regions = getattr(self, 'region_pool', None) if is_train else None
         if regions:
@@ -666,8 +647,7 @@ class CytoNucsDataGenerator(Sequence):
         tk_c_k = [[] for _ in range(n_pr)]
 
         for _ci, i in enumerate(crop_indices):
-            # ДЕТЕРМИНИРОВАННЫЙ val: иначе каждая эпоха валидируется на другом
-            # кропе с другим промптом, и val_loss мерит дисперсию выборки.
+            # Deterministic validation: the same crops and prompts every epoch.
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch if is_train else 0, int(idx), int(_ci), 1]))
 
             sample = regions[i] if regions else self.data_pool[i]
@@ -676,8 +656,8 @@ class CytoNucsDataGenerator(Sequence):
             cyto_full = sample['cytoplasm_mask']
             spatial = img_full.shape[:nd]
 
-            # ZOOM выбираем ЗАРАНЕЕ, чтобы кропнуть ровно столько, сколько после
-            # масштабирования даст patch. Внутри аугментера зум отключён.
+            # The zoom is drawn first, so that the crop gives exactly one patch after scaling (the augmenter does not
+            # zoom).
             zr = getattr(self.config, 'zoom_range', (0.75, 1.35))
             f = 1.0
             if (is_train and self.augmenter is not None
@@ -715,7 +695,7 @@ class CytoNucsDataGenerator(Sequence):
                     else:
                         f, fz, need = 1.0, 1.0, [min(patch[a], spatial[a]) for a in range(nd)]
             else:
-                # центр кропа: с вероятностью p_fg на случайном объекте
+                # crop centre: on a random object with probability p_fg
                 p_fg = getattr(self.config, 'fg_crop_prob', 0.9)
                 center = None
                 fg = sample['fg_coords']
@@ -738,7 +718,7 @@ class CytoNucsDataGenerator(Sequence):
                     if sh <= p:
                         starts.append(0)
                     elif center is not None:
-                        # center — валидный ЦЕНТР патча (канон), не воксель объекта
+                        # center is a valid patch centre (as StarDist), not an object voxel
                         starts.append(max(0, min(int(center[a]) - p // 2, sh - p)))
                     else:
                         starts.append(int(rng.integers(0, sh - p + 1)))
@@ -768,7 +748,7 @@ class CytoNucsDataGenerator(Sequence):
             if unknown['cytoplasm'] is not None:
                 cytoplasm_mask = with_unknown(cytoplasm_mask, unknown['cytoplasm'])
 
-            # ZOOM по патчу
+            # zoom of the patch
             if f != 1.0 or fz != 1.0:
                 from scipy.ndimage import zoom as ndzoom
                 zf = [1.0] * nd
@@ -791,7 +771,7 @@ class CytoNucsDataGenerator(Sequence):
                 nucleus_mask = warp_yx(nucleus_mask, dy, dx, 0, nd)
                 cytoplasm_mask = warp_yx(cytoplasm_mask, dy, dx, 0, nd)
 
-            # Аугментация (флипы, транспоз, интенсивность) — уже по патчу
+            # augmentation of the patch (flips, transposition, intensity)
             if self.augmenter is not None:
                 if self.augmenter in (cytonucs_augmenter_3d, cytonucs_augmenter_2d):
                     img, nucleus_mask, cytoplasm_mask = self.augmenter(
@@ -804,7 +784,7 @@ class CytoNucsDataGenerator(Sequence):
             if unknown['cytoplasm'] is not None:
                 cytoplasm_mask, unknown['cytoplasm'] = without_unknown(cytoplasm_mask, dtypes[1])
 
-            # Центральный кроп / паддинг ровно до patch
+            # centre crop / padding to the patch size
             cur = img.shape[:nd]
             # Axes whose patch faces cut objects that continue in the source volume.
             # A face equal to the volume face (e.g. full Z) truncates GT and image
@@ -836,7 +816,7 @@ class CytoNucsDataGenerator(Sequence):
                 cytoplasm_mask = np.pad(cytoplasm_mask, pw, mode='constant')
                 unknown = {role: None if u is None else np.pad(u, pw, mode='constant') for role, u in unknown.items()}
 
-            # StarDist GT зависит ТОЛЬКО от масок -> считается один раз на кроп
+            # The StarDist targets depend on the masks only: computed once per crop
             _pn, _dn = compute_stardist_gt(nucleus_mask, self.config,
                                            self._nuc_grid, rays=self._nuc_rays,
                                            aniso=self._nuc_aniso,
@@ -855,11 +835,10 @@ class CytoNucsDataGenerator(Sequence):
                 img_ch_base = np.concatenate([img_ch_base, code], axis=-1)
 
             def _prompt_at(shape, c, extent, rng_=rng, augment=True, owner=None):
-                # PROMPT AUGMENTATION. На обучении промпт строится по ТОЧНОМУ
-                # центроиду и bbox GT-инстанса, а на инференсе — по пику NMS с
-                # сигмой из ПРЕДСКАЗАННЫХ лучей. Рефайн, обученный на идеальном
-                # промпте, к этому сдвигу не готов. Шум задаётся в долях размера
-                # объекта, поэтому не зависит от масштаба данных.
+                # PROMPT AUGMENTATION. In training a prompt is built from the exact centroid and bounding box of a
+                # ground-truth object, at inference from a probability peak with a sigma from the predicted rays; the
+                # noise prepares the refinement for that shift. It is a fraction of the object size, so it does not
+                # depend on the scale of the data.
                 ext = np.asarray(extent, np.float32)
                 shift = float(getattr(self.config, 'prompt_center_jitter', 0.1))
                 sscale = float(getattr(self.config, 'prompt_sigma_jitter', 0.1))
@@ -885,8 +864,8 @@ class CytoNucsDataGenerator(Sequence):
                 d2 = sum(((g - c[a]) / sig[a]) ** 2 for a, g in enumerate(grids))
                 return np.exp(-0.5 * d2).astype(np.float32)
 
-            # Повторы одной клетки управляются repeat_cell_prompt_prob и дают
-            # пары разных промптов для same-instance consistency.
+            # Repeated prompts on one cell (repeat_cell_prompt_prob) give pairs of prompts for the same-instance
+            # consistency term.
             _asg = sample.get('assignments') or {}
             cyto_ids = np.unique(cytoplasm_mask)
             cyto_ids = list(cyto_ids[cyto_ids > 0])
@@ -915,10 +894,10 @@ class CytoNucsDataGenerator(Sequence):
                     chosen_cyto = 0
 
                 if chosen_cyto:
-                    # ядра, НАЗНАЧЕННЫЕ этой клетке и присутствующие в патче
+                    # nuclei assigned to this cell and present in the patch
                     nuc_ids = [n for n, c in _asg.items()
                                if int(c) == chosen_cyto and int(n) in nuc_present]
-                    if not nuc_ids:  # фолбэк: перекрытие, как раньше
+                    if not nuc_ids:  # fallback: by overlap
                         nuc_ids = [int(v) for v in
                                    np.unique(nucleus_mask[cytoplasm_mask == chosen_cyto])
                                    if v > 0]
@@ -1052,7 +1031,7 @@ class CytoNucsDataGenerator(Sequence):
                    'cytoplasm_z_prompt_pair', 'nucleus_z_prompt_pair', 'crop_truncation_axes',
                    'nucleus_crop_cut', 'cytoplasm_crop_cut'):
             y_batch[_k] = np.stack(y_batch[_k])
-        # k*B + b — порядок, в котором модель склеивает K выходов рефайна
+        # k*B + b: the order in which the model concatenates the K refinement outputs
         y_batch['nucleus_target'] = np.concatenate(
             [np.stack(v) for v in tg_n_k], axis=0)
         y_batch['cytoplasm_target'] = np.concatenate(
@@ -1067,7 +1046,7 @@ class CytoNucsDataGenerator(Sequence):
                                  nucleus_mask_final, cytoplasm_mask_final,
                                  nucleus_dist_raw, cytoplasm_dist_raw, epoch):
         """
-        Визуализация: Original GT vs Final GT (после watershed)
+        Visualisation: original vs final ground truth
         """
         import matplotlib.pyplot as plt
         from matplotlib import colors
@@ -1349,19 +1328,19 @@ def prepare_cytonucs_dataset(
     raw_cytoplasm_masks_dir = Path(raw_cytoplasm_masks_dir)
     output_dir = Path(output_dir)
 
-    # ========== Вспомогательные функции ==========
+    # ========== Helpers ==========
 
     def read_image_any_format(filepath, keep_rgb=False):
         """
-        Читает изображение:
+        Reads an image:
         - 2D grayscale: (H, W)
         - 2D RGB/RGBA: (H, W, 3/4)
         - 3D grayscale: (Z, H, W)
         - 3D RGB/RGBA: (Z, H, W, 3/4)
 
-        Если keep_rgb=False:
+        With keep_rgb=False:
         - 2D RGB -> grayscale
-        - 3D RGB -> 3D grayscale, послойно
+        - 3D RGB -> 3D grayscale, slice by slice
         """
         filepath = Path(filepath)
         ext = filepath.suffix.lower()
@@ -1373,7 +1352,7 @@ def prepare_cytonucs_dataset(
         else:
             raise ValueError(f"Unsupported format: {ext}")
 
-        # RGB/RGBA -> grayscale только если keep_rgb=False
+        # RGB / RGBA -> grayscale only with keep_rgb=False
         if not keep_rgb:
             # 2D RGB/RGBA: (H, W, 3/4)
             if img.ndim == 3 and img.shape[-1] in [3, 4]:
@@ -1394,12 +1373,9 @@ def prepare_cytonucs_dataset(
         return img
 
     def save_image_smart(img, filepath, is_mask=False):
-        """Пишем тем же форматом, что и исходники: обычный многостраничный
-        TIFF без ImageJ-заголовка. Исходные стеки — (Z,Y,X,3) uint8,
-        photometric=RGB, is_imagej=False; Fiji читает их без проблем.
-        Ни metadata={'axes':...}, ни imagej=True тут не нужны: первое
-        подменяет ImageDescription своим JSON, второе перекладывает RGB
-        в ZCYX-гиперстек и меняет глубину на 16 бит.
+        """Written in the format of the sources: a plain multi-page TIFF without an ImageJ header ((Z, Y, X, 3)
+        uint8, photometric RGB), which Fiji reads. Neither metadata={'axes': ...} (it replaces the ImageDescription)
+        nor imagej=True (it turns RGB into a 16-bit ZCYX hyperstack) is used.
         """
         import tifffile
         filepath = str(filepath)
@@ -1423,7 +1399,7 @@ def prepare_cytonucs_dataset(
 
 
     def validate_instance_mask(mask, name):
-        """Проверка instance mask"""
+        """Checks an instance mask."""
         unique_vals = np.unique(mask)
 
         if len(unique_vals) == 2 and 255 in unique_vals:
@@ -1436,7 +1412,7 @@ def prepare_cytonucs_dataset(
         return True
 
     def find_all_images(directory, base_name=None):
-        """Поиск файлов"""
+        """Finds the files."""
         extensions = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg']
 
         if base_name:
@@ -1451,7 +1427,7 @@ def prepare_cytonucs_dataset(
                 files.extend(list(directory.glob(ext)))
             return sorted(set(files))
 
-    # ========== Поиск и валидация ==========
+    # ========== Search and validation ==========
 
     print("Searching for images and masks...")
     image_files = find_all_images(raw_images_dir)
@@ -1498,13 +1474,13 @@ def prepare_cytonucs_dataset(
 
     print(f"\nSplit: Train={len(train_triplets)}, Val={len(val_triplets)}, Test={len(test_triplets)}")
 
-    # ========== Создание директорий ==========
+    # ========== Output folders ==========
 
     for subset in ['train', 'val', 'test']:
         for subdir in ['images', 'nucleus_masks', 'cytoplasm_masks', 'assignments']:
             (output_dir / subset / subdir).mkdir(parents=True, exist_ok=True)
 
-    # ========== Обработка ==========
+    # ========== Processing ==========
     rescale_factors = []
     for subset_name, triplets in [('train', train_triplets),
                                   ('val', val_triplets),
@@ -1515,12 +1491,12 @@ def prepare_cytonucs_dataset(
             base_name = img_file.stem
             print(f"  {base_name}")
 
-            # Чтение (RGB сохраняется для изображений)
+            # Reading (images keep their channels)
             img = read_image_any_format(img_file, keep_rgb=True)
             nucleus_mask = read_image_any_format(nuc_file, keep_rgb=False)
             cytoplasm_mask = read_image_any_format(cyto_file, keep_rgb=False)
 
-            # Определяем ndim (2D RGB считается 2D, не 3D)
+            # ndim (2D RGB is 2D, not 3D)
             if img.ndim == 3 and img.shape[-1] == 3:
                 ndim = 2  # 2D RGB
             else:
@@ -1528,68 +1504,13 @@ def prepare_cytonucs_dataset(
 
             print(f"    Detected: {ndim}D, img shape {img.shape}")
 
-            # === RESCALE (как в стандартном StarDist train.py) ===
-            # # Constraint: median cytoplasm extent должен влезать в FOV сети
-            # if train_patch_size is not None:
-            #     from skimage.measure import regionprops
-            #     from stardist import fill_label_holes
-            #
-            #     cyto_props = regionprops(cytoplasm_mask)
-            #     if len(cyto_props) > 0:
-            #         extents = []
-            #         for prop in cyto_props:
-            #             bbox = prop.bbox
-            #             n = len(bbox) // 2
-            #             ext = np.array([bbox[d + n] - bbox[d] for d in range(n)])
-            #             extents.append(ext)
-            #         median_extent = np.median(extents, axis=0)
-            #
-            #         # FOV ≈ effective receptive field of UNet
-            #         # Эмпирически ~60% patch_size для 4-level UNet с 3×3 convs
-            #         patch_arr = np.array(train_patch_size[-ndim:], dtype=np.float64)
-            #         fov = patch_arr * 0.6
-            #
-            #         # Rescale только если median extent НЕ влезает в FOV
-            #         max_extent = np.max(median_extent)
-            #         max_fov = np.min(fov)
-            #
-            #         if max_extent > max_fov:
-            #             rescale_factor = float(max_fov / max_extent)
-            #             rescale_factor = np.clip(rescale_factor, 0.25, 1.0)
-            #
-            #             print(f"    Median extent {median_extent} > FOV {fov}")
-            #             print(f"    Rescaling: factor={rescale_factor:.3f}")
-            #
-            #             if ndim == 2 and img.ndim == 3 and img.shape[-1] in [3, 4]:
-            #                 img = rescale(img, (rescale_factor, rescale_factor, 1),
-            #                               order=1, preserve_range=True, anti_aliasing=True).astype(img.dtype)
-            #             else:
-            #                 img = rescale(img, rescale_factor,
-            #                               order=1, preserve_range=True, anti_aliasing=True).astype(img.dtype)
-            #
-            #             nucleus_mask = rescale(nucleus_mask, rescale_factor,
-            #                                    order=0, preserve_range=True, anti_aliasing=False).astype(np.uint16)
-            #             nucleus_mask = fill_label_holes(nucleus_mask)
-            #
-            #             cytoplasm_mask = rescale(cytoplasm_mask, rescale_factor,
-            #                                      order=0, preserve_range=True, anti_aliasing=False).astype(np.uint16)
-            #             cytoplasm_mask = fill_label_holes(cytoplasm_mask)
-            #
-            #             print(f"    New shape: {img.shape}")
-            #             rescale_factors.append(rescale_factor)
-            #         else:
-            #             print(f"    No rescale needed: median extent {max_extent:.0f}px < FOV {max_fov:.0f}px")
             rescale_factors.append(1.0)
 
-            # Валидация
+            # Validation (no rescaling)
             validate_instance_mask(nucleus_mask, "nucleus")
             validate_instance_mask(cytoplasm_mask, "cytoplasm")
 
-            # Единственный rescale — FOV-based блок выше (он ndim-aware).
-            # Прежний второй блок (хардкод target_extent=[128,128], 2D-индексы
-            # bbox[2]/bbox[3]) удалён: ломал 3D и противоречил "no rescaling".
-
-            # Сохранение
+            # Saving
             output_filename = base_name + '.tiff'
 
             save_image_smart(

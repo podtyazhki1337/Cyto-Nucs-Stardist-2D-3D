@@ -7,9 +7,8 @@ from skimage.measure import regionprops
 
 
 def _to_shape(arr, shape):
-    """Приводит карту к заданной пространственной форме ближайшим соседом.
-    Нужно потому, что nucleus_grid и cytoplasm_grid могут различаться, и тогда
-    карты голов приходят разного размера."""
+    """A map resized to the given spatial shape by nearest neighbour (nucleus_grid and cytoplasm_grid may differ,
+    so the maps of the two heads may have different sizes)."""
     arr = np.asarray(arr)
     if tuple(arr.shape) == tuple(shape):
         return arr
@@ -30,20 +29,15 @@ def compute_containment_penalty(
     """
     Compute containment penalty in numpy (for monitoring or post-processing).
 
-    Для многоядерных клеток штраф считается по КАЖДОМУ ядру и усредняется
-    по клетке — цитоплазма должна вмещать все свои ядра.
+    For a cell with several nuclei the penalty is computed for every nucleus and averaged over the cell: the
+    cytoplasm must hold all of its nuclei.
 
-    Радиус клетки берётся ВДОЛЬ НАПРАВЛЕНИЯ центр клетки -> центр ядра, а не
-    как среднее по лучам. Среднее занижено кратно: при анизотропном наборе
-    лучей большинство направлений упирается в верх/низ плоской клетки и даёт
-    короткие значения, из-за чего штраф срабатывал бы на нормальных клетках.
-    Без rays поведение падает обратно на среднее (обратная совместимость).
+    The cell radius is taken along the direction cell centre -> nucleus centre, not as the mean over the rays:
+    with an anisotropic ray set most rays hit the top / bottom of a flat cell, so the mean is several times too
+    short and the penalty would fire on normal cells. Without rays the mean is used.
 
-    grid — прореживание, с которым посчитана cytoplasm_dist_pred. Центроиды из
-    regionprops живут в full-res координатах, а карта дистанций — в grid-
-    разрешении; прежняя версия индексировала карту full-res координатами, и
-    проверка границ отбрасывала ВСЕ клетки, то есть функция тихо возвращала 0
-    на любом изображении крупнее патча.
+    grid: the subsampling of cytoplasm_dist_pred. Centroids from regionprops are in full-resolution coordinates
+    and are mapped to the grid of the distance map.
 
     Args:
         nucleus_instances: (Z, Y, X) nucleus instance labels
@@ -51,8 +45,8 @@ def compute_containment_penalty(
         cytoplasm_dist_pred: (z, y, x, K) predicted cytoplasm distances (grid-res)
         assignments: dict {nucleus_id: cytoplasm_id}
         containment_margin: tolerance in voxels
-        rays: объект лучей цитоплазмы (config.rays_cytoplasm), опционально
-        grid: прореживание карты дистанций, опционально
+        rays: ray set of the cytoplasm (config.rays_cytoplasm), optional
+        grid: subsampling of the distance map, optional
 
     Returns:
         penalty: scalar, average containment violation
@@ -65,7 +59,7 @@ def compute_containment_penalty(
     nd = int(np.asarray(cytoplasm_instances).ndim)
 
     if grid is None:
-        # Выводим grid из соотношения форм: карта дистанций прорежена ровно так.
+        # The grid follows from the ratio of the shapes: the distance map is subsampled exactly so.
         grid = tuple(max(1, int(round(s / max(d, 1))))
                      for s, d in zip(np.asarray(cytoplasm_instances).shape,
                                      cytoplasm_dist_pred.shape[:nd]))
@@ -96,8 +90,8 @@ def compute_containment_penalty(
             continue
         cell_center = np.array(cytoplasm_props[cell_id].centroid, np.float64)
 
-        # Центроид вогнутой клетки может лежать вне её самой — тогда лучи там
-        # фоновые. Подтягиваем к ближайшему вокселю СВОЕЙ клетки.
+        # The centroid of a concave cell may lie outside the cell, where the rays are background: move it to the
+        # nearest voxel of its own cell.
         cc_int = np.clip(np.round(cell_center).astype(int),
                          0, np.array(cytoplasm_instances.shape) - 1)
         if cytoplasm_instances[tuple(cc_int)] != cell_id:
@@ -107,7 +101,7 @@ def compute_containment_penalty(
             cc_int = pts[np.argmin(np.abs(pts - cell_center).sum(axis=1))]
             cell_center = cc_int.astype(np.float64)
 
-        # full-res -> grid-координаты карты дистанций
+        # full resolution -> grid coordinates of the distance map
         cc_grid = tuple(int(np.clip(cc_int[a] // grid[a], 0, dist_shape[a] - 1))
                         for a in range(nd))
         predicted_radii = np.asarray(cytoplasm_dist_pred[cc_grid], np.float64)
@@ -123,8 +117,7 @@ def compute_containment_penalty(
                 continue
 
             if verts is not None and len(predicted_radii) == len(verts):
-                # Радиус вдоль направления на ядро: берём луч с максимальным
-                # косинусом и переводим его длину в воксели (|d * v|).
+                # Radius towards the nucleus: the ray with the largest cosine, its length in voxels (|d * v|).
                 u = vec / distance
                 k = int(np.argmax(vunit @ u))
                 radius = float(predicted_radii[k] * vnorm[k])
@@ -153,24 +146,18 @@ def monitor_wbr_metric(nucleus_prob, cytoplasm_prob, cytoplasm_instances=None,
                        prob_thresh=0.5):
     """
     Monitor WBR metric in numpy (for logging/visualization):
-    доля МАССЫ ЯДРА, оказавшаяся вне клетки.
+    the share of the nucleus mass that lies outside the cells.
 
-    Три отличия от прежней версии.
-
-    1. Нормировка на площадь ядра, а не на площадь фона. Прежнее деление на
-       число вокселей с cytoplasm_prob < 0.5 давало почти весь том в
-       знаменателе, и метрика была порядка 1e-5 при любом состоянии модели.
-    2. Контейнер предпочтительно БИНАРНЫЙ (cytoplasm_instances). cytoplasm_prob
-       это edt_prob: выше 0.5 лежит лишь 14-25% площади клетки, поэтому порог
-       по нему относит бо́льшую часть самой клетки к «снаружи».
-    3. Карты голов приводятся к общей форме: nucleus_grid и cytoplasm_grid
-       могут различаться, и тогда logical_and падал по broadcast.
+    - Normalised by the nucleus area (not by the background area, which made the metric ~1e-5 whatever the model).
+    - The container is preferably binary (cytoplasm_instances): cytoplasm_prob is an edt_prob, above 0.5 on only
+      14-25 % of a cell's area, so thresholding it would count most of the cell as outside.
+    - The maps of the two heads are brought to one shape (nucleus_grid and cytoplasm_grid may differ).
 
     Args:
         nucleus_prob: (Z, Y, X) nucleus probability
         cytoplasm_prob: (Z, Y, X) cytoplasm probability
-        cytoplasm_instances: (Z, Y, X) бинарный/instance контейнер, опционально
-        prob_thresh: порог бинаризации вероятностей
+        cytoplasm_instances: (Z, Y, X) binary or instance container, optional
+        prob_thresh: threshold that binarises the probabilities
 
     Returns:
         ratio: fraction of nucleus outside cytoplasm, [0, 1]

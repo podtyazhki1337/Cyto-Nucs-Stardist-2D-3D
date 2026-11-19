@@ -45,7 +45,7 @@ parser.add_argument('--pretrained-only', action='store_true', help='no fine-tuni
 parser.add_argument('--predict-only', action='store_true',
                     help='no training: the models and settings of <basedir>/<name>/training.json predict --split (its '
                          'seconds go to predict_seconds.json; training.json is not changed)')
-parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/cellpose')
+parser.add_argument('--basedir', default='runs/cellpose')
 parser.add_argument('--seed', type=int, default=0,
                     help="0: Cellpose's own sampling (it seeds numpy with the epoch number); k > 0 offsets those seeds by "
                          "k * 1000003 and seeds torch with k, so the runs see other crops and augmentations")

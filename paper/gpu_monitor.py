@@ -1,7 +1,7 @@
 """Samples one GPU (utilisation, memory, power) and the host memory of a process tree every --every seconds into
 a CSV while a training or evaluation runs, for the resource tables of a paper.
 
-Usage: python gpu_monitor.py --gpu 1 --output run_gpu.csv [--every 10] [--until-session TMUX_SESSION] [--tree PID]
+Usage: python paper/gpu_monitor.py --gpu 1 --output run_gpu.csv [--every 10] [--until-session TMUX_SESSION] [--tree PID]
 Host memory: resident memory of --tree (default: the monitor's parent, e.g. the queue slot running the job) and
 all its descendants except the monitor, in total (with memory-mapped files read) and anonymous.
 Stops when the tmux session ends (if given) or on Ctrl-C. `summarise(csv)` returns mean / max utilisation,

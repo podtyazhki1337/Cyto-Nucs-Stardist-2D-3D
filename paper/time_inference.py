@@ -29,8 +29,8 @@ Every method runs through the code that scored it, with the arguments of its sco
 Run it with nothing else on the machine.
 
 Usage:
-  python baselines/time_inference.py --method cytonucs --gpu 0 --output OUT.json [--limit 300] -- --config C --weights W
-  python baselines/time_inference.py --method hsd --gpu 0 --output OUT.json -- --data DIR --score --name NAME
+  python paper/time_inference.py --method cytonucs --gpu 0 --output OUT.json [--limit 300] -- --config C --weights W
+  python paper/time_inference.py --method hsd --gpu 0 --output OUT.json -- --data DIR --score --name NAME
 """
 import argparse
 import importlib.util
@@ -46,8 +46,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = Path(__file__).resolve().parents[1]                   # the repository root
+HERE = ROOT / 'baselines'                                    # the baseline scripts
 METHODS = ('cytonucs', 'cytonucs-blocks', 'stardist', 'stardist-blocks', 'hsd', 'cellpose', 'cellpose-blocks')
 
 

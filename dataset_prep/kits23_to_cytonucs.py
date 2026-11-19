@@ -17,8 +17,8 @@ The imaging is downloaded case by case from the KiTS23 Hugging Face mirror (as k
 downloaded again any time; the annotation of the repository is kept).
 
 Usage:
-  python dataset_prep/kits23_to_cytonucs.py --kits /storage02/miroslavm/data/KiTS23/kits23 \\
-      --output /storage02/miroslavm/data/KiTS23/cytonucs_3x078 [--spacing 3.0 0.78 0.78] [--delete-raw] [--limit N]
+  python dataset_prep/kits23_to_cytonucs.py --kits data/KiTS23/kits23 \\
+      --output data/KiTS23/cytonucs_3x078 [--spacing 3.0 0.78 0.78] [--delete-raw] [--limit N]
 Data licence: CC BY-NC-SA 4.0 (KiTS23); cite Heller et al., KiTS21/23.
 """
 import argparse

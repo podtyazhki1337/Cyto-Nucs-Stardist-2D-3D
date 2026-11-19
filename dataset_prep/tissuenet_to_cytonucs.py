@@ -21,8 +21,8 @@ With --val-all only the val split is converted, all 3118 tiles, into <output>/va
 tissuenet_val_all.json; nothing else is touched.
 
 Usage:
-  python dataset_prep/tissuenet_to_cytonucs.py --raw /storage02/miroslavm/data/TissueNet/raw \\
-      --output /storage02/miroslavm/data/TissueNet/cytonucs [--val-count 256] [--seed 0] [--val-all]
+  python dataset_prep/tissuenet_to_cytonucs.py --raw data/TissueNet/raw \\
+      --output data/TissueNet/cytonucs [--val-count 256] [--seed 0] [--val-all]
 Licence: modified Apache 2.0, non-commercial (see raw/LICENSE); cite Greenwald, Miller et al., Nat. Biotechnol. 2022.
 """
 import argparse

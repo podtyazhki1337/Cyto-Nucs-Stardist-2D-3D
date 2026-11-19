@@ -29,7 +29,7 @@ from types import SimpleNamespace
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument('--target', choices=('nucleus', 'cytoplasm'))
-parser.add_argument('--data', default='/storage02/miroslavm/data/Cytonucs_Emese_Hela/patches_split_hela')
+parser.add_argument('--data', default='data/Cytonucs_Emese_Hela/patches_split_hela')
 parser.add_argument('--gpu', default='')
 parser.add_argument('--epochs', type=int, default=300)
 parser.add_argument('--steps', type=int, default=100)
@@ -40,11 +40,12 @@ parser.add_argument('--nucleus-model')
 parser.add_argument('--cytoplasm-model')
 parser.add_argument('--margin', type=int, default=192)
 parser.add_argument('--output', help='score file (default: <basedir>/blocks_<nucleus model>_<cytoplasm model>.json)')
+parser.add_argument('--save', help='--score: folder for the GT and predicted labels of every block (names as evaluate_blocks.py --save)')
 parser.add_argument('--patch', type=int, nargs=3, default=[16, 320, 320], help='training patch ZYX (160 for half resolution)')
 parser.add_argument('--grid', type=int, nargs=3, default=[1, 4, 4], help='StarDist grid ZYX ((1, 2, 2) for half resolution)')
 parser.add_argument('--backbone', default='resnet', choices=('resnet', 'unet'),
                     help='resnet: the 3d-oids recipe (field of view 17x49x49 px); unet: depth 3, pool (2,2,2) (32x128x128 px)')
-parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/stardist',
+parser.add_argument('--basedir', default='runs/stardist',
                     help='where the models are written and read')
 parser.add_argument('--unknown-as-background', action='store_true',
                     help='masks with training.unknown_label 65535 (sparse annotation): StarDist cannot ignore voxels, so they become background')
@@ -254,7 +255,7 @@ def score():
     results = {}
     for split in ('test', 'val'):
         counts = {t: np.zeros((3, len(TAUS)), np.int64) for t in MASKS}
-        joint, objects, timing = [0, 0], {t: 0 for t in MASKS}, []
+        joint, objects, timing, per_block = [0, 0], {t: 0 for t in MASKS}, [], []
         fails = dict(fail_nucleus=0, fail_cell=0, fail_link=0)    # why annotated pairs are no joint TP
         for _, block, window in block_windows(manifest, split, args.margin, factor):
             y0, y1, x0, x1 = window
@@ -270,6 +271,12 @@ def score():
                 timing.append(dict(target=t, block=list(block), seconds=round(time.time() - started, 1)))
             gt = {t: objects_in_block(gt_all[t][:, y0:y1, x0:x1], block, window) for t in MASKS}
             pr = {t: objects_in_block(pred[t].astype(np.int32), block, window) for t in MASKS}
+            if args.save:
+                stem = f'{split}_{name}_y{block[0]:04d}_x{block[2]:04d}'
+                Path(args.save).mkdir(parents=True, exist_ok=True)
+                for t in MASKS:
+                    tifffile.imwrite(Path(args.save) / f'{stem}_{t}_gt.tiff', gt[t], photometric='minisblack')
+                    tifffile.imwrite(Path(args.save) / f'{stem}_{t}_pred.tiff', pr[t], photometric='minisblack')
             for t in MASKS:
                 objects[t] += int(len(np.unique(gt[t])) - 1)
                 for k, r in enumerate(matching(gt[t], pr[t], thresh=TAUS, criterion='iou')):
@@ -278,9 +285,12 @@ def score():
                 _, details = compute_jtpr(pr['nucleus'], pr['cytoplasm'], gt['nucleus'], gt['cytoplasm'], iou_thresh=.5,
                                           assignments_gt=pairs)
             joint[0] += int(details['joint_tp']); joint[1] += int(details['total_pairs'])
+            per_block.append(dict(volume=name, block=list(block), window=list(window), jtpr=details['joint_tp'] / max(details['total_pairs'], 1),
+                                  pairs=int(details['total_pairs']), fail_nucleus=int(details['joint_fail_nucleus']),
+                                  fail_cell=int(details['joint_fail_cell']), fail_link=int(details['joint_fail_link'])))
             for key in fails:
                 fails[key] += int(details['joint_' + key])
-        result = dict(jtpr=joint[0] / max(joint[1], 1), pairs=joint[1], objects=objects, timing=timing, **fails)
+        result = dict(jtpr=joint[0] / max(joint[1], 1), pairs=joint[1], objects=objects, timing=timing, blocks=per_block, **fails)
         for t in MASKS:
             tp, fp, fn = counts[t]
             ap = accuracy_profile(tp, fp, fn)

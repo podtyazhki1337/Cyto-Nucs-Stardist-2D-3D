@@ -40,8 +40,8 @@ import numpy as np
 import tifffile
 from scipy import ndimage as ndi
 
-EMESE = Path('/storage02/miroslavm/data/Cytonucs_Emese_Hela')
-HOLLANDI = Path('/storage02/miroslavm/data/Cytonucs_Hollandi')
+EMESE = Path('data/Cytonucs_Emese_Hela')
+HOLLANDI = Path('data/Cytonucs_Hollandi')
 HELA_REGIONS = EMESE / 'patches_split_hela_xy2' / 'train_regions'
 EA_MANIFEST = EMESE / 'patches_split' / 'split_manifest.json'
 HOLLANDI_HELD_OUT = ('Image0019.tiff', 'Image0036.tiff')
@@ -1006,52 +1006,52 @@ def _fmt(d, scale=1.0, digits=2):
 
 
 def report(stats):
-    lines = ['# Статистики разметки для синтетики CytoNucs', '',
-             'Медиана [5–95-й процентиль] по целым объектам train-части. Единицы — пиксели XY '
-             '(для 3D объёмы и радиусы в XY-пикселях с учётом шага по Z), Z-экстент — в срезах.', '']
+    lines = ['# Annotation statistics for the CytoNucs synthetic data', '',
+             'Median [5th–95th percentile] over the whole objects of the train part. Units: XY pixels '
+             '(in 3D, volumes and radii in XY pixels with the Z step taken into account), Z extent in slices.', '']
     for ds, s in stats['datasets'].items():
         src = stats['sources'][ds]
         lines += [f'## {ds}', '', src['description'], '']
-        lines += ['| признак | клетки | ядра |', '|---|---|---|']
-        names = dict(volume='объём, воксели', extent_z='экстент Z, срезы', radius_xy='экв. радиус XY', radius_3d='экв. радиус 3D',
-                     semi_major_xy='большая полуось XY', semi_minor_xy='малая полуось XY', semi_z='полуось Z (физ.)',
-                     flatness='сплюснутость (Z / XY)', elongation='вытянутость XY', sphericity='сферичность (2D: круглость)',
-                     solidity='выпуклость (solidity)', mode2='мода 2 log r (эллипс)', rough_low='шероховатость, моды 3–8',
-                     rough_high='шероховатость, моды 9–24', nonstar='доля не-звёздных лучей')
+        lines += ['| feature | cells | nuclei |', '|---|---|---|']
+        names = dict(volume='volume, voxels', extent_z='Z extent, slices', radius_xy='equivalent radius XY', radius_3d='equivalent radius 3D',
+                     semi_major_xy='semi-major axis XY', semi_minor_xy='semi-minor axis XY', semi_z='semi-axis Z (physical)',
+                     flatness='flatness (Z / XY)', elongation='elongation XY', sphericity='sphericity (2D: circularity)',
+                     solidity='solidity', mode2='mode 2 of log r (ellipse)', rough_low='roughness, modes 3–8',
+                     rough_high='roughness, modes 9–24', nonstar='share of non-star-convex rays')
         for k, title in names.items():
             if k in s.get('cells', {}) or k in s.get('nuclei', {}):
                 lines.append(f"| {title} | {_fmt(s.get('cells', {}).get(k))} | {_fmt(s.get('nuclei', {}).get(k))} |")
         for lvl in ('cells', 'nuclei'):
             o = s.get(lvl, {}).get('orientation', {})
             if o.get('n'):
-                lines.append(f"| ориентация XY ({lvl}) | R = {o['resultant']:.2f}, p = {o['rayleigh_p']:.2g} | |")
+                lines.append(f"| orientation XY ({lvl}) | R = {o['resultant']:.2f}, p = {o['rayleigh_p']:.2g} | |")
         h = s['hierarchy']
-        lines += ['', f"Иерархия: {h['cells']} целых клеток; ядер на клетку (0, 1, 2, …): {h['nuclei_per_cell_counts']}; "
-                      f"многоядерных {h['multinucleated_share']:.1%}, без ядра {h['without_nucleus_share']:.1%}; "
-                      f"объём ядра / клетки {_fmt(h['volume_ratio'])}; смещение ядра в XY / радиус клетки {_fmt(h['offset_xy'])}; "
-                      f"по Z / полувысота клетки {_fmt(h['offset_z'])}; вокселей ядер вне своей клетки {h['outside_share_voxels']:.2%} "
-                      f"(из них вне всех клеток {h['outside_no_cell_share_voxels']:.2%}, остальное — в соседней клетке).", '']
+        lines += ['', f"Hierarchy: {h['cells']} whole cells; nuclei per cell (0, 1, 2, …): {h['nuclei_per_cell_counts']}; "
+                      f"multinucleated {h['multinucleated_share']:.1%}, without a nucleus {h['without_nucleus_share']:.1%}; "
+                      f"nucleus / cell volume {_fmt(h['volume_ratio'])}; nucleus offset in XY / cell radius {_fmt(h['offset_xy'])}; "
+                      f"in Z / cell half-height {_fmt(h['offset_z'])}; nucleus voxels outside their cell {h['outside_share_voxels']:.2%} "
+                      f"(outside every cell {h['outside_no_cell_share_voxels']:.2%}, the rest in a neighbouring cell).", '']
         p = s['packing']
-        lines += [f"Упаковка: клеток в train-области {p['cells']}, целых {p['whole_cells']}; касаются соседа {p['touching_share']:.0%}; "
-                  f"соседей по касанию {_fmt(p['touching_neighbours'], digits=0)}; доля границы на контакте {_fmt(p['contact_fraction'])}; "
-                  f"кластеров на клетку {p['clusters_per_cell']:.2f}, одиночек {p['singleton_share']:.0%}; "
-                  f"расстояние до ближайшего {_fmt(p['nn_distance'], digits=1)} px, отношение зазора {_fmt(p['nn_gap_ratio'])}, "
-                  f"угол к плоскости XY {_fmt(p['nn_elevation'], digits=0)}°; плотность в оболочке ткани {_fmt(p['envelope_density'])}; "
-                  f"доля клеток в объёме {_fmt(p['cell_fraction'])}; в непустых окнах {p['window']}: {_fmt(p['window_cell_share'])} "
-                  f"(пустых окон {p['empty_window_share']:.0%}).", '']
+        lines += [f"Packing: cells in the train region {p['cells']}, whole {p['whole_cells']}; touching a neighbour {p['touching_share']:.0%}; "
+                  f"touching neighbours {_fmt(p['touching_neighbours'], digits=0)}; boundary share in contact {_fmt(p['contact_fraction'])}; "
+                  f"clusters per cell {p['clusters_per_cell']:.2f}, singletons {p['singleton_share']:.0%}; "
+                  f"distance to the nearest {_fmt(p['nn_distance'], digits=1)} px, gap ratio {_fmt(p['nn_gap_ratio'])}, "
+                  f"angle to the XY plane {_fmt(p['nn_elevation'], digits=0)}°; density in the tissue envelope {_fmt(p['envelope_density'])}; "
+                  f"cell fraction of the volume {_fmt(p['cell_fraction'])}; in non-empty windows {p['window']}: {_fmt(p['window_cell_share'])} "
+                  f"(empty windows {p['empty_window_share']:.0%}).", '']
         if 'appearance' in s:
             a = s['appearance']
-            lines += ['| класс | среднее RGB | σ между объектами | текстура σ | длина корреляции X | шум σ |', '|---|---|---|---|---|---|']
+            lines += ['| class | mean RGB | σ between objects | texture σ | correlation length X | noise σ |', '|---|---|---|---|---|---|']
             for name in ('background', 'cytoplasm', 'nucleus'):
                 r = a[name]
                 tl = r.get('texture_length', {}).get('x')
                 lines.append(f"| {name} | {_v(r.get('mean'))} | {_v(r.get('between_object_std'))} | {_v(r.get('texture_std'))} | "
                              f"{_v(tl)} | {_v(r.get('noise_sigma'), 2)} |")
             b = a['blur']
-            lines += ['', f"Размытие относительно границ GT (ядро + ореол): ядро σ_xy {_fmt(b['sigma_xy'], digits=1)} px, "
-                          f"σ_z {_fmt(b['sigma_z'], digits=1)} срезов; ореол σ {_fmt(b['halo'], digits=0)} px, его доля "
+            lines += ['', f"Blur relative to the GT boundaries (core + halo): core σ_xy {_fmt(b['sigma_xy'], digits=1)} px, "
+                          f"σ_z {_fmt(b['sigma_z'], digits=1)} slices; halo σ {_fmt(b['halo'], digits=0)} px, its weight "
                           f"{_fmt(b['halo_weight'])}; R² {_fmt(b['r2'])}.", '']
-    lines += ['## Что измерено и что принято', '', *stats['assumptions'], '']
+    lines += ['## Measured and assumed', '', *stats['assumptions'], '']
     return '\n'.join(lines)
 
 
@@ -1060,19 +1060,19 @@ def _v(values, digits=1):
 
 
 ASSUMPTIONS = [
-    '- Размер вокселя в файлах не записан. Для HeLa в половинном XY шаг по Z = 2.5 пикселя XY (model.anisotropy v5); '
-    'для EA.hy926 принят тот же (после уменьшения XY в 2 раза).',
-    '- Ядрышки не размечены нигде: их параметры в генераторе заданы вручную, а не измерены.',
-    '- Ядро считается привязанным к клетке по файлу assignments (HeLa) или по максимальному перекрытию (EA.hy926, Hollandi).',
-    '- Размытие — ширина краёв изображения относительно границ GT; в неё входит и неточность разметки.',
-    '- Шум — оценка Immerkær (ядро 3×3) по медиане, в зависимости от локального среднего; квантование uint8 входит в неё.',
+    '- The files carry no voxel size. For HeLa at half XY resolution the Z step is 2.5 XY pixels (model.anisotropy of v5); '
+    'the same is assumed for EA.hy926 (after halving XY).',
+    '- Nucleoli are annotated nowhere: their generator parameters are set by hand, not measured.',
+    '- A nucleus belongs to a cell by the assignments file (HeLa) or by the largest overlap (EA.hy926, Hollandi).',
+    '- Blur: the width of the image edges relative to the GT boundaries; it includes annotation inaccuracy.',
+    '- Noise: Immerkær estimate (3x3 kernel) by median, as a function of the local mean; uint8 quantisation is part of it.',
 ]
 
 DESCRIPTIONS = dict(
-    hela='HeLa, сфероид, половинное разрешение XY (patches_split_hela_xy2/train_regions), только train-блоки regions.json.',
-    ea='EA.hy926, три объёма, уменьшены в 2 раза по XY; только блоки train из patches_split/split_manifest.json '
-       '(val/test-блоки замаскированы и могут служить независимой проверкой).',
-    hollandi='Hollandi 2D, RGB 2048², без Image0019 и Image0036 (валидация старых прогонов StarDist 2D).')
+    hela='HeLa spheroid at half XY resolution (patches_split_hela_xy2/train_regions), train blocks of regions.json only.',
+    ea='EA.hy926, three volumes halved in XY; train blocks of patches_split/split_manifest.json only '
+       '(the val / test blocks are masked and can serve as an independent check).',
+    hollandi='Hollandi 2D, RGB 2048², without Image0019 and Image0036.')
 WINDOWS = dict(hela=(32, 256, 256), ea=(16, 256, 256), hollandi=(512, 512))
 
 

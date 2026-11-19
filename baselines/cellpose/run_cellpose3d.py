@@ -34,7 +34,7 @@ import time
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument('--data', default='/storage02/miroslavm/data/Cytonucs_Emese_Hela/patches_split_hela')
+parser.add_argument('--data', default='data/Cytonucs_Emese_Hela/patches_split_hela')
 parser.add_argument('--name', required=True)
 parser.add_argument('--gpu', default='0')
 parser.add_argument('--cell-channels', type=int, nargs=2, default=[2, 3], help='Cellpose channels [cytoplasm, nucleus] (1=R 2=G 3=B)')
@@ -49,7 +49,7 @@ parser.add_argument('--score', action='store_true', help='score the saved predic
 parser.add_argument('--reuse-models', action='store_true',
                     help='skip the training of a level whose model is in <basedir>/<name>/models (its training hours '
                          'and planes are kept from training.json); the settings are chosen and the blocks predicted again')
-parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/cellpose')
+parser.add_argument('--basedir', default='runs/cellpose')
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = '' if args.score else args.gpu
 ROOT = Path(__file__).resolve().parents[2]

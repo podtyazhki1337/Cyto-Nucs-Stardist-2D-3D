@@ -5,7 +5,7 @@ of its level's head over its voxels. Writes <predictions>/semantic/<stem>.json f
 than predicting again: the refinement windows of large objects need most of a 24 GB card.
 
 Usage:
-  python semantic_scores.py --config CONFIG --weights WEIGHTS --split test --predictions DIR [--gpu 0] [--memory-limit MB]
+  python paper/semantic_scores.py --config CONFIG --weights WEIGHTS --split test --predictions DIR [--gpu 0] [--memory-limit MB]
 """
 import argparse
 import contextlib
@@ -14,7 +14,10 @@ import json
 import os
 import tempfile
 import time
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # the repository root: the CytoNucs modules
 from types import SimpleNamespace
 
 import numpy as np

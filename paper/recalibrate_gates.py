@@ -7,13 +7,16 @@ The result goes into inference.quality_gates_override of a scoring config (score
 
 Only the AP objective is offered: the joint pairs a removal would lose are not in the log.
 
-Usage: python recalibrate_gates.py RUN_DIR [--epoch N] [--output FILE]
+Usage: python paper/recalibrate_gates.py RUN_DIR [--epoch N] [--output FILE]
        (RUN_DIR = output.basedir/experiment.name; epoch default: best_fullval.json)
 """
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # the repository root: the CytoNucs modules
 
 import numpy as np
 

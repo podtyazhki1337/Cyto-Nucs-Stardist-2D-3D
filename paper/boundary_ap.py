@@ -10,14 +10,17 @@ terciles of their area in the split; a bin counts the matches and missed objects
 unmatched predictions whose area falls in it.
 
 Usage:
-  python boundary_ap.py --data DATASET_DIR --split test --method NAME=FOLDER [NAME=FOLDER ...] [--levels nucleus cytoplasm]
+  python paper/boundary_ap.py --data DATASET_DIR --split test --method NAME=FOLDER [NAME=FOLDER ...] [--levels nucleus cytoplasm]
                         [--widths 1 2 4] [--output FILE]
 FOLDER holds <level>/<name> label images (score_hierarchy.py --predictions and the baseline scorers); predicted
 objects lying mostly in <split>/<level>_unknown are left out, as in score_hierarchy.py.
 """
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # the repository root: the CytoNucs modules
 
 import numpy as np
 

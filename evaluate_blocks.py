@@ -148,6 +148,9 @@ def evaluate(config_path, weights, splits=('test', 'val'), margin=192, save=None
                     for level in LEVEL_FILES:
                         tifffile.imwrite(Path(save) / f'{stem}_{level}_gt.tiff', gt_in[level], photometric='minisblack')
                         tifffile.imwrite(Path(save) / f'{stem}_{level}_pred.tiff', pred_in[level], photometric='minisblack')
+                    links = getattr(predictor, '_prompt_assignments', None)       # the predicted links JTPR uses
+                    if links is not None:
+                        (Path(save) / f'{stem}_links.json').write_text(json.dumps({int(k): int(v) for k, v in links.items()}))
                 for level in LEVEL_FILES:
                     objects[level] += int(len(np.unique(gt_in[level])) - 1)
                     for k, r in enumerate(matching(gt_in[level], pred_in[level], thresh=TAUS, criterion='iou')):

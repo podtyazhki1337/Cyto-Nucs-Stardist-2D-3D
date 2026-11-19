@@ -14,8 +14,8 @@ images; the nucleus set is known to be incomplete. Here:
 Licence: CC BY-NC-SA 3.0 (Roland Lang); cite Ljosa et al., Nature Methods 2012.
 
 Usage:
-  python dataset_prep/bbbc020_to_cytonucs.py --raw /storage02/miroslavm/data/BBBC020/raw \\
-      --output /storage02/miroslavm/data/BBBC020/cytonucs_xy2 [--factor 2] [--counts 12 4 4] [--seed 0]
+  python dataset_prep/bbbc020_to_cytonucs.py --raw data/BBBC020/raw \\
+      --output data/BBBC020/cytonucs_xy2 [--factor 2] [--counts 12 4 4] [--seed 0]
 """
 import argparse
 import json

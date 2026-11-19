@@ -1,0 +1,20 @@
+# CytoNucs: training, inference, scoring and dataset preparation (Python 3.10).
+# Tested with these versions on NVIDIA RTX A5000 GPUs (24 GB), CUDA from the tensorflow[and-cuda] wheels.
+tensorflow[and-cuda]==2.18.*
+numpy>=1.26,<2.1
+stardist==0.9.1
+csbdeep==0.8.1
+scipy>=1.15
+scikit-image>=0.25
+tifffile
+imageio
+tqdm
+opencv-python
+matplotlib
+h5py
+pillow
+# Optional:
+#   edt        faster StarDist targets: pip install --no-deps edt
+#   nibabel    KiTS23 conversion (dataset_prep/kits23_to_cytonucs.py)
+# The HydraStarDist baseline runs in this environment as well (also needs six, numexpr, packaging);
+# Cellpose, InstanSeg and nnU-Net need environments of their own (see README.md, Baselines).

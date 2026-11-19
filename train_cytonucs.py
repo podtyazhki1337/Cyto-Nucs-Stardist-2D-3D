@@ -34,7 +34,7 @@ def run_inference_only(config_dict, config_path):
     """
     Pure inference mode — loads full volumes, normalizes axes, runs tiled inference,
     dumps full-resolution prediction/GT masks as TIFF, computes Dice/AP/JTPR.
-    Универсально для 2D/3D, grayscale и RGB-стеков (Z,Y,X,C).
+    2D and 3D, grayscale and multichannel stacks (Z, Y, X, C).
     """
     import imageio.v2 as imageio
     from pathlib import Path
@@ -85,19 +85,19 @@ def run_inference_only(config_dict, config_path):
 
     # ========== Loaders / helpers ==========
     def _load_volume(path):
-        """Читает том и нормализует порядок осей RGB-стека к (Z, Y, X, C)."""
+        """Reads a volume; a multichannel stack is brought to the axis order (Z, Y, X, C)."""
         from cytonucs_runtime import read_model_image
         return read_model_image(path, ndim, model_config.n_channel_in)
 
     def _to_model_input(img):
-        """(spatial...) или (spatial..., C) -> нормализованный (spatial..., C)."""
+        """(spatial...) or (spatial..., C) -> normalised (spatial..., C)."""
         if img.ndim == ndim:
             img = img[..., np.newaxis]
         img = normalize(img.astype(np.float32), 1, 99.8, axis=tuple(range(ndim)))
         return img
 
     def _semantic_dice(gt, pred):
-        """Бинарный Dice (любой объект vs фон) — без инстансного матчинга."""
+        """Binary Dice (any object vs background), without instance matching."""
         g = np.asarray(gt) > 0
         p = np.asarray(pred) > 0
         if not g.any() and not p.any():
@@ -121,20 +121,18 @@ def run_inference_only(config_dict, config_path):
             files.extend(list(path.glob(ext)))
         return sorted(set(files))
 
-    # Какие сплиты гонять. Строка допускается ради удобства ("test"), но
-    # разворачивается в список: `for split in ('test')` перебирал бы СИМВОЛЫ,
-    # а не сплиты, и молча не находил ни одного файла.
+    # Splits to run. A single string ("test") is accepted and turned into a list.
     eval_splits = config_dict.get('inference', {}).get('eval_splits', ['test', 'val'])
     if isinstance(eval_splits, str):
         eval_splits = [eval_splits]
     eval_splits = [str(s) for s in eval_splits]
 
     image_files, nucleus_mask_files, cytoplasm_mask_files = [], [], []
-    split_of_file = []  # источник каждого файла, для имени и печати
+    split_of_file = []  # split of every file, for its name and the printout
     for split in eval_splits:
         d = Path(config_dict['data']['dataset_dir']) / split
         if not d.exists():
-            print(f"⚠️  Сплит '{split}' не найден: {d}")
+            print(f"⚠️  Split '{split}' not found: {d}")
             continue
         _im = find_all_images(d / 'images')
         _nu = find_all_images(d / 'nucleus_masks')
@@ -148,7 +146,7 @@ def run_inference_only(config_dict, config_path):
         print(f"📂 Loaded {len(_im)} images from {split}")
 
     if len(image_files) == 0:
-        print(f"❌ Нет изображений в сплитах {eval_splits} "
+        print(f"❌ No images in the splits {eval_splits} "
               f"({config_dict['data']['dataset_dir']})")
         sys.exit(1)
 
@@ -184,7 +182,7 @@ def run_inference_only(config_dict, config_path):
     def _save_mask(arr, path):
         write_instance_mask(path, arr)
 
-    # один раз, а не на каждом изображении
+    # once, not for every image
     dice_callback = DiceCallback(model, None, eval_every=1, save_best=False)
 
     # ========== Inference Loop ==========
@@ -193,9 +191,9 @@ def run_inference_only(config_dict, config_path):
     pred_assignments = []
     gt_assignments = [load_gt_assignments(f) for f in nucleus_mask_files]
     _n_gt = sum(1 for a in gt_assignments if a is not None)
-    print(f"📎 Истинный mapping ядро->клетка найден для {_n_gt}/{len(gt_assignments)} томов"
+    print(f"📎 Annotated nucleus -> cell pairs found for {_n_gt}/{len(gt_assignments)} volumes"
           + ("" if _n_gt == len(gt_assignments)
-             else " — остальные считаются эвристикой, знаменатель JTPR завышен"))
+             else "; the others are derived by overlap"))
     for i in tqdm(range(len(image_files)), desc=f"Inference on {dataset_name}"):
         img_path = image_files[i]
         nuc_mask_path = nucleus_mask_files[i]
@@ -249,10 +247,7 @@ def run_inference_only(config_dict, config_path):
                 )
             )
 
-            # Z полностью контролируется внутри
-            # _predict_with_tiling через fixed-Z windows.
-            #
-            # Здесь n_tiles относится только к XY.
+            # Z is handled inside _predict_with_tiling (fixed-Z windows); n_tiles here is for XY only.
             if ndim == 3:
                 n_tiles = (
                     1,
@@ -287,7 +282,7 @@ def run_inference_only(config_dict, config_path):
                 normalize_img=False
             )
 
-        # Выравнивание форм pred/GT
+        # Prediction and ground truth brought to one shape
         if nucleus_pred.shape != nucleus_gt.shape:
             print(f"  ⚠️  Shape mismatch: pred={nucleus_pred.shape}, gt={nucleus_gt.shape}")
             min_shape = tuple(min(p, g) for p, g in zip(nucleus_pred.shape, nucleus_gt.shape))
@@ -306,11 +301,11 @@ def run_inference_only(config_dict, config_path):
             from collections import Counter
             _cnt = Counter(l for l in _lab if l > 0)
             _dup = {k: v for k, v in _cnt.items() if v > 1}
-            print(f"  [gt-diag] промптов {len(_lab)}: "
-                  f"в фоне {sum(1 for l in _lab if l == 0)}, "
-                  f"на GT-ядрах {len(_cnt)} уникальных, "
-                  f"дубликатов (>1 промпта на ядро) {len(_dup)}"
-                  + (f", распределение {sorted(_dup.values(), reverse=True)[:8]}" if _dup else ""))
+            print(f"  [gt-diag] prompts {len(_lab)}: "
+                  f"on background {sum(1 for l in _lab if l == 0)}, "
+                  f"on {len(_cnt)} distinct GT nuclei, "
+                  f"duplicates (>1 prompt per nucleus) {len(_dup)}"
+                  + (f", counts {sorted(_dup.values(), reverse=True)[:8]}" if _dup else ""))
         sd_n = _semantic_dice(nucleus_gt, nucleus_pred)
         sd_c = _semantic_dice(cytoplasm_gt, cytoplasm_pred)
         print(f"  [{i}] semantic Dice  nuc={sd_n:.3f} cyto={sd_c:.3f} | "
@@ -340,11 +335,7 @@ def run_inference_only(config_dict, config_path):
     stats_nuc = matching_dataset(y_true_nucleus, y_pred_nucleus, thresh=taus, show_progress=False)
     stats_cyto = matching_dataset(y_true_cytoplasm, y_pred_cytoplasm, thresh=taus, show_progress=False)
 
-    # AP в конвенции StarDist / DSB-2018 = accuracy = TP/(TP+FP+FN), среднее по
-    # taus. Раньше здесь печаталась precision = TP/(TP+FP) под именем «AP@50»
-    # и результат _calculate_ap (интегрирование PR-кривой по 10 точкам) под
-    # именем «AP» — обе величины несравнимы с тем, что печатает DiceCallback,
-    # так что val и test были в разных единицах.
+    # AP in the StarDist / DSB-2018 convention: accuracy = TP / (TP + FP + FN), mean over the taus (as DiceCallback).
     acc_nuc = np.array([s.accuracy for s in stats_nuc])
     acc_cyto = np.array([s.accuracy for s in stats_cyto])
     precision_nucleus = np.array([s.precision for s in stats_nuc])
@@ -356,10 +347,8 @@ def run_inference_only(config_dict, config_path):
     ap50_nucleus = float(acc_nuc[0])
     ap50_cytoplasm = float(acc_cyto[0])
 
-    # Разбивка: без неё «AP@50 0.045» не отличает «не нашли» от «нашли, но IoU
-    # не дотянул» — это разные проблемы с разными лечениями. Обвал accuracy
-    # между 0.5 и 0.6 = систематически неверный размер масок; низкая уже на
-    # 0.5 = недодетекция.
+    # Breakdown: tells missed objects from found ones with too low an IoU. A drop of the accuracy between 0.5 and
+    # 0.6 means systematically wrong mask sizes; a low accuracy already at 0.5 means missed objects.
     s_n, s_c = stats_nuc[0], stats_cyto[0]
     print(f"  @IoU=0.5 nucleus:   TP={s_n.tp} FP={s_n.fp} FN={s_n.fn} "
           f"P={s_n.precision:.3f} R={s_n.recall:.3f}")
@@ -369,10 +358,9 @@ def run_inference_only(config_dict, config_path):
           f"{' '.join(f'{t:.2f}:{a:.3f}' for t, a in zip(taus, acc_nuc))}")
     print(f"  accuracy(tau) cytoplasm: "
           f"{' '.join(f'{t:.2f}:{a:.3f}' for t, a in zip(taus, acc_cyto))}")
-    # compute_dice усредняет ТОЛЬКО по совпавшим парам (IoU>0.5) и за пропуски
-    # не штрафует: 6 совпадений из 61 дают ровную «Dice 0.69».
-    print(f"  instance Dice посчитан по: nucleus {s_n.tp}/{s_n.tp + s_n.fn} пар, "
-          f"cytoplasm {s_c.tp}/{s_c.tp + s_c.fn} пар")
+    # compute_dice averages over the matched pairs (IoU > 0.5) only and does not penalise misses.
+    print(f"  instance Dice over: nucleus {s_n.tp}/{s_n.tp + s_n.fn} pairs, "
+          f"cytoplasm {s_c.tp}/{s_c.tp + s_c.fn} pairs")
 
     print("\n  Computing JTPR...")
     jtpr_values, joint_tp_total, total_pairs_total = [], 0, 0
@@ -487,11 +475,8 @@ def run_mask_calibration(config_dict, config_path):
 
 def run_threshold_optimization(config_dict, config_path):
     """
-    Подбор порогов на ПОЛНЫХ ТОМАХ через тот же путь, что и inference
-    (тайлинг + промпт-ветка). Прежняя версия собирала патчи из val-генератора
-    и звала predict_instances без тайлинга — то есть подбирала пороги под
-    режим, которого на реальных данных не существует.
-    Пороги в конфиг НЕ пишет — впишешь найденное руками.
+    Threshold search on whole volumes through the inference path (tiling and prompt refinement). The thresholds
+    are not written into the configuration; set the values found by hand.
     """
     import imageio.v2 as imageio
     from cytonucs_runtime import normalize_percentiles as normalize
@@ -534,8 +519,7 @@ def run_threshold_optimization(config_dict, config_path):
             files.extend(list(path.glob(ext)))
         return sorted(set(files))
 
-    # На каких сплитах подбирать. По умолчанию val: подбор на test — это
-    # подгонка под тестовую выборку, и в статье так писать нельзя.
+    # Splits to search on; val by default (a search on test would fit the test set).
     splits = config_dict.get('evaluation', {}).get('threshold_opt_splits', ['val'])
     image_files, nuc_files, cyto_files = [], [], []
     for split in splits:
@@ -545,9 +529,9 @@ def run_threshold_optimization(config_dict, config_path):
             nuc_files.extend(find_all_images(d / 'nucleus_masks'))
             cyto_files.extend(find_all_images(d / 'cytoplasm_masks'))
     if len(image_files) == 0:
-        print(f"❌ Нет изображений в сплитах {splits}")
+        print(f"❌ No images in the splits {splits}")
         return None
-    print(f"📂 Подбор на {len(image_files)} томах из {splits}")
+    print(f"📂 Search on {len(image_files)} volumes of {splits}")
 
     val_images, val_nuc, val_cyto, val_asg = [], [], [], []
     for f_img, f_n, f_c in zip(image_files, nuc_files, cyto_files):
@@ -558,7 +542,7 @@ def run_threshold_optimization(config_dict, config_path):
         val_asg.append(load_gt_assignments(f_n))
         print(f"   {f_img.name}: {val_images[-1].shape}, "
               f"GT nuc={len(np.unique(val_nuc[-1])) - 1} cyto={len(np.unique(val_cyto[-1])) - 1}"
-              f"{'' if val_asg[-1] is None else f', пар GT={len(val_asg[-1])}'}")
+              f"{'' if val_asg[-1] is None else f', GT pairs={len(val_asg[-1])}'}")
 
     predictor = CytoNucsPredictor(
         model=model, config=model_config,
@@ -582,7 +566,7 @@ def run_threshold_optimization(config_dict, config_path):
     with open(thresh_path, 'w') as f:
         json.dump(best, f, indent=2)
     print(f"  ✅ Optimized thresholds saved to: {thresh_path}")
-    print(f"  ▶ Впиши в config.inference: {best}")
+    print(f"  ▶ Set in config.inference: {best}")
     return best
 
 
@@ -649,9 +633,8 @@ class WarmupExponentialDecay(tf.keras.optimizers.schedules.LearningRateSchedule)
         self.decay_steps = tf.cast(decay_steps, tf.float32)
         self.decay_rate = tf.cast(decay_rate, tf.float32)
         self.min_lr = tf.cast(min_lr, tf.float32)
-        # Оптимизатор создаётся ПОСЛЕ load_weights и стартует с iterations=0.
-        # Без смещения resume с эпохи 500 повторно прогревается и
-        # возвращает lr к initial_lr — модель выбивается из минимума.
+        # The optimizer is created after load_weights and starts at iterations = 0; without this offset a resume
+        # would warm up again and return the learning rate to initial_lr.
         self.step_offset = tf.cast(step_offset, tf.float32)
         self.staircase = bool(staircase)
 
@@ -710,7 +693,7 @@ def main(config_path='config_cytonucs.json'):
     np.random.seed(seed)
     tf.keras.utils.set_random_seed(seed)
     # ========== MODE SELECTION ==========
-    mode = config_dict.get('mode', 'train')  # По умолчанию training
+    mode = config_dict.get('mode', 'train')
     # 'auto' inference settings: the values calibrated for the checkpoint (inference modes), the defaults while
     # training; training calibrates them on validation at its end.
     auto_keys = auto_inference_keys(config_dict.get('inference', {}))
@@ -722,7 +705,7 @@ def main(config_path='config_cytonucs.json'):
 
     if mode == 'inference':
         print("\n🔍 MODE: INFERENCE ONLY")
-        result = run_inference_only(config_dict, config_path)  # ← СОХРАНЯЕМ результат
+        result = run_inference_only(config_dict, config_path)
         return result
     elif mode == 'optimize_thresholds':
         print("\n🎯 MODE: THRESHOLD OPTIMIZATION ONLY")
@@ -758,7 +741,7 @@ def main(config_path='config_cytonucs.json'):
             'anisotropy': model_config.anisotropy,
             'grid': model_config.grid,
 
-            # === ЛОГИРОВАНИЕ ВЕСОВ ЛОССОВ ===
+            # loss weights
             'lambda_prob_nucleus': model_config.lambda_prob_nucleus,
             'lambda_dist_nucleus': model_config.lambda_dist_nucleus,
             'lambda_prob_cytoplasm': model_config.lambda_prob_cytoplasm,
@@ -821,11 +804,10 @@ def main(config_path='config_cytonucs.json'):
         print(f"Extra training data, share {model_config.extra_train_share}: "
               + ', '.join(f'{folder} ({len(g.image_files)} files)' for folder, g in zip(model_config.extra_train_dirs, extra_generators)))
 
-    # ========== КАНОНИЧЕСКИЙ ЗАМЕР АНИЗОТРОПИИ ==========
-    # StarDist 3D выводит anisotropy из МЕДИАННЫХ BBOX ОБЪЕКТОВ, а не из шага
-    # между срезами (examples/3D/2_training.ipynb). От неё зависят и лучи, и
-    # grid. Делается ПОСЛЕ создания генераторов, потому что нужны загруженные
-    # маски, и ДО build_cytonucs_model, потому что модель читает гриды.
+    # ========== Anisotropy, as StarDist measures it ==========
+    # StarDist 3D derives the anisotropy from the median bounding boxes of the objects, not from the slice spacing
+    # (examples/3D/2_training.ipynb); the rays and the grids depend on it. Measured after the generators are made
+    # (the masks must be loaded) and before build_cytonucs_model (the model reads the grids).
     # training.init_weights (fine-tuning from another run) keeps that run's geometry like a resume does.
     resume_geometry = config_dict['training'].get('resume_from_checkpoint') or config_dict['training'].get('init_weights')
     if resume_geometry:
@@ -845,7 +827,7 @@ def main(config_path='config_cytonucs.json'):
         _gen._cyto_rays = model_config.rays_cytoplasm
         _gen._nuc_aniso = model_config.rays_anisotropy_nucleus
         _gen._cyto_aniso = model_config.rays_anisotropy_cytoplasm
-    print(f"  ✓ Гриды генераторов обновлены: nucleus={train_generator._nuc_grid}, "
+    print(f"  ✓ Grids of the generators: nucleus={train_generator._nuc_grid}, "
           f"cytoplasm={train_generator._cyto_grid}")
     print(f"Steps per epoch: {model_config.train_steps_per_epoch} (from config)")
     if extra_generators:
@@ -860,7 +842,6 @@ def main(config_path='config_cytonucs.json'):
         name=config_dict['experiment']['name'],
         basedir=config_dict['output']['basedir']
     )
-    # Stage 1: загрузить рабочие веса 0.85 Dice
 
     print("\n=== MODEL INITIALIZATION DEBUG ===")
     for var in model.keras_model.trainable_variables:
@@ -906,7 +887,6 @@ def main(config_path='config_cytonucs.json'):
         model.loaded_quality_gates = None
         model.loaded_mask_thresholds = None
         print(f'Initial weights (fine-tuning from epoch 0 with a new optimizer): {init_weights}')
-    # ========== КОНЕЦ БЛОКА ==========
     print("\nModel Summary:")
     model.summary()
 
@@ -947,9 +927,9 @@ def main(config_path='config_cytonucs.json'):
         step_offset=int(start_epoch) * int(steps_per_epoch),
         staircase=config_dict['training'].get('lr_staircase', False),
     )
-    print(f"  ✓ LR: warmup {lr_warmup_epochs} эпох -> {initial_lr}, "
-          f"decay {decay_rate} / {decay_steps} шагов, floor {min_lr}, "
-          f"старт с шага {int(start_epoch) * int(steps_per_epoch)}")
+    print(f"  ✓ LR: warmup {lr_warmup_epochs} epochs -> {initial_lr}, "
+          f"decay {decay_rate} / {decay_steps} steps, floor {min_lr}, "
+          f"from step {int(start_epoch) * int(steps_per_epoch)}")
     gradient_clip_norm = config_dict['training']['gradient_clip_norm']
     trainer = CytoNucsTrainer(
         model=model,
@@ -1164,7 +1144,7 @@ def main(config_path='config_cytonucs.json'):
         model=model,
         config=model_config,
         prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
-        prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),  # ← Проверьте эту строку!
+        prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),
         nms_thresh=config_dict['inference'].get('nms_thresh', 0.3)
     )
 
@@ -1173,11 +1153,8 @@ def main(config_path='config_cytonucs.json'):
     # COLLECT FULL VALIDATION VOLUMES
     # ============================================================
     #
-    # НЕ используем val_generator[i]:
-    # это train_patch_size crops.
-    #
-    # val_generator.data_pool содержит исходные полные,
-    # уже нормализованные volumes.
+    # Not val_generator[i] (crops of train_patch_size): val_generator.data_pool holds the whole volumes, already
+    # normalised.
     # ============================================================
 
     if (
@@ -1198,9 +1175,8 @@ def main(config_path='config_cytonucs.json'):
     val_nucleus_masks = []
     val_cytoplasm_masks = []
     val_filenames = []
-    # Истинный маппинг ядро->клетка. Генератор уже прочитал его из
-    # assignments/*.json в repool(); здесь он просто переносится дальше,
-    # чтобы знаменатель JTPR не строился эвристикой.
+    # Annotated nucleus -> cell pairs, read by the generator from assignments/*.json in repool(), so that the JTPR
+    # counts the annotated pairs.
     val_assignments_gt = []
 
     print(
@@ -1312,7 +1288,7 @@ def main(config_path='config_cytonucs.json'):
             normalize_img=False
         )
 
-    # ========== Threshold Optimization (опционально) ==========
+    # ========== Threshold Optimization (optional) ==========
     if config_dict.get('evaluation', {}).get('optimize_thresholds', False):
         print("\n" + "=" * 60)
         print("Optimizing thresholds...")
@@ -1341,7 +1317,7 @@ def main(config_path='config_cytonucs.json'):
             model=model,
             config=model_config,
             prob_thresh_nucleus=config_dict['inference'].get('prob_thresh_nucleus', 0.3),
-            prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),  # ← Проверьте эту строку!
+            prob_thresh_cytoplasm=config_dict['inference'].get('prob_thresh_cytoplasm', 0.4),
             nms_thresh=config_dict['inference'].get('nms_thresh', 0.3)
         )
 
@@ -1406,7 +1382,7 @@ def main(config_path='config_cytonucs.json'):
                 import matplotlib.pyplot as plt
                 fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
-                # Оригинал
+                # Image
                 axes[0, 0].imshow(val_images[i], cmap='gray')
                 axes[0, 0].set_title('Original')
 
@@ -1514,7 +1490,7 @@ def main(config_path='config_cytonucs.json'):
             imageio.mimsave(
                 viz_dir / 'training_progress.gif',
                 images,
-                duration=0.5  # 0.5 секунды на кадр
+                duration=0.5  # seconds per frame
             )
             print(f"✅ Created training animation: training_progress.gif")
     if config_dict['evaluation']['compute_jtpr']:

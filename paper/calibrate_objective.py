@@ -12,9 +12,9 @@ Methods (the arguments after `--` are those of the method's scoring call):
   cellpose  run_cellpose.py models (cellpose env): the cellprob x flow grid of run_cellpose.py, per level.
 
 Usage:
-  python baselines/calibrate_objective.py grid --method stardist --out OUT --gpu 0 -- --data DIR --score --inner ... --outer ...
-  python baselines/calibrate_objective.py select --out OUT --data DIR
-  python baselines/calibrate_objective.py predict --method stardist --out OUT --gpu 0 --split test -- <the same arguments>
+  python paper/calibrate_objective.py grid --method stardist --out OUT --gpu 0 -- --data DIR --score --inner ... --outer ...
+  python paper/calibrate_objective.py select --out OUT --data DIR
+  python paper/calibrate_objective.py predict --method stardist --out OUT --gpu 0 --split test -- <the same arguments>
 """
 import argparse
 import importlib.util
@@ -23,8 +23,8 @@ import os
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = Path(__file__).resolve().parents[1]                   # the repository root
+HERE = ROOT / 'baselines'                                    # the baseline scripts
 PROB_GRID = (0.2, 0.3, 0.4, 0.5, 0.6, 0.65, 0.7)        # evaluation.prob_thresh_range of CytoNucs
 
 

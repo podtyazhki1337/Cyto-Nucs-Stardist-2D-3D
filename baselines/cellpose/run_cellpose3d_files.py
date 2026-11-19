@@ -38,8 +38,8 @@ import time
 from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument('--data', default='/storage02/miroslavm/data/KiTS23/cytonucs_3x078')
-parser.add_argument('--select-data', default='/storage02/miroslavm/data/KiTS23/cytonucs_3x078_val16',
+parser.add_argument('--data', default='data/KiTS23/cytonucs_3x078')
+parser.add_argument('--select-data', default='data/KiTS23/cytonucs_3x078_val16',
                     help='dataset whose val volumes choose the settings')
 parser.add_argument('--levels', nargs=2, default=['mass', 'kidney'], help='inner level first')
 parser.add_argument('--min-mm3', type=float, nargs=2, default=[32., 1600.], help='smallest object of each level')
@@ -56,8 +56,8 @@ parser.add_argument('--limit', type=int, help='first N volumes of every split (s
 parser.add_argument('--reuse-models', action='store_true',
                     help='skip the training of a level whose model is in <basedir>/<name>/models (its training hours '
                          'and planes are kept from training.json); the settings are chosen and the volumes predicted again')
-parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/cellpose')
-parser.add_argument('--cache', help='folder of the training planes (default /storage01/miroslavm/cellpose_cytonucs/cache/<name>)')
+parser.add_argument('--basedir', default='runs/cellpose')
+parser.add_argument('--cache', help='folder of the training planes (default runs/cellpose/cache/<name>)')
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
@@ -67,7 +67,7 @@ import tifffile
 UNKNOWN = 65535
 TAUS = np.arange(0.5, 1.0, 0.05)                                       # as score_hierarchy.TAUS
 DATA, SELECT, OUT = Path(args.data), Path(args.select_data), Path(args.basedir) / args.name
-CACHE = Path(args.cache or f'/storage01/miroslavm/cellpose_cytonucs/cache/{args.name}')
+CACHE = Path(args.cache or f'runs/cellpose/cache/{args.name}')
 SPACING = json.loads((DATA / 'kits23.json').read_text())['spacing'] if (DATA / 'kits23.json').is_file() else None
 ANISOTROPY = args.anisotropy or SPACING[0] / SPACING[1]
 VOXEL_MM3 = float(np.prod(SPACING)) if SPACING else 1.0

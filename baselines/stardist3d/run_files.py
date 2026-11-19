@@ -54,7 +54,7 @@ parser.add_argument('--depth', type=int, default=3, help='U-Net depth (StarDist 
 parser.add_argument('--width', type=int, default=32, help='U-Net filters of the first level (StarDist default 32)')
 parser.add_argument('--foreground-only', type=float, default=0.9,
                     help="share of training patches drawn around objects (StarDist's train_foreground_only)")
-parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/stardist')
+parser.add_argument('--basedir', default='runs/stardist')
 parser.add_argument('--seed', type=int, default=42, help='random seed of the run (42: the default of the code)')
 parser.add_argument('--cache', help='folder of the memory-mapped train volumes (default <basedir>/cache/<parent>_<data name>)')
 parser.add_argument('--score', action='store_true')

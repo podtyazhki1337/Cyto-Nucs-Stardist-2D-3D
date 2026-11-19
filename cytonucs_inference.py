@@ -478,7 +478,7 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     residual: {head: dict(coords, probs, dists)} peaks suppressed by the proposal window;
     prompted only where the first assembly left the voxel free, assembled after all
     first-pass candidates (object assembly modes only).
-    model.stage_seconds, when a dict (stage profiling, baselines/time_inference.py), gets the seconds of the prompt
+    model.stage_seconds, when a dict (stage profiling, paper/time_inference.py), gets the seconds of the prompt
     refinement and of the assembly with the links added.
     """
     import time
@@ -486,11 +486,6 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     from scipy.ndimage import find_objects
     started = time.perf_counter()
     policy = getattr(config, 'refinement_mode', 'mask')
-    if policy == 'legacy_union':
-        return _predict_instances_prompted_legacy(
-            model, config, img_full, nuc_coords, nuc_probs, cyto_coords, cyto_probs,
-            mask_thresh, iou_dedup, verbose, nuc_dists, cyto_dists,
-            nuc_labels, cyto_labels, nms_thresh)
     nd = int(config.ndim)
     shape = img_full.shape[:nd]
     if policy == 'polyhedron':
@@ -1271,450 +1266,6 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     fine_cache.clear()
     return nuclei, cells, pairs
 
-def _predict_instances_prompted_legacy(model, config, img_full, nuc_coords, nuc_probs,
-                               cyto_coords=None, cyto_probs=None,
-                               mask_thresh=0.5, iou_dedup=0.5, verbose=True,
-                               nuc_dists=None, cyto_dists=None,
-                               nuc_labels=None, cyto_labels=None,
-                               nms_thresh=None):
-    """
-    Инстансы определяются в 3D как в каноническом StarDist: NMS -> полиэдры.
-    Рефайн только ДОБИРАЕТ форму, по 2D-слайсам.
-
-    Цикл идёт по МЕТКАМ, а не по пикам: polyhedron_to_label отдаёт
-    непересекающиеся метки, одна метка = один инстанс.
-
-    Форма инстанса = полиэдр (отрендерен по ВСЕМУ объёму, значит целостен по Z и
-    не обрезается окном прогона) ОБЪЕДИНЁННЫЙ с выращенной маской внутри окна.
-    Выращивание послойное: на слайсе центра берётся связная компонента,
-    содержащая центр, дальше вверх и вниз по Z берутся компоненты, касающиеся
-    уже принятой части соседнего слайса.
-
-    ПОСЛЕ добора формы применяется ТОТ ЖЕ критерий, что в NMS StarDist
-    (stardist3d_impl.cpp: A_inter/A_min > nms_thresh) — см. _place.
-
-    Наборы лучей у голов РАЗНЫЕ (см. CytoNucsConfig.rays_nucleus /
-    rays_cytoplasm), поэтому сигма промпта считается по набору своей головы.
-
-    Один прогон на инстанс ядра даёт И маску ядра, И маску его клетки — ровно
-    как учит генератор (промпт на ядре, cytoplasm_target = родительская клетка).
-    Многоядерность выходит сама: два ядра приходят в одну и ту же клетку, второе
-    просто записывается в assignments.
-
-    ДИАГНОСТИКА ПОТЕРЬ. Полиэдров на входе может быть больше, чем инстансов на
-    выходе, и до сих пор было не видно, где именно они исчезают. Теперь считаются
-    все каналы утечки:
-      occupied   — _place вернул 0: вся территория полиэдра уже занята ранее
-                   записанными инстансами (w пусто). Раньше терялось молча.
-                   Достижимо, когда полиэдр покрыт НЕСКОЛЬКИМИ соседями, каждый
-                   из которых по отдельности не дотянул до nms_thresh: при
-                   nms_thresh=0.3 хватает четырёх соседей по 25%. Для плотного
-                   сфероида с 5-6 соседями на клетку это штатный сценарий, и он
-                   даёт связные чёрные дыры в предсказании.
-      seen       — метка клетки уже записана другим ядром. Законно для настоящей
-                   многоядерной клетки, но так же выглядит случай, когда полиэдр
-                   ядра залез в соседнюю клетку и «увёл» её.
-      no_overlap — полиэдр ядра не пересёкся ни с одной меткой цитоплазмы.
-    Печатается баланс: полиэдры - merged - occupied должно сойтись с записанными.
-
-    iou_dedup оставлен в сигнатуре для обратной совместимости вызовов.
-    Возвращает (nucleus_instances, cytoplasm_instances, assignments).
-    """
-    import numpy as np, tensorflow as tf
-    from scipy.ndimage import zoom, find_objects
-    from scipy.ndimage import label as _cc_label
-
-    nd = int(config.ndim)
-    patch = tuple(int(p) for p in config.train_patch_size)
-    n_img = int(config.n_channel_in)
-    # Модель строит вход на K промпт-пар (K = train_batch_size). На инференсе
-    # промпт всегда один: слот 0 занят, остальные нулевые, читается строка 0.
-    n_pr = max(1, int(getattr(config, 'prompts_per_crop', config.train_batch_size)))
-    aniso = np.asarray(getattr(config, 'anisotropy', (1.,) * nd), np.float32)
-    # nms_thresh приходит ОТ ПРЕДИКТОРА. Прежнее чтение из config давало
-    # значение из json и не менялось при переборе в optimize_thresholds —
-    # то есть отбор инстансов в _place шёл мимо подбора.
-    nms_thresh = float(getattr(config, 'nms_thresh', 0.3)
-                       if nms_thresh is None else nms_thresh)
-
-    if nuc_labels is None and cyto_labels is None:
-        raise ValueError("predict_instances_prompted: нужны nuc_labels/cyto_labels "
-                         "(результат polyhedron_to_label) — они и ЕСТЬ инстансы")
-
-    nuc_labels = None if nuc_labels is None else np.asarray(nuc_labels, np.int32)
-    cyto_labels = None if cyto_labels is None else np.asarray(cyto_labels, np.int32)
-
-    shape = tuple(int(s) for s in img_full.shape[:nd])
-    nuc_out = np.zeros(shape, np.int32)
-    cyto_out = np.zeros(shape, np.int32)
-    area_n, area_c, assignments = {}, {}, {}
-
-    # Окно прогона = train_patch_size. Универсально: от глубины стека не
-    # зависит (пробовалось брать Z целиком — на 250 срезах не влезет в память).
-    run_shape = tuple(min(patch[a], shape[a]) for a in range(nd))
-    grids = np.meshgrid(*[np.arange(s, dtype=np.float32) for s in run_shape],
-                        indexing='ij')
-
-    def _verts(name):
-        r = getattr(config, f'rays_{name}', None) or getattr(config, 'rays', None)
-        try:
-            return np.asarray(r.vertices, np.float32)      # (n_rays, nd)
-        except Exception:
-            return None
-
-    _verts_nuc, _verts_cyto = _verts('nucleus'), _verts('cytoplasm')
-
-    def _anchors(labels, coords, probs, dists, objs):
-        """Для каждой метки — точка промпта, её лучи и уверенность.
-        objs — результат find_objects(labels), считается ОДИН раз снаружи:
-        на томе 17x2048x2048 он не бесплатный, а нужен и здесь, и в _place."""
-        res = {}
-        if labels is None:
-            return res
-        if coords is not None and len(coords) > 0:
-            hi = np.array(labels.shape) - 1
-            for j in range(len(coords)):
-                c = np.clip(np.asarray(coords[j], int), 0, hi)
-                lab = int(labels[tuple(c)])
-                if lab == 0:
-                    continue
-                p = float(probs[j]) if probs is not None else 1.0
-                if lab in res and res[lab][2] >= p:
-                    continue
-                res[lab] = (c, None if dists is None else np.asarray(dists[j]), p)
-
-        for i, sl_o in enumerate(objs, start=1):
-            if sl_o is None or i in res:
-                continue
-            sub = (labels[sl_o] == i)
-            loc = np.array([s.start for s in sl_o])
-            ctr = np.array([(s.start + s.stop - 1) // 2 for s in sl_o], int)
-            if not sub[tuple(ctr - loc)]:
-                pts = np.argwhere(sub)
-                ctr = pts[np.argmin(np.abs(pts + loc - ctr).sum(axis=1))] + loc
-            res[i] = (ctr, None, 0.0)
-        return res
-
-    def _sigma(r_hint, rays_at_peak, verts):
-        """Сигма промпта из ЛУЧЕЙ ЭТОГО пика, а не из глобальной медианы:
-        генератор строит промпт как extent/4 по bbox конкретного объекта.
-        Rays_GoldenSpiral хранит verts = dir/anisotropy, поэтому |verts*dist|
-        уже в вокселях — единицы совпадают с bbox генератора. Набор берётся
-        ПО ГОЛОВЕ: направления у ядра и цитоплазмы разные, а проверка по длине
-        (96 == 96) их не различает."""
-        if (rays_at_peak is not None and verts is not None
-                and len(rays_at_peak) == len(verts)):
-            ext = np.abs(verts * np.asarray(rays_at_peak, np.float32)[:, None]).max(axis=0)
-            return np.maximum(2.0 * ext / 4.0, 1.0)          # extent = 2 * полуось
-        return np.maximum(r_hint / np.maximum(aniso, 1e-6) / 2.0, 1.0)
-
-    def _run(center, r_hint, rays_at_peak=None, head='nucleus'):
-        """Возвращает (sl, cl, nucleus_mask, cytoplasm_mask):
-        sl — окно в координатах тома, cl — центр промпта в координатах окна."""
-        lo = [max(0, min(int(center[a]) - run_shape[a] // 2,
-                         shape[a] - run_shape[a])) for a in range(nd)]
-        sl = tuple(slice(lo[a], lo[a] + run_shape[a]) for a in range(nd))
-        crop = img_full[sl]
-        if crop.ndim == nd:
-            crop = crop[..., None]
-        cl = np.clip(np.asarray(center, int) - np.asarray(lo),
-                     0, np.asarray(run_shape) - 1)
-        sig = _sigma(r_hint, rays_at_peak,
-                     _verts_cyto if head == 'cytoplasm' else _verts_nuc)
-        d2 = sum(((g - cl[a]) / sig[a]) ** 2 for a, g in enumerate(grids))
-        pr = np.exp(-0.5 * d2).astype(np.float32)[..., None]
-        _pad = np.zeros(pr.shape[:-1] + (2 * (n_pr - 1),), np.float32)
-        x = np.concatenate([crop[..., :n_img], pr, pr, _pad], axis=-1)
-        x = pad_to_multiple(x, architecture_plan(config)['input_multiple'])[None]
-        y = model.keras_model(tf.convert_to_tensor(x, tf.float32), training=False)
-
-        def _get(k):
-            # Выходы рефайна склеены по батчу как k*B + b; B=1, берём k=0.
-            a = y[k].numpy()[0]
-            a = a[..., 0] if a.shape[-1] == 1 else a
-            if a.shape != run_shape:
-                grid = config.nucleus_grid if k == 'nucleus_mask' else config.cytoplasm_grid
-                a = upsample_grid(a, run_shape, grid)
-            return a
-        return sl, cl, _get('nucleus_mask'), _get('cytoplasm_mask')
-
-    def _grow(m, cl):
-        """Послойное выращивание маски от центра промпта.
-        3D-связность здесь не годится: при anisotropy=[5,1,1] объект толщиной
-        3-5 срезов легко распадается по Z, а по слайсам он всегда цел.
-
-        СЕМЯ — максимум маски в окрестности cl, а не сам воксель cl. cl это пик
-        prob из NMS; у плоской клетки prob почти плато и пик смещён (замерено
-        12.5 px на объекте 153 px), а mask приходит из ОТДЕЛЬНОЙ рефайн-ветки
-        со своим шумом. Прежняя версия при m[cl] <= порога возвращала пустоту,
-        и рефайн для такого инстанса не давал НИЧЕГО — оставался сырой полиэдр,
-        молча, без счётчика в статистике потерь.
-
-        Радиус поиска — половина окна прогона по каждой оси, но не больше:
-        дальше это уже соседний объект. Никаких констант: всё из run_shape.
-        """
-        out = np.zeros_like(m, bool)
-        if not m.any():
-            return out
-
-        cl = np.asarray(cl, int)
-        rad = np.maximum(np.asarray(m.shape) // 8, 1)
-
-        def _seed(plane, c2d, rad2d):
-            """(индекс компоненты, cc, n) по максимуму plane в окне вокруг c2d."""
-            cc, n = _cc_label(plane)
-            if n == 0:
-                return 0, cc, n
-            lo = np.maximum(c2d - rad2d, 0)
-            hi = np.minimum(c2d + rad2d + 1, np.asarray(plane.shape))
-            win = tuple(slice(int(lo[a]), int(hi[a])) for a in range(len(c2d)))
-            sub = cc[win]
-            if not sub.any():
-                return 0, cc, n
-            # компонента, ближайшая к c2d среди попавших в окно
-            pts = np.argwhere(sub > 0)
-            j = int(np.argmin(np.abs(pts + lo - c2d).sum(axis=1)))
-            return int(sub[tuple(pts[j])]), cc, n
-
-        if nd == 2:
-            k, cc, n = _seed(m, cl, rad)
-            return (cc == k) if k > 0 else out
-
-        z0 = int(np.clip(cl[0], 0, m.shape[0] - 1))
-        k, cc, n = _seed(m[z0], cl[1:], rad[1:])
-        if k == 0:
-            # центральный слайс пуст — ищем ближайший непустой по Z
-            for dz in range(1, m.shape[0]):
-                for z_try in (z0 + dz, z0 - dz):
-                    if 0 <= z_try < m.shape[0] and m[z_try].any():
-                        k, cc, n = _seed(m[z_try], cl[1:], rad[1:])
-                        if k > 0:
-                            z0 = z_try
-                            break
-                if k > 0:
-                    break
-        if k == 0:
-            return out
-        out[z0] = (cc == k)
-
-        for step in (1, -1):
-            z = z0 + step
-            while 0 <= z < m.shape[0]:
-                prev = out[z - step]
-                if not prev.any():
-                    break
-                cc, n = _cc_label(m[z])
-                if n == 0:
-                    break
-                ids = np.unique(cc[prev & (cc > 0)])
-                ids = ids[ids > 0]
-                if ids.size == 0:
-                    break
-                out[z] = np.isin(cc, ids)
-                z += step
-        return out
-
-    def _place(labels_arr, lab, bb, sl, grown, out, area):
-        """Полиэдр + добор формы, ОГРАНИЧЕННЫЙ ничейной территорией.
-
-        Возвращает (метка, новый_ли, причина): 'ok' / 'merged' / 'occupied'.
-
-        Почему рост ограничен. labels_arr приходит из polyhedron_to_label и
-        по построению непересекающийся, а запись идёт только в out_reg == 0.
-        Поэтому out_reg[poly] > 0 достижимо ЕДИНСТВЕННЫМ путём: ранее
-        записанный инстанс разлился своей grown-маской на чужой полиэдр.
-        В прежней версии такой разлив приводил к срабатыванию критерия
-        A_inter/A_min > nms_thresh, и чужой инстанс объявлялся дубликатом —
-        то есть счётчики merged/occupied считали не схлопывания, а ПОТЕРИ.
-        Отсюда же оптимум подбора на верхнем краю nms_thresh_range: подбор
-        загонял порог вверх, чтобы отключить этот merge.
-
-        NMS уже решил, кому принадлежит территория. Рефайн имеет право
-        занимать только то, что НЕ принадлежит другому полиэдру: свой полиэдр
-        и фон. Merge оставлен как страховка и в норме не срабатывает.
-        """
-        reg = tuple(slice(min(bb[a].start, sl[a].start),
-                          max(bb[a].stop, sl[a].stop)) for a in range(nd))
-        lab_reg = labels_arr[reg]
-        poly = (lab_reg == lab)
-        out_reg = out[reg]  # view: запись идёт в out
-        n_poly = int(poly.sum())
-        if n_poly == 0:
-            return 0, False, 'occupied'
-
-        sub = out_reg[poly]
-        sub = sub[sub > 0]
-        if sub.size:
-            vals, cnts = np.unique(sub, return_counts=True)
-            a_min = np.minimum(n_poly, np.array([area.get(int(v), n_poly)
-                                                 for v in vals], np.int64))
-            iom = cnts / np.maximum(a_min, 1)
-            k = int(np.argmax(iom))
-            if iom[k] > nms_thresh:
-                return int(vals[k]), False, 'merged'
-
-        # Рост допускается на СВОЙ полиэдр и на фон полиэдральной карты.
-        own = poly | (lab_reg == 0)
-        g = np.zeros_like(poly)
-        loc = tuple(slice(sl[a].start - reg[a].start, sl[a].stop - reg[a].start)
-                    for a in range(nd))
-        g[loc] = grown
-        keep = poly | (g & own)
-
-        w = keep & (out_reg == 0)
-        if not w.any():
-            w = poly & (out_reg == 0)
-        if not w.any():
-            return 0, False, 'occupied'
-        out_reg[w] = lab
-        area[lab] = int(w.sum())
-        return lab, True, 'ok'
-
-    def _bbox(objs, lab):
-        bb = objs[lab - 1] if 0 < lab <= len(objs) else None
-        if bb is None:
-            raise RuntimeError(f"метка {lab} отсутствует в find_objects")
-        return bb
-
-    r_nuc = float(getattr(config, 'median_max_dist_nucleus', 25.0))
-    r_cyto = float(getattr(config, 'median_max_dist_cytoplasm', 60.0))
-
-    nuc_objs = [] if nuc_labels is None else find_objects(nuc_labels)
-    cyto_objs = [] if cyto_labels is None else find_objects(cyto_labels)
-
-    nuc_anchor = _anchors(nuc_labels, nuc_coords, nuc_probs, nuc_dists, nuc_objs)
-    cyto_anchor = _anchors(cyto_labels, cyto_coords, cyto_probs, cyto_dists,
-                           cyto_objs)
-
-    n_runs, n_merge_n, n_merge_c, cyto_seen = 0, 0, 0, {}
-    lost = dict(occ_n=0, occ_c=0, occ_c_free=0, seen=0, no_overlap=0)
-    seen_labels = {}  # lab_c -> список ядер, которые её уже забрали
-    # Отложенная запись цитоплазмы. Прежде клетки писались в порядке убывания
-    # prob ЯДРА: слабая клетка, прицепленная к сильному ядру, занимала фон
-    # раньше сильной соседки. Порядок обязан быть по СВОЕЙ уверенности.
-    # Маска хранится плоскими индексами (int32), а не булевым томом: полный
-    # bool на окно 16x448x448 это 3.2 МБ, на сотни клеток — гигабайты.
-    cyto_pending = {}  # lab_c -> (prob_c, sl, flat_idx, shape)
-    pairs = {}  # lab_c -> [записанные метки ядер]
-
-    # ---------- ЯДРА: запись ядра + ОПРЕДЕЛЕНИЕ пары ----------
-    for lab_n in sorted(nuc_anchor, key=lambda L: -nuc_anchor[L][2]):
-        ctr, rays, _ = nuc_anchor[lab_n]
-
-        sl, cl, mn, mc = _run(ctr, r_nuc, rays, head='nucleus')
-        n_runs += 1
-
-        this_n, new_n, why_n = _place(nuc_labels, lab_n, _bbox(nuc_objs, lab_n),
-                                      sl, _grow(mn > mask_thresh, cl),
-                                      nuc_out, area_n)
-        if why_n == 'merged':
-            n_merge_n += 1
-        elif why_n == 'occupied':
-            lost['occ_n'] += 1
-
-        if cyto_labels is None:
-            continue
-
-        # Метка цито ПОД ЦЕНТРОМ ядра — как в спецификации задачи. Полиэдр
-        # ядра это грубая звёздчатая оболочка, у стыка клеток он отдаёт
-        # большинство вокселей соседу, и max-overlap уводит пару.
-        lab_c = int(cyto_labels[tuple(int(v) for v in ctr)])
-        if lab_c == 0:
-            _m = (nuc_labels[sl] == lab_n)
-            vals, cnts = np.unique(cyto_labels[sl][_m], return_counts=True)
-            ok = vals > 0
-            lab_c = int(vals[ok][np.argmax(cnts[ok])]) if ok.any() else 0
-        if lab_c == 0:
-            lost['no_overlap'] += 1
-            continue
-
-        if lab_c in cyto_pending:
-            lost['seen'] += 1
-            seen_labels.setdefault(lab_c, []).append(lab_n)
-        else:
-            g = _grow(mc > mask_thresh, cl)
-            cyto_pending[lab_c] = (
-                float(cyto_anchor.get(lab_c, (None, None, 0.0))[2]),
-                sl, np.flatnonzero(g).astype(np.int32), tuple(g.shape))
-        if this_n:
-            pairs.setdefault(lab_c, []).append(this_n)
-
-    # ---------- КЛЕТКИ: запись в порядке СВОЕЙ уверенности ----------
-    # Клетки без ядра прогоняются здесь же, с промптом своей головы.
-    _order = sorted(
-        set(cyto_pending) | set(cyto_anchor),
-        key=lambda L: -(cyto_pending[L][0] if L in cyto_pending
-                        else float(cyto_anchor[L][2])))
-
-    for lab_c in _order:
-        if lab_c in cyto_pending:
-            _p, sl, flat, shp = cyto_pending[lab_c]
-            grown = np.zeros(shp, bool)
-            grown.flat[flat] = True
-            _free = False
-        else:
-            ctr, rays, _ = cyto_anchor[lab_c]
-            sl, cl, _mn, mc = _run(ctr, r_cyto, rays, head='cytoplasm')
-            n_runs += 1
-            grown = _grow(mc > mask_thresh, cl)
-            _free = True
-
-        got, new_c, why_c = _place(cyto_labels, lab_c,
-                                   _bbox(cyto_objs, lab_c), sl,
-                                   grown, cyto_out, area_c)
-        if why_c == 'merged':
-            n_merge_c += 1
-        elif why_c == 'occupied':
-            lost['occ_c_free' if _free else 'occ_c'] += 1
-        if got:
-            cyto_seen[lab_c] = got
-            for _tn in pairs.get(lab_c, ()):
-                assignments[_tn] = got
-
-
-    # ---------- КЛЕТКИ БЕЗ ЯДЕР ----------
-    for lab_c in sorted(cyto_anchor, key=lambda L: -cyto_anchor[L][2]):
-        if lab_c in cyto_seen:
-            continue
-        ctr, rays, _ = cyto_anchor[lab_c]
-        sl, cl, _mn, mc = _run(ctr, r_cyto, rays, head='cytoplasm')
-        n_runs += 1
-        got, new_c, why_c = _place(cyto_labels, lab_c, _bbox(cyto_objs, lab_c),
-                                   sl, _grow(mc > mask_thresh, cl),
-                                   cyto_out, area_c)
-        if why_c == 'merged':
-            n_merge_c += 1
-        elif why_c == 'occupied':
-            lost['occ_c_free'] += 1
-        if got:
-            cyto_seen[lab_c] = got
-
-    if verbose:
-        _np_ = 0 if nuc_labels is None else int(len(np.unique(nuc_labels)) - 1)
-        _cp_ = 0 if cyto_labels is None else int(len(np.unique(cyto_labels)) - 1)
-        _wn = int(len(np.unique(nuc_out)) - 1)
-        _wc = int(len(np.unique(cyto_out)) - 1)
-        _occ_c = lost['occ_c'] + lost['occ_c_free']
-        print(f"  [prompted] полиэдров nuc={_np_} cyto={_cp_} -> "
-              f"ЗАПИСАНО nuc={_wn} cyto={_wc} | "
-              f"схлопнуто как тот же объект {n_merge_n}/{n_merge_c} "
-              f"(критерий NMS, nms_thresh={nms_thresh:.2f}) | "
-              f"прогонов {n_runs}, пар ядро-клетка: {len(assignments)}")
-        print(f"  [prompted] ПОТЕРИ nuc: территория занята {lost['occ_n']} | "
-              f"баланс {_np_} - {n_merge_n} - {lost['occ_n']} = "
-              f"{_np_ - n_merge_n - lost['occ_n']} (записано {_wn})")
-        print(f"  [prompted] ПОТЕРИ cyto: территория занята {_occ_c} "
-              f"({lost['occ_c']} через ядро + {lost['occ_c_free']} без ядра) | "
-              f"метку уже забрало другое ядро {lost['seen']} | "
-              f"ядро без клетки {lost['no_overlap']} | "
-              f"баланс {_cp_} - {n_merge_c} - {_occ_c} = "
-              f"{_cp_ - n_merge_c - _occ_c} (записано {_wc})")
-        if seen_labels:
-            _cnt = sorted((len(v) + 1 for v in seen_labels.values()), reverse=True)
-            print(f"  [prompted] меток цито, забранных >1 ядром: "
-                  f"{len(seen_labels)}, ядер на них: {_cnt[:8]}")
-    return nuc_out, cyto_out, assignments
-
 def create_overlay_with_iou(image, nucleus_pred, cytoplasm_pred,
                             nucleus_gt, cytoplasm_gt,
                             iou_thresh=0.5, z_slice=None):
@@ -1741,7 +1292,7 @@ def create_overlay_with_iou(image, nucleus_pred, cytoplasm_pred,
         nucleus_gt = nucleus_gt[z_slice]
         cytoplasm_gt = cytoplasm_gt[z_slice]
         if image.ndim >= 3:
-            image = image[z_slice]  # (Z,Y,X)->(Y,X) или (Z,Y,X,C)->(Y,X,C)
+            image = image[z_slice]  # (Z,Y,X)->(Y,X) or (Z,Y,X,C)->(Y,X,C)
 
     # Convert to grayscale
     if image.ndim == 3 and image.shape[-1] in [3, 4]:
@@ -1755,7 +1306,7 @@ def create_overlay_with_iou(image, nucleus_pred, cytoplasm_pred,
     # Create figure with subplots
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
-    # Random colormap для instance масок
+    # random colormap of the instance masks
     cmap_instance = random_label_cmap()
 
     # === ROW 1: PREDICTIONS ===
@@ -1819,17 +1370,16 @@ def create_overlay_with_iou(image, nucleus_pred, cytoplasm_pred,
 
     plt.tight_layout()
 
-    # ИСПРАВЛЕНО: используем buffer_rgba() вместо tostring_rgb()
     fig.canvas.draw()
 
-    # Получаем RGBA buffer
+    # RGBA buffer
     buf = fig.canvas.buffer_rgba()
     width, height = fig.canvas.get_width_height()
 
-    # Конвертируем в numpy array
+    # as a NumPy array
     overlay = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 4))
 
-    # Убираем alpha channel (оставляем RGB)
+    # alpha channel dropped (RGB)
     overlay = overlay[:, :, :3]
 
     plt.close(fig)
@@ -2021,9 +1571,9 @@ class CytoNucsPredictor:
         self.n_rays = config.n_rays
         self.rays_nucleus = getattr(config, 'rays_nucleus', getattr(config, 'rays', None))
         self.rays_cytoplasm = getattr(config, 'rays_cytoplasm', getattr(config, 'rays', None))
-        self.rays = self.rays_nucleus  # обратная совместимость
+        self.rays = self.rays_nucleus  # config.rays is the nucleus set
         # ============================================================
-        # === ПОРОГИ из аргументов, config, или defaults ===
+        # === THRESHOLDS from the arguments, the configuration or the defaults ===
         # ============================================================
 
         # Default thresholds
@@ -2058,7 +1608,7 @@ class CytoNucsPredictor:
         # and stored with the checkpoint. Calibration passes (full validation,
         # threshold search) set calibrating=True and see ungated candidates.
         # inference.quality_gates_override replaces some or all of them (e.g. gates chosen for AP alone by
-        # recalibrate_gates.py from the full validation of the checkpoint).
+        # paper/recalibrate_gates.py from the full validation of the checkpoint).
         override = getattr(config, 'quality_gates_override', None)
         self.quality_gates = (dict(getattr(model, 'loaded_quality_gates', None) or {}, **override) if override
                               else getattr(model, 'loaded_quality_gates', None)) if config.mask_quality_min == 'auto' else None
@@ -2129,19 +1679,14 @@ class CytoNucsPredictor:
 
     def _get_detection_model(self):
         """
-        Detection-only submodel для первого StarDist прохода.
-
-        На первом проходе нужны только:
+        Detection-only submodel of the first (StarDist) pass, which needs only:
           - nucleus_prob
           - nucleus_dist
           - cytoplasm_prob
           - cytoplasm_dist
 
-        Refinement heads здесь не считаются, потому что с нулевым prompt
-        их результат не используется для финальных instances.
-
-        Настоящий refinement выполняется позже через
-        predict_instances_prompted() с реальным Gaussian prompt.
+        The refinement heads are not run here (with a zero prompt their output is not used); the refinement runs
+        later in predict_instances_prompted() with the Gaussian prompts.
         """
         if self._votes_wanted():
             # The centre-offset heads (inference.center_vote_grouping), with the semantic heads when those are wanted.
@@ -2218,40 +1763,29 @@ class CytoNucsPredictor:
             if len(cache) > 8:
                 cache.popitem(last=False)
             if not any_shape:
-                print(f"    [graph] трассировка на форму {key}")
+                print(f"    [graph] tracing for shape {key}")
         cache.move_to_end(key)
         return fn(tf.convert_to_tensor(x, tf.float32))
 
     def _predict_with_tiling(self, img, n_tiles, normalize_img):
         """
-        StarDist/CSBDeep tiled inference для CytoNucs. Работает для 2D и 3D.
+        StarDist / CSBDeep tiled inference of the detection heads, 2D and 3D.
 
-        Оси делятся на два класса:
+        Two kinds of axes:
 
-          * СВОБОДНАЯ ось: сшивается штатным csbdeep tile_iterator с overlap
-            >= context, тайлы шире обучающего патча (сеть свёрточная).
+          * a free axis is stitched by csbdeep's tile_iterator with an overlap >= the context; tiles may be larger
+            than the training patch (the network is convolutional);
 
-          * ФИКСИРОВАННАЯ ось: окно всегда содержит ровно train_patch[a]
-            отсчётов с padding до кратности сети. Окна перекрываются;
-            выход каждого окна записывается только в его центральную область.
+          * a fixed axis is cut into windows of exactly train_patch[a] samples, padded to the network's multiple.
+            The windows overlap by half and their outputs are added with Hann weights, so there are no seams.
 
-        Фиксированная ось одна: Z в 3D (окна по train_Z срезов, перекрытие
-        наполовину, выходы складываются с весом Ханна, так что швов по Z нет).
-        По Z рецептивное поле больше обучающего патча, и тайл с полным
-        контекстом по Z — это почти весь объём, который не помещается в
-        память. В 2D фиксированных осей нет: канонический StarDist tiling
-        (картинка целиком или тайлы с перекрытием >= контекста), без швов.
+        The only fixed axis is Z in 3D: along Z the receptive field exceeds the training patch, and a tile with the
+        full Z context would be nearly the whole volume. 2D has no fixed axis (StarDist tiling: the whole image or
+        tiles with an overlap >= the context). Window borders are aligned to block_sizes, so any grid works on the
+        fixed axis.
 
-        Отличия от прежней fixed-Z версии:
-          * нет `raise ... "рассчитана на ndim=3"` -> 2D работает;
-          * нет требования grid_Z=1: границы окон выравниваются по block_sizes,
-            поэтому grid по фиксированной оси может быть любым (иначе смена
-            анизотропии на новых данных ломала бы инференс уже после обучения);
-          * произвольный набор фиксированных осей, а не жёстко ось 0.
-
-        Первый проход считает только detection heads (prob/dist обеих голов);
-        zero-prompt refinement не нужен, настоящий идёт в
-        predict_instances_prompted() с реальным Gaussian prompt.
+        Only the detection heads (prob / dist of both levels) run here; the refinement runs in
+        predict_instances_prompted() with the Gaussian prompts.
         """
         from cytonucs_runtime import normalize_percentiles as normalize
         from csbdeep.internals.predict import tile_iterator
@@ -2273,8 +1807,8 @@ class CytoNucsPredictor:
             img = img[..., np.newaxis]
         elif img.ndim != nd + 1:
             raise ValueError(
-                f"_predict_with_tiling: ожидалось ndim={nd} "
-                f"или ndim+channels, получено shape={img.shape}")
+                f"_predict_with_tiling: expected ndim={nd} "
+                f"or ndim+channels, got shape={img.shape}")
 
         if normalize_img:
             img = normalize(img.astype(np.float32), 1, 99.8,
@@ -2282,9 +1816,8 @@ class CytoNucsPredictor:
         else:
             img = img.astype(np.float32, copy=False)
 
-        # Detection pass идёт с НУЛЕВЫМИ промптами. Их K пар, потому что модель
-        # строит вход на K = train_batch_size промптов; на prob/dist они не
-        # влияют — энкодер получает только img-каналы.
+        # The detection pass gets zero prompts (K pairs, as the model input holds K prompts); they do not affect
+        # prob / dist (the encoder reads the image channels only).
         _n_pr = max(1, int(getattr(self.config, 'prompts_per_crop', self.config.train_batch_size)))
         _n_pch = 2 * _n_pr
         if img.shape[-1] == _n_img:
@@ -2293,7 +1826,7 @@ class CytoNucsPredictor:
         elif img.shape[-1] != _n_img + _n_pch:
             raise ValueError(
                 f"_predict_with_tiling: channels={img.shape[-1]}, "
-                f"ожидалось {_n_img} или {_n_img + _n_pch}")
+                f"expected {_n_img} or {_n_img + _n_pch}")
 
         img_shape = tuple(int(v) for v in img.shape[:nd])
         self._last_img_shape = img_shape
@@ -2308,7 +1841,7 @@ class CytoNucsPredictor:
                 g = getattr(self.config, 'grid', (1,) * nd)
             g = tuple(int(v) for v in g)
             if len(g) != nd or any(v < 1 for v in g):
-                raise ValueError(f"Некорректный {name}: {g}")
+                raise ValueError(f"Invalid {name}: {g}")
             return g
 
         nuc_grid = _read_grid('nucleus_grid')
@@ -2325,16 +1858,15 @@ class CytoNucsPredictor:
 
         _tp = tuple(int(v) for v in self.config.train_patch_size)[-nd:]
 
-        # Фиксированная ось: Z в 3D, в 2D ни одной (StarDist tiling по всем осям). Окна обучающего
-        # размера по всем осям (прежний inference.tiling_fixed_axes) давали швы на картах: GroupNorm и
-        # контекст у каждого окна свои; канонический tiling на валидации HeLa / TissueNet не хуже и быстрее.
+        # Fixed axis: Z in 3D, none in 2D (StarDist tiling on every axis). Training-size windows on every axis would
+        # leave seams in the maps (each window has its own GroupNorm statistics and context).
         _fx_cfg = [0] if nd == 3 else []
         fixed = tuple(a in _fx_cfg for a in range(nd))
 
         for a in _fx_cfg:
             if _tp[a] % block_sizes[a] != 0:
                 raise ValueError(
-                    f"Фиксированная ось {a}: train_patch={_tp[a]} не кратен "
+                    f"Fixed axis {a}: train_patch={_tp[a]} is not a multiple of "
                     f"block_size={block_sizes[a]}")
 
         # ============================================================
@@ -2347,15 +1879,15 @@ class CytoNucsPredictor:
             n_tiles = tuple(int(v) for v in n_tiles)
             if len(n_tiles) == nd + 1:
                 if n_tiles[-1] != 1:
-                    raise ValueError("Канальная ось не может тайлиться")
+                    raise ValueError("The channel axis cannot be tiled")
                 n_tiles = n_tiles[:nd]
             if len(n_tiles) != nd or any(v < 1 for v in n_tiles):
                 raise ValueError(
-                    f"n_tiles должен иметь {nd} положительных значений, "
-                    f"получено {n_tiles}")
+                    f"n_tiles must have {nd} positive values, "
+                    f"got {n_tiles}")
 
         # ============================================================
-        # ФИКСИРОВАННЫЕ ОСИ: непересекающиеся окна по train_patch
+        # FIXED AXES: windows of train_patch
         # ============================================================
 
         def _fdown(v, d):
@@ -2373,7 +1905,7 @@ class CytoNucsPredictor:
         fixed_plans = {a: _fixed_plan(a) for a in fixed_axes}
 
         # ============================================================
-        # СВОБОДНЫЕ ОСИ: паддинг до кратности + overlap >= context
+        # FREE AXES: padding to the multiple + overlap >= context
         # ============================================================
 
         pad_free = {a: (-img_shape[a]) % block_sizes[a] for a in free_axes}
@@ -2390,23 +1922,22 @@ class CytoNucsPredictor:
 
         print(f"  Detection RF={rf_detection}, required context={context}, "
               f"block_sizes={block_sizes}")
-        print(f"  Оси: фиксированные {fixed_axes} -> окно "
-              f"train_patch, перекрытие с центральной записью; свободные {free_axes} -> tile_iterator, "
+        print(f"  Axes: fixed {fixed_axes} -> windows of "
+              f"train_patch, overlapping; free {free_axes} -> tile_iterator, "
               f"overlap="
               f"{tuple(n_block_overlaps[a] * block_sizes[a] for a in free_axes)} px")
         for a in fixed_axes:
-            print(f"    ось {a}: n={img_shape[a]}, train={_tp[a]}, "
-                  f"окон={len(fixed_plans[a])}")
+            print(f"    axis {a}: n={img_shape[a]}, train={_tp[a]}, "
+                  f"windows={len(fixed_plans[a])}")
             for i, (s0, sz, d0, d1) in enumerate(fixed_plans[a]):
                 print(f"      #{i}: src={s0}:{s0 + sz} -> dst={d0}:{d1}")
 
         # ============================================================
-        # ВЫХОДНЫЕ КАРТЫ
+        # OUTPUT MAPS
         # ============================================================
         #
-        # По фиксированным осям адресация глобальная -> размер ceil(n/grid).
-        # По свободным осям tile_iterator работает поверх ПАДДЕННОГО массива,
-        # его s_dst покрывает [0, padded) -> держим padded/grid и режем в конце.
+        # Fixed axes: global addressing, size ceil(n / grid). Free axes: tile_iterator runs on the padded array
+        # (its s_dst covers [0, padded)), so the maps hold padded / grid and are cropped at the end.
         # ============================================================
 
         def _map_shape(grid_):
@@ -2450,8 +1981,8 @@ class CytoNucsPredictor:
         # ============================================================
 
         def _put(dst, val, grid_, s_src, s_dst, fx, coverage=None):
-            """fx: {axis: (src_lo, dst_lo, dst_hi)} для фиксированных осей.
-            Для свободных осей берутся слайсы tile_iterator. Along the fixed axis the window's Hann weight multiplies
+            """fx: {axis: (src_lo, dst_lo, dst_hi)} of the fixed axes; the free axes take the slices of
+            tile_iterator. Along the fixed axis the window's Hann weight multiplies
             the values, which are added, and coverage sums the weights."""
             ss, sd = [], []
             for a in range(nd):
@@ -2460,9 +1991,9 @@ class CytoNucsPredictor:
                     src_lo, dst_lo, dst_hi = fx[a][:3]
                     if src_lo % g or dst_lo % g:
                         raise RuntimeError(
-                            f"ось {a}: окно {src_lo}/{dst_lo} не кратно grid={g}")
+                            f"axis {a}: window {src_lo}/{dst_lo} is not a multiple of grid={g}")
                     g_lo = dst_lo // g
-                    g_hi = -((-dst_hi) // g)          # ceil: последний блок
+                    g_hi = -((-dst_hi) // g)          # ceil: the last block
                     off = src_lo // g
                     sd.append(slice(g_lo, g_hi))
                     ss.append(slice(g_lo - off, g_hi - off))
@@ -2471,7 +2002,7 @@ class CytoNucsPredictor:
                     if (a_src.start % g or a_src.stop % g
                             or a_dst.start % g or a_dst.stop % g):
                         raise RuntimeError(
-                            f"ось {a}: срезы тайла не кратны grid={g}: "
+                            f"axis {a}: tile slices are not multiples of grid={g}: "
                             f"src={a_src}, dst={a_dst}")
                     ss.append(slice(a_src.start // g, a_src.stop // g))
                     sd.append(slice(a_dst.start // g, a_dst.stop // g))
@@ -2496,14 +2027,10 @@ class CytoNucsPredictor:
 
         tiles_done = 0
 
-        # ГРАФОВОЕ исполнение обязательно. Eager-вызов функциональной модели
-        # держит выходы ВСЕХ слоёв живыми до конца прохода: пик = сумма по
-        # графу, а не максимум. На тайле 16x896x896 один только
-        # nuc_features_prob это [1,16,448,448,128] = 1.64 ГБ, и таких тензоров
-        # в графе несколько -> OOM там, где graph mode проходит.
-        # tf.function с КОНКРЕТНОЙ формой (все тайлы одинаковы по построению
-        # tile_iterator) даёт планировщику переиспользовать буферы; кэш по
-        # форме нужен только на случай отличающегося последнего окна.
+        # Graph execution: an eager call of the functional model keeps the outputs of every layer alive until the end
+        # of the pass (on a 16 x 896 x 896 tile nuc_features_prob alone is 1.64 GB). A tf.function per concrete shape
+        # (tile_iterator makes all tiles alike) lets TensorFlow reuse buffers; the cache by shape covers a different
+        # last window.
         _forward = self._detection_forward
 
         def _flip_averaged(y_pred, tile):
@@ -2523,8 +2050,7 @@ class CytoNucsPredictor:
         _ov_full = tuple(n_block_overlaps) + (0,)
 
         try:
-            # Перебор окон по фиксированным осям (для 2D список пуст ->
-            # ровно одна итерация со всем изображением).
+            # windows of the fixed axes (2D: none, one iteration over the whole image)
             for combo in product(*[fixed_plans[a] for a in fixed_axes]):
                 # (src_lo, dst_lo, dst_hi, window): the window's centre, or with blending all of it
                 fx = {a: ((c[0], c[0], min(c[0] + c[1], img_shape[a]), c[1]) if blend else (c[0], c[2], c[3], c[1]))
@@ -2549,8 +2075,8 @@ class CytoNucsPredictor:
                 for a in fixed_axes:
                     if sub.shape[a] != win[a][1]:
                         raise RuntimeError(
-                            f"ось {a}: перед forward ожидалось {win[a][1]}, "
-                            f"получено {sub.shape[a]}")
+                            f"axis {a}: expected {win[a][1]} before the forward pass, "
+                            f"got {sub.shape[a]}")
 
                 for tile, s_src, s_dst in tile_iterator(
                         sub, n_tiles=_nt_full, block_sizes=_bs_full,
@@ -2586,9 +2112,9 @@ class CytoNucsPredictor:
 
         except (tf.errors.ResourceExhaustedError, tf.errors.InternalError) as e:
             raise RuntimeError(
-                f"OOM при StarDist tiling n_tiles={n_tiles}. "
-                f"Auto-splitting отключён. Увеличьте n_tiles по свободным осям "
-                f"{free_axes} явно. Ошибка: {type(e).__name__}: {e}") from e
+                f"OOM in StarDist tiling with n_tiles={n_tiles}. "
+                f"No automatic splitting: increase n_tiles on the free axes "
+                f"{free_axes}. Error: {type(e).__name__}: {e}") from e
 
         print(f"  ✅ StarDist tiling complete: {tiles_done} model forwards")
 
@@ -2600,7 +2126,7 @@ class CytoNucsPredictor:
             for _tag, _cov, _maps in (('nucleus', cov_nuc, [nucleus_prob_full, nucleus_dist_full]),
                                       ('cytoplasm', cov_cyto, [cytoplasm_prob_full, cytoplasm_dist_full])):
                 if not np.all(_cov > 0):
-                    raise RuntimeError(f"Tiling coverage нарушен для {_tag}: missing={int((_cov <= 0).sum())}")
+                    raise RuntimeError(f"Tiling coverage broken for {_tag}: missing={int((_cov <= 0).sum())}")
                 _h = _tag
                 _maps += [m[_h] for m in (semantic_full, votes_full) if m is not None]
                 for _m in _maps:
@@ -2611,14 +2137,14 @@ class CytoNucsPredictor:
             print(f"  coverage[{_tag}]: min={_mn_cov}, max={_mx_cov}")
             if _mn_cov != 1 or _mx_cov != 1:
                 raise RuntimeError(
-                    f"Tiling coverage нарушен для {_tag}: min={_mn_cov}, "
+                    f"Tiling coverage broken for {_tag}: min={_mn_cov}, "
                     f"max={_mx_cov}, missing={int((_cov == 0).sum())}, "
                     f"double={int((_cov > 1).sum())}")
 
         del cov_nuc, cov_cyto
 
         # ============================================================
-        # CROP PADDING СВОБОДНЫХ ОСЕЙ
+        # PADDING OF THE FREE AXES CROPPED
         # ============================================================
 
         def _crop(arr, grid_, rays=False):
@@ -2711,7 +2237,7 @@ class CytoNucsPredictor:
                 candidate_sink=getattr(self, '_refinement_candidate_sink', None),
                 residual=residual)
         else:
-            print("  ⚠️ Ни ядер, ни клеток -> prompted refinement не запускался")
+            print("  ⚠️ No nuclei and no cells -> no prompted refinement")
             self._prompt_assignments = None
         nucleus_instances, cytoplasm_instances = self._apply_semantic(
             nucleus_instances, cytoplasm_instances, semantic_full, dict(nucleus=nuc_grid, cytoplasm=cyto_grid))
@@ -2725,8 +2251,7 @@ class CytoNucsPredictor:
             'cytoplasm_prob': cytoplasm_prob_full,
             'nucleus_dist': nucleus_dist_full,
             'cytoplasm_dist': cytoplasm_dist_full,
-            # Zero-prompt refinement намеренно не считается: с нулевым промптом
-            # его результат в инстансы не идёт.
+            # no zero-prompt refinement: its output would not be used
             'nucleus_mask': None,
             'cytoplasm_mask': None,
             'rays_nucleus': self.rays_nucleus,
@@ -2746,17 +2271,10 @@ class CytoNucsPredictor:
 
     def predict_instances(self, img, normalize_img=True):
         """
-        Одиночный forward для тома/кадра, целиком влезающего в сеть.
+        One forward pass for a volume / image that fits into the network.
 
-        Вход выравнивается по кратности ТАК ЖЕ, как это делает tiling. Без
-        этого UNet глубины depth падает на Concatenate, когда сторона не делится
-        на base_grid * pool**depth: прежняя версия молча полагалась на «удачный»
-        размер (2048 кратно 32) и ломалась на любом другом препарате, а в 2D —
-        почти всегда.
-
-        Прежний `except ResourceExhaustedError` с обрезкой до train_patch убран:
-        он возвращал сегментацию одного угла как результат по всему кадру. Если
-        не влезает — это тайлинг, а не тихая обрезка.
+        The input is padded to the network's multiple as in tiling (a U-Net of depth d needs sides divisible by
+        base_grid * pool**d). An input that does not fit in memory needs tiling; it is never cropped silently.
         """
         from cytonucs_runtime import normalize_percentiles as normalize
         from math import gcd
@@ -2768,8 +2286,8 @@ class CytoNucsPredictor:
         if img.ndim == nd:
             img = img[..., np.newaxis]
         elif img.ndim != nd + 1:
-            raise ValueError(f"predict_instances: ожидалось ndim={nd} "
-                             f"или ndim+channels, получено {img.shape}")
+            raise ValueError(f"predict_instances: expected ndim={nd} "
+                             f"or ndim+channels, got {img.shape}")
 
         if normalize_img:
             img = normalize(img.astype(np.float32), 1, 99.8,
@@ -2784,7 +2302,7 @@ class CytoNucsPredictor:
                 [img, np.zeros(img.shape[:nd] + (_n_pch,), np.float32)], axis=-1)
         elif img.shape[-1] != _n_img + _n_pch:
             raise ValueError(f"predict_instances: channels={img.shape[-1]}, "
-                             f"ожидалось {_n_img} или {_n_img + _n_pch}")
+                             f"expected {_n_img} or {_n_img + _n_pch}")
 
         img_shape = tuple(int(s) for s in img.shape[:nd])
         self._last_img_shape = img_shape
@@ -2795,7 +2313,7 @@ class CytoNucsPredictor:
                 g = getattr(self.config, 'grid', (1,) * nd)
             g = tuple(int(v) for v in g)
             if len(g) != nd or any(v < 1 for v in g):
-                raise ValueError(f"Некорректный {nm}: {g}")
+                raise ValueError(f"Invalid {nm}: {g}")
             return g
 
         nuc_grid, cyto_grid = _rd('nucleus_grid'), _rd('cytoplasm_grid')
@@ -2812,7 +2330,7 @@ class CytoNucsPredictor:
         y_pred = self._detection_forward(img_net[np.newaxis, ...], any_shape=True)
 
         def _get(key, grid_):
-            """Срез до РЕАЛЬНОГО размера входа в grid-разрешении головы."""
+            """Cropped to the real input size at the grid resolution of the head."""
             if key not in y_pred:
                 return None
             a = np.asarray(y_pred[key])[0]
@@ -2874,8 +2392,8 @@ class CytoNucsPredictor:
                 candidate_sink=getattr(self, '_refinement_candidate_sink', None),
                 residual=residual)
         else:
-            print("  ⚠️  Ни ядер, ни клеток -> промпт-ветка НЕ ЗАПУСКАЛАСЬ. "
-                  "Возвращены сырые полиэдры StarDist.")
+            print("  ⚠️  No nuclei and no cells -> no prompted refinement; "
+                  "the StarDist polygons are returned.")
             self._prompt_assignments = None
         nucleus_instances, cytoplasm_instances = self._apply_semantic(
             nucleus_instances, cytoplasm_instances, semantic, dict(nucleus=nuc_grid, cytoplasm=cyto_grid))
@@ -2902,27 +2420,19 @@ class CytoNucsPredictor:
             nms_thresh
     ):
         """
-        Fast StarDist post-processing для больших 3D cytoplasm объектов.
+        Fast StarDist post-processing for large 3D objects.
 
         Pipeline:
             prob/dist
               -> threshold
               -> spatial candidate preselection
-              -> ОДИН StarDist sparse NMS
+              -> one StarDist sparse NMS
               -> polyhedron_to_label
 
-        В отличие от прежней реализации:
-            - нет iterative rounds;
-            - нет covered mask;
-            - нет повторных NMS;
-            - нет повторного render внутри NMS loop.
+        The candidate preselection only keeps the computation feasible (a dense StarDist NMS over hundreds of
+        thousands of large 3D polyhedra is impractical).
 
-        Candidate preselection используется только для вычислительной
-        осуществимости: dense StarDist NMS для сотен тысяч крупных 3D
-        polyhedra практически непригоден.
-
-        GRID/RAYS и размер кандидирующего окна выбираются отдельно
-        для nucleus/cytoplasm.
+        Grid, rays and the size of the candidate window are chosen per level.
         """
         import numpy as np
 
@@ -3101,28 +2611,12 @@ class CytoNucsPredictor:
         ext = expected_object_extent(self.config, obj_type, full_shape)
 
         # ============================================================
-        # CANDIDATE PRESELECTION — ПЕРЕКРЫВАЮЩИЕСЯ ЛОКАЛЬНЫЕ МАКСИМУМЫ
+        # CANDIDATE PRESELECTION: LOCAL MAXIMA IN A SLIDING WINDOW
         # ============================================================
         #
-        # Прежняя версия резала карту на НЕПЕРЕСЕКАЮЩИЕСЯ блоки step и брала по
-        # одному argmax на блок. Два дефекта:
-        #
-        #   1. Жёсткий лимит «один кандидат на блок». ext выводится из ОДНОЙ
-        #      глобальной median_max_dist_*, а обучение идёт на двух доменах
-        #      (плоские EA.hy926 bbox ~[5,153,154] и сфероиды HeLa). Медиана по
-        #      объединению задаёт окно под крупные клетки, и в мелком домене два
-        #      соседних центра штатно попадают в один блок — один не доживает
-        #      до sparse NMS. Каждая такая потеря это потерянная пара JTPR.
-        #   2. Блоки привязаны к координатной сетке: настоящий локальный
-        #      максимум у границы блока проигрывает соседу, который локальным
-        #      максимумом не является.
-        #
-        # maximum_filter даёт локальные максимумы в СКОЛЬЗЯЩЕМ окне: лимита на
-        # блок нет, привязки к сетке нет, стоимость та же (фильтр сепарабельный).
-        # Дедупликацию по-настоящему делает sparse NMS ниже — у него на каждый
-        # кандидат свои лучи, в отличие от единого окна здесь. Поэтому окно
-        # теперь ЧИСТО вычислительный тормоз, и его можно смело уменьшать
-        # (nms_candidate_spacing 0.10-0.15) — качество от этого только растёт.
+        # maximum_filter keeps the local maxima of a sliding window: no limit per block and no tie to a grid, at the
+        # cost of a separable filter. The sparse NMS below does the real deduplication (with each candidate's own
+        # rays), so the window only bounds the computation and may be small (nms_candidate_spacing 0.10-0.15).
         # ============================================================
 
         from scipy.ndimage import maximum_filter
@@ -3184,13 +2678,12 @@ class CytoNucsPredictor:
             )
             return _empty()
 
-        # Потолок числа кандидатов — только ради стоимости sparse NMS.
-        # Отбор по prob, а не по положению: пространственного смещения нет.
+        # A cap on the candidates, for the cost of the sparse NMS only; selected by probability (no spatial bias).
         _cap = int(getattr(self.config, 'nms_max_candidates', 300000))
         if len(candidates) > _cap:
             _v = prob[tuple(candidates[:, a] for a in range(self.ndim))]
             candidates = candidates[np.argsort(_v)[::-1][:_cap]]
-            print(f"  [{obj_type}] кандидатов урезано до потолка {_cap}")
+            print(f"  [{obj_type}] candidates capped at {_cap}")
 
         # ============================================================
         # CANDIDATE DATA
@@ -3217,7 +2710,7 @@ class CytoNucsPredictor:
                 * np.asarray(grid)[None, :]
         ).astype(np.float32)
 
-        # Сортируем по prob до sparse NMS.
+        # sorted by probability before the sparse NMS
         order = np.argsort(
             candidate_prob
         )[::-1]
@@ -3468,7 +2961,7 @@ class CytoNucsPredictor:
         # For debugging/validation
         print(f"  Assigned {len(assignments)} nuclei to cells")
         if len(unassigned) > 0:
-            print(f"  {len(unassigned)} nuclei без назначенной клетки (сохранены)")
+            print(f"  {len(unassigned)} nuclei without a cell (kept)")
 
         return nucleus_instances, cytoplasm_instances
 
@@ -3477,29 +2970,17 @@ class CytoNucsPredictor:
                             nms_thresh_range=[0.15, 0.2, 0.25, 0.3, 0.4],
                             mask_thresh_range=None, val_assignments=None):
         """
-        Подбор порогов по JTPR — это целевая метрика задачи: она штрафует и за
-        пропущенное ядро, и за пропущенную клетку, и за неверную пару. AP по
-        одной голове ни того, ни другого не учитывает; compute_dice усредняет
-        по совпавшим парам и за FP не штрафует вовсе.
+        Threshold search by JTPR (it counts a missed nucleus, a missed cell and a wrong pair; the AP of one level
+        counts none of the pairs). JTPR is one number for both levels, so the search is a coordinate descent instead
+        of the full product:
 
-        JTPR — ОДНО число на обе головы, поэтому пороги голов не разделяются на
-        независимые задачи, как это было при подборе по AP. Вместо декартова
-        произведения (которое стоило бы куба) идёт покоординатный спуск:
+          1) shared prob x nms          coarse setting of the peaks;
+          2) nucleus prob, cell fixed;
+          3) cell prob, nucleus fixed;
+          4) mask_thresh                the mask size at the thresholds found.
 
-          1) общий prob x nms         — грубая настройка списка пиков;
-          2) prob ядра при фикс. цито — уточнение одной координаты;
-          3) prob цито при фикс. ядре — уточнение второй;
-          4) mask_thresh              — размер масок при найденных порогах.
-
-        Стоимость аддитивная: P*N + 2P + M прогонов вместо P^2*N*M. Каждый шаг
-        не ухудшает JTPR по построению, потому что предыдущая точка входит в
-        перебор и результаты кэшируются.
-
-        nms_thresh здесь управляет ДВУМЯ шагами: sparse NMS и тестом
-        тождественности в _place. Второй раньше молча брал config.nms_thresh и
-        в подборе не участвовал.
-
-        Тайлинг включается автоматически — тот же путь, что и на инференсе.
+        Cost: P*N + 2P + M predictions instead of P^2*N*M. No step lowers the JTPR (the previous point is part of
+        every scan, results are cached). Tiling as at inference.
         """
         from itertools import product
         from stardist.matching import matching_dataset
@@ -3531,8 +3012,7 @@ class CytoNucsPredictor:
                                                  normalize_img=False)
             return self.predict_instances(img, normalize_img=False)
 
-        # Кэш по ПОЛНОМУ набору порогов: покоординатный спуск переоценивает
-        # уже посчитанные точки, а один прогон стоит минуты.
+        # cache by the full set of thresholds: the coordinate descent revisits points, and a prediction takes minutes
         _cache = {}
 
         def _score(tag=None):
@@ -3543,7 +3023,7 @@ class CytoNucsPredictor:
                    self.config.mask_thresh_nucleus, self.config.mask_thresh_cytoplasm)
             if key in _cache:
                 if tag:
-                    print(f"  {tag} | JTPR={_cache[key][0]:.4f} (из кэша)")
+                    print(f"  {tag} | JTPR={_cache[key][0]:.4f} (cached)")
                 return _cache[key]
 
             t0 = time.time()
@@ -3555,9 +3035,8 @@ class CytoNucsPredictor:
                 nuc_pred, cyto_pred, _ = _predict(img)
                 pn.append(nuc_pred)
                 pc.append(cyto_pred)
-                # None = промпт-ветка не запускалась (тогда законен фолбэк),
-                # {} = запустилась и дала 0 пар (тогда JTPR обязан быть 0).
-                # Прежнее `or None` эти два случая склеивало.
+                # None = the prompted refinement did not run (pairs by overlap); {} = it ran and gave no pairs
+                # (JTPR 0).
                 _j, _d = compute_jtpr(nucleus_pred=nuc_pred,
                                       cytoplasm_pred=cyto_pred,
                                       nucleus_gt=gn, cytoplasm_gt=gc,
@@ -3579,7 +3058,7 @@ class CytoNucsPredictor:
             ac = float(np.mean([s.accuracy for s in sc]))
 
             if tag:
-                print(f"  {tag} ({time.time() - t0:.0f} с) | "
+                print(f"  {tag} ({time.time() - t0:.0f} s) | "
                       f"JTPR={jtpr:.4f} ({tp_j}/{tot_j}) | "
                       f"nuc AP={an:.3f} @50={sn[0].accuracy:.3f} "
                       f"TP/FP/FN={sn[0].tp}/{sn[0].fp}/{sn[0].fn} | "
@@ -3602,10 +3081,10 @@ class CytoNucsPredictor:
                     if getattr(self.config, 'mask_thresh_' + head) not in (None, 'auto'):
                         setattr(self.config, 'mask_thresh_' + head, float(mask_))
 
-        # ---------- СТАДИЯ 1: общий prob x nms ----------
-        print(f"[1/4] общий prob x nms — "
-              f"{len(prob_thresh_range) * len(nms_thresh_range)} комбинаций "
-              f"x {len(val_images)} томов (mask_thresh={_mask_saved})")
+        # ---------- STEP 1: shared prob x nms ----------
+        print(f"[1/4] shared prob x nms: "
+              f"{len(prob_thresh_range) * len(nms_thresh_range)} combinations "
+              f"x {len(val_images)} volumes (mask_thresh={_mask_saved})")
         best = (_score('initial thresholds')[0], float(self.prob_thresh_nucleus),
                 float(self.prob_thresh_cytoplasm), float(self.nms_thresh))
         for p, n in product(prob_thresh_range, nms_thresh_range):
@@ -3614,35 +3093,35 @@ class CytoNucsPredictor:
             if j > best[0]:
                 best = (j, p, p, n)
         _set(pn_=best[1], pc_=best[2], nms_=best[3])
-        print(f"  ▸ стадия 1: prob={best[1]} nms={best[3]} JTPR={best[0]:.4f}")
+        print(f"  ▸ step 1: prob={best[1]} nms={best[3]} JTPR={best[0]:.4f}")
 
-        # ---------- СТАДИЯ 2: prob ядра ----------
-        print(f"[2/4] prob ядра при cyto={best[2]}, nms={best[3]}")
+        # ---------- STEP 2: nucleus prob ----------
+        print(f"[2/4] nucleus prob with cyto={best[2]}, nms={best[3]}")
         for p in prob_thresh_range:
             _set(pn_=p)
             j = _score(f"prob_nuc={p:.2f}")[0]
             if j > best[0]:
                 best = (j, p, best[2], best[3])
         _set(pn_=best[1])
-        print(f"  ▸ стадия 2: prob_nuc={best[1]} JTPR={best[0]:.4f}")
+        print(f"  ▸ step 2: prob_nuc={best[1]} JTPR={best[0]:.4f}")
 
-        # ---------- СТАДИЯ 3: prob цитоплазмы ----------
-        print(f"[3/4] prob цитоплазмы при nuc={best[1]}, nms={best[3]}")
+        # ---------- STEP 3: cytoplasm prob ----------
+        print(f"[3/4] cytoplasm prob with nuc={best[1]}, nms={best[3]}")
         for p in prob_thresh_range:
             _set(pc_=p)
             j = _score(f"prob_cyto={p:.2f}")[0]
             if j > best[0]:
                 best = (j, best[1], p, best[3])
         _set(pc_=best[2])
-        print(f"  ▸ стадия 3: prob_cyto={best[2]} JTPR={best[0]:.4f}")
+        print(f"  ▸ step 3: prob_cyto={best[2]} JTPR={best[0]:.4f}")
 
-        # ---------- СТАДИЯ 4: mask_thresh ----------
+        # ---------- STEP 4: mask_thresh ----------
         if mask_thresh_range is None:
             mask_thresh_range = list(getattr(self.config, 'mask_thresh_range',
                                              [0.25, 0.35, 0.45, 0.55]))
         mask_thresh_range = sorted(set([_mask_saved] + list(mask_thresh_range)))
-        print(f"[4/4] mask_thresh — {len(mask_thresh_range)} значений "
-              f"при найденных prob/nms")
+        print(f"[4/4] mask_thresh: {len(mask_thresh_range)} values "
+              f"at the prob / nms found")
         best_mask, best_mask_j = _mask_saved, _score()[0]
         best_heads = _heads_saved
         for mt in mask_thresh_range:
@@ -3668,8 +3147,8 @@ class CytoNucsPredictor:
             if len(rng) > 1 and (v == min(rng) or v == max(rng)):
                 _edge.append(f"{nm}={v}")
         if _edge:
-            print(f"  ⚠️  оптимум на КРАЮ диапазона: {', '.join(_edge)} — "
-                  f"расширь список, настоящий оптимум может лежать дальше")
+            print(f"  ⚠️  optimum at the edge of the range: {', '.join(_edge)}; "
+                  f"the true optimum may lie beyond, extend the range")
 
         best_params = {
             'prob_thresh_nucleus': float(best[1]),
@@ -3680,20 +3159,14 @@ class CytoNucsPredictor:
             'mask_thresh_cytoplasm': best_heads[1],
             'jtpr': float(best_mask_j),
         }
-        print(f"Best parameters (по JTPR): {best_params}")
+        print(f"Best parameters (by JTPR): {best_params}")
         return best_params
 
 
 
 def load_gt_assignments(mask_or_image_path, dirname='assignments'):
-    """Истинный mapping {nucleus_id: cytoplasm_id} из <split>/assignments/<stem>.json.
-
-    Тот же файл, который читает генератор (data_generator.repool). Метрика его
-    до сих пор игнорировала и пересчитывала эвристикой compute_nucleus_cell_
-    assignments с max_distance=100: она засчитывает принадлежность при 1%
-    перекрытия и назначает ВСЕ оставшиеся ядра ближайшей клетке в изотропной
-    метрике. Свободные ядра попадали в знаменатель JTPR, то есть метрика имела
-    потолок ниже 1.0 при идеальной сегментации.
+    """Annotated pairs {nucleus_id: cytoplasm_id} from <split>/assignments/<stem>.json (the file the generator reads
+    in repool), so that the JTPR counts the annotated pairs rather than pairs derived by overlap.
     """
     from pathlib import Path
     import json
@@ -3734,8 +3207,7 @@ def compute_jtpr(nucleus_pred, cytoplasm_pred, nucleus_gt, cytoplasm_gt, iou_thr
         # Geometric fallback may differ from annotated biological pairs.
         assignments_gt, _, _ = compute_nucleus_cell_assignments(nucleus_gt, cytoplasm_gt)
     else:
-        # Отфильтровать пары, которых нет в ЭТОМ томе: mapping считался по
-        # полному изображению, а сюда мог прийти кроп или подмножество меток.
+        # pairs absent from this volume are dropped (the mapping is of the whole image; this may be a crop)
         _n_ids = set(int(v) for v in np.unique(nucleus_gt) if v > 0)
         _c_ids = set(int(v) for v in np.unique(cytoplasm_gt) if v > 0)
         assignments_gt = {int(n): int(c) for n, c in dict(assignments_gt).items()
@@ -3944,7 +3416,7 @@ def create_comprehensive_figure(image, nucleus_pred, cytoplasm_pred,
 
     # Determine layout
     has_gt = (nucleus_gt is not None and cytoplasm_gt is not None)
-    n_cols = 5 if has_gt else 4  # Добавили колонку для GT
+    n_cols = 5 if has_gt else 4  # one more column with the ground truth
 
     fig = plt.figure(figsize=(6 * n_cols, 12))
 
@@ -4127,8 +3599,8 @@ def compute_all_metrics(img, nucleus_pred, cytoplasm_pred,
 
     # WBR metric
     if details and 'nucleus_prob' in details and 'cytoplasm_prob' in details:
-        # Контейнер — бинарные инстансы клеток, а не cytoplasm_prob: последний
-        # это edt_prob, и порог по нему относит бо́льшую часть клетки к «снаружи».
+        # The container is the binary cell instances, not cytoplasm_prob (an EDT map: a threshold on it would put
+        # most of a cell outside).
         wbr_ratio = monitor_wbr_metric(
             details['nucleus_prob'],
             details['cytoplasm_prob'],
@@ -4276,9 +3748,7 @@ def process_single_image(predictor, image_path, output_dir,
             cytoplasm_gt = imageio.volread(gt_cyto_path)
             print(f"  Loaded GT cytoplasm")
 
-    # Run inference. Тайлинг — тот же путь, что в run_inference_only: без него
-    # том больше патча либо не влезает в память, либо молча обрезается до
-    # патча внутри except ResourceExhaustedError.
+    # Run inference, with the tiling of run_inference_only (a volume larger than the patch needs it).
     print("  Predicting...")
     _patch = tuple(int(p) for p in predictor.config.train_patch_size)
     _shp = img.shape[:predictor.ndim]
