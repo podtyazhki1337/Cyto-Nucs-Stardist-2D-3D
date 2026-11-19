@@ -18,6 +18,7 @@ and scored with score_predictions.py in the CytoNucs env, like every other metho
     counts (Cellpose's metrics: TP / (TP + FP + FN), as ours); object size: the diameter of the training labels.
 
 Usage (cellpose env):
+  python run_cellpose.py --data DIR --name NAME --gpu 0 --cell-channels 1 3 --nucleus-channel 3 --predict-only --split holdout
   python run_cellpose.py --data DIR --name NAME --gpu 0 --cell-channels 1 3 --nucleus-channel 3 [--split test]
   python run_cellpose.py --data DIR --name NAME --gpu 0 --cell-channels 1 3 --nucleus-channel 3 --pretrained-only
 then (CytoNucs env):  python score_predictions.py --data DIR --predictions <basedir>/<name>/predictions --split test
@@ -41,7 +42,13 @@ parser.add_argument('--nimg-per-epoch', type=int, default=800)
 parser.add_argument('--batch', type=int, default=8)
 parser.add_argument('--split', nargs='+', default=['test'])
 parser.add_argument('--pretrained-only', action='store_true', help='no fine-tuning: the pretrained cyto3 / nuclei models')
+parser.add_argument('--predict-only', action='store_true',
+                    help='no training: the models and settings of <basedir>/<name>/training.json predict --split (its '
+                         'seconds go to predict_seconds.json; training.json is not changed)')
 parser.add_argument('--basedir', default='/storage02/miroslavm/cytonucs_paper_runs/cellpose')
+parser.add_argument('--seed', type=int, default=0,
+                    help="0: Cellpose's own sampling (it seeds numpy with the epoch number); k > 0 offsets those seeds by "
+                         "k * 1000003 and seeds torch with k, so the runs see other crops and augmentations")
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
@@ -54,6 +61,11 @@ UNKNOWN = 65535
 TAUS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 CELLPROB, FLOW = (-1.0, 0.0, 1.0), (0.4, 0.6)
 DATA, OUT = Path(args.data), Path(args.basedir) / args.name
+if args.seed:
+    # train_seg calls np.random.seed(epoch) every epoch: the same crops in every run whatever the global seed.
+    _numpy_seed = np.random.seed
+    np.random.seed = lambda seed=None: _numpy_seed(None if seed is None else (int(seed) + args.seed * 1000003) % 2 ** 32)
+    torch.manual_seed(args.seed)
 LEVELS = {args.outer: dict(pretrained='cyto3', channels=list(args.cell_channels)),
           args.inner: dict(pretrained='nuclei', channels=[args.nucleus_channel, 0])}
 
@@ -112,7 +124,7 @@ def main():
         total = torch.cuda.get_device_properties(0).total_memory / 2 ** 20
         torch.cuda.set_per_process_memory_fraction(min(1.0, limit / total))
     from importlib.metadata import version
-    info = dict(name=args.name, data=str(DATA), pretrained_only=args.pretrained_only, levels={},
+    info = dict(name=args.name, data=str(DATA), seed=args.seed, pretrained_only=args.pretrained_only, levels={},
                 cellpose=version('cellpose'), torch=torch.__version__)
     val_images = [tifffile.imread(DATA / 'val' / 'images' / n) for n in names('val')]
     chosen = {}
@@ -154,6 +166,13 @@ def main():
                                      parameters=int(sum(p.numel() for p in (model.cp if args.pretrained_only else model).net.parameters())),
                                      weights=None if path is None else str(path))
         print(level, json.dumps({k: v for k, v in info['levels'][level].items() if k != 'val_ap'}), flush=True)
+    info['seconds'] = predict_splits(chosen)
+    (OUT / 'training.json').write_text(json.dumps(info, indent=2, default=str))
+    print('->', OUT / 'predictions')
+
+
+def predict_splits(chosen):
+    """Labels of every level for the images of --split into <OUT>/predictions/<split>/<level>/; seconds per image."""
     timing = {}
     for split in args.split:
         for name in names(split):
@@ -165,10 +184,24 @@ def main():
                 tifffile.imwrite(OUT / 'predictions' / split / level / name, labels.astype(np.uint16), photometric='minisblack',
                                  compression='zlib')
             timing[f'{split}/{name}'] = time.time() - started
-    info['seconds'] = timing
-    (OUT / 'training.json').write_text(json.dumps(info, indent=2, default=str))
+    return timing
+
+
+def predict_only():
+    """--predict-only: the trained (or pretrained) models of training.json with their chosen settings."""
+    info = json.loads((OUT / 'training.json').read_text())
+    gpu = torch.cuda.is_available()
+    chosen = {}
+    for level, spec in info['levels'].items():
+        model = (models.Cellpose(gpu=gpu, model_type=spec['pretrained']) if info.get('pretrained_only') else
+                 models.CellposeModel(gpu=gpu, pretrained_model=spec['weights']))
+        chosen[level] = (model, spec['diameter'], (spec['cellprob_threshold'], spec['flow_threshold']))
+    seconds = predict_splits(chosen)
+    path = OUT / 'predict_seconds.json'
+    previous = json.loads(path.read_text()) if path.is_file() else {}
+    path.write_text(json.dumps({**previous, **seconds}, indent=1))
     print('->', OUT / 'predictions')
 
 
 if __name__ == '__main__':
-    main()
+    predict_only() if args.predict_only else main()

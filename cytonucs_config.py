@@ -23,7 +23,7 @@ METHOD_SETTINGS = {
                      val_loss_every_n_epochs=10, keep_epoch_checkpoints=1, reset_best_on_resume=False,
                      train_batch_size=2, predicted_prompt_fraction=0.25, predicted_prompt_start_epoch=10,
                      predicted_prompt_sample_peaks=True, cell_predicted_nucleus_fraction=0.5,
-                     nucleus_prob_grid_normalize=True, tile_sampling_by_objects=0.0),
+                     nucleus_prob_grid_normalize=True, tile_sampling_by_objects=0.0, jit_compile=False),
     'loss_params': dict(checkpoint_w_jtpr=0.5, dist_loss='mae', huber_delta=1.0, mask_overlap_loss='lovasz',
                         mask_ce_class_balance=False, mask_quality_target='component',
                         mask_quality_ignore_boundary_targets=True, object_losses_include_crop_cut=True),
@@ -49,7 +49,7 @@ METHOD_SETTINGS = {
                       mask_overlap_nucleus=0.85, mask_overlap_cytoplasm=0.85, pair_min_overlap=0.1,
                       pair_min_mask_iou=0.25, refinement_adaptive_roi=True, refinement_roi_snap=True,
                       cell_roi_expansion_steps=2, refinement_batch=32, eval_splits=['val'], save_pred_tiff=True,
-                      max_prompts_per_head='auto'),
+                      max_prompts_per_head='auto', outer_from_inner_prompts=True),
     'output': dict(save_history=True, save_best_dice=True),
     'gpu_config': dict(allow_growth=True, memory_limit=None),
 }
@@ -176,7 +176,7 @@ class CytoNucsConfig:
                       refinement_full_resolution=False, unet_norm_groups=0,
                       levels=['nucleus', 'cytoplasm']),
         'training': dict(seed=42, image_batch_size=1, prompts_per_crop=None, nucleus_prob_grid_normalize=False,
-                         log_every_steps=20, prefetch_workers=3, prefetch_depth=3,
+                         log_every_steps=20, prefetch_workers=3, prefetch_depth=3, jit_compile=False,
                          predicted_prompt_fraction=0.0, predicted_prompt_start_epoch=10,
                          detector_prompt_slots=0, cell_predicted_nucleus_fraction=0.0,
                          predicted_prompt_sample_peaks=False, reset_best_on_resume=False,
@@ -206,7 +206,8 @@ class CytoNucsConfig:
                           residual_proposals=False, refinement_roi_snap=False, tta_flips=False, refinement_batch=0,
                           refinement_windows=False, max_prompts_per_head=0,
                           skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0,
-                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25),
+                          refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25,
+                          outer_from_inner_prompts=True),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1, negative_prompt_inside_outer=0.0,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -589,7 +590,7 @@ class CytoNucsConfig:
                     'mask_quality_use_scores', 'prompt_inside_target', 'mask_ce_class_balance', 'refinement_stage_audit', 'nucleus_prob_grid_normalize',
                     'residual_proposals', 'object_losses_include_crop_cut', 'refinement_roi_snap', 'tta_flips',
                     'object_losses_min_area_from_gate', 'refinement_full_resolution', 'train_region_crops',
-                    'partial_annotation'):
+                    'partial_annotation', 'outer_from_inner_prompts', 'jit_compile'):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(f'{key} must be boolean')
         # Residual prompts are added after the first object assembly into free voxels only.

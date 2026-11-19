@@ -55,19 +55,37 @@ def _calculate_ap(precision, recall):
     ap = np.sum((recall[x] - recall[x - 1]) * precision[x])
 
     return ap
+def batch_tensors(batch):
+    """A generator batch (x, y) as tensors: floating arrays as float32, integer arrays as int32, other values as they are."""
+    x, y = batch
+    converted = {}
+    for key, value in y.items():
+        if isinstance(value, np.ndarray) and value.dtype.kind in 'fiu':
+            # numpy casts without the GIL (the ray targets arrive as float16), TensorFlow then only copies.
+            value = tf.convert_to_tensor(np.asarray(value, np.float32 if value.dtype.kind == 'f' else np.int32))
+        elif isinstance(value, np.ndarray):
+            value = tf.convert_to_tensor(value)
+        converted[key] = value
+    return tf.convert_to_tensor(np.asarray(x, np.float32)), converted
+
+
 class _Prefetcher:
-    """Bounded ordered prefetch: reproducible samples regardless of worker timing."""
-    def __init__(self, gen, depth=3, workers=3, count=None):
+    """Bounded ordered prefetch: reproducible samples regardless of worker timing.
+
+    convert: applied to every batch in its worker (batch_tensors: the training loop then gets tensors and does not
+    spend its own time between two steps on the conversion)."""
+    def __init__(self, gen, depth=3, workers=3, count=None, convert=None):
         from concurrent.futures import ThreadPoolExecutor
         from collections import deque
         self._gen, self._next = gen, 0
+        self._item = gen.__getitem__ if convert is None else (lambda index: convert(gen[index]))
         self._count = len(gen) if count is None else int(count)
         self._pool = ThreadPoolExecutor(max_workers=max(1, workers))
         self._futures = deque()
         for _ in range(min(max(1, depth), self._count)):
             self._submit()
     def _submit(self):
-        self._futures.append(self._pool.submit(self._gen.__getitem__, self._next))
+        self._futures.append(self._pool.submit(self._item, self._next))
         self._next += 1
     def next(self):
         result = self._futures.popleft().result()
@@ -348,6 +366,12 @@ class CytoNucsTrainer:
             self.prompt_detector = tf.keras.Model(model.keras_model.inputs,
                 {h+'_'+kind:model.keras_model.output[h+'_'+kind]
                  for h in ('nucleus','cytoplasm') for kind in ('prob','dist')})
+        # Detector prompts from the prob / dist of the training pass itself (model.detection_model, then
+        # model.prompted_model with the prompts): the separate detector pass computed the same prob / dist once
+        # more (no layer of the backbone depends on the training flag). Mask prompts need a complete pass of
+        # their own and keep the single call.
+        self.two_calls = self.prompt_detector is not None and not config.mask_prompt_fraction
+        self.compiled = None
         self.current_step = 0
         self.current_epoch_var = tf.Variable(1, dtype=tf.int32, trainable=False)
         # Setup optimizer
@@ -449,24 +473,48 @@ class CytoNucsTrainer:
 
         # cytonucs_trainer.py - ЛУЧШИЙ ВАРИАНТ с tf.py_function
 
+    def _detection(self, x_batch):
+        """model.detection_model in training mode, the first call of the two-call step. training.jit_compile: compiled
+        with XLA (the same operations, fused: GroupNorm and the activations are chains of element-wise passes over
+        the feature maps otherwise). The prompted networks are not compiled: their windows are cut where the prompts
+        lie, and XLA takes such positions, and with them the whole input, as constants of one compilation."""
+        net = self.model.detection_model
+        if not getattr(self.config, 'jit_compile', False):
+            return net(x_batch, training=True)
+        if self.compiled is None:
+            self.compiled = tf.function(lambda x: net(x, training=True), jit_compile=True)
+        return self.compiled(x_batch)
+
     @tf.function
     def train_step(self, x_batch, y_batch_dict):
         original_prompts = x_batch
         nuclear_cell_fraction = tf.constant(0., tf.float32)
-        if self.prompt_detector is not None:
-            x_batch, nuclear_cell_fraction = tf.cond(self.current_epoch_var >= self.config.predicted_prompt_start_epoch,
-                lambda: self._predicted_prompts(x_batch, y_batch_dict, return_stats=True),
-                lambda: (x_batch, tf.constant(0., tf.float32)))
-        # Quality targets read the prompts' Gaussian geometry: taken before mask prompts are added.
-        y_batch_dict = self._mask_quality_inputs(x_batch, y_batch_dict)
-        detector_prompts = x_batch
         mask_prompt_share = tf.constant(0., tf.float32)
-        if self.config.mask_prompt_fraction:
-            x_batch, mask_prompt_share = tf.cond(self.current_epoch_var >= self.config.mask_prompt_start_epoch,
-                lambda: self._mask_prompts(x_batch),
-                lambda: (x_batch, tf.constant(0., tf.float32)))
+        if not self.two_calls:
+            if self.prompt_detector is not None:
+                x_batch, nuclear_cell_fraction = tf.cond(self.current_epoch_var >= self.config.predicted_prompt_start_epoch,
+                    lambda: self._predicted_prompts(x_batch, y_batch_dict, return_stats=True),
+                    lambda: (x_batch, tf.constant(0., tf.float32)))
+            # Quality targets read the prompts' Gaussian geometry: taken before mask prompts are added.
+            y_batch_dict = self._mask_quality_inputs(x_batch, y_batch_dict)
+            detector_prompts = x_batch
+            if self.config.mask_prompt_fraction:
+                x_batch, mask_prompt_share = tf.cond(self.current_epoch_var >= self.config.mask_prompt_start_epoch,
+                    lambda: self._mask_prompts(x_batch),
+                    lambda: (x_batch, tf.constant(0., tf.float32)))
         with tf.GradientTape() as tape:
-            y_pred = self.model.keras_model(x_batch, training=True)
+            if self.two_calls:
+                first = self._detection(x_batch)
+                y_pred = dict(first['outputs'])
+                detector = {key: tf.stop_gradient(y_pred[key]) for key in self.prompt_detector.output}
+                x_batch, nuclear_cell_fraction = tf.cond(self.current_epoch_var >= self.config.predicted_prompt_start_epoch,
+                    lambda: self._predicted_prompts(original_prompts, y_batch_dict, return_stats=True, pred=detector),
+                    lambda: (original_prompts, tf.constant(0., tf.float32)))
+                y_batch_dict = self._mask_quality_inputs(x_batch, y_batch_dict)
+                detector_prompts = x_batch
+                y_pred.update(self.model.prompted_model([x_batch] + list(first['features']), training=True))
+            else:
+                y_pred = self.model.keras_model(x_batch, training=True)
             loss = self.loss_fn(y_batch_dict, y_pred, current_epoch=self.current_epoch_var)
 
         for hi, head in enumerate(('nucleus', 'cytoplasm')):
@@ -604,14 +652,16 @@ class CytoNucsTrainer:
                 channels.append(tf.where(select, mask_prompt(gaussian, mask), gaussian))
         return tf.stop_gradient(tf.concat(channels, axis=-1)), tf.reduce_mean(tf.cast(chosen, tf.float32))
 
-    def _predicted_prompts(self, x, targets, return_stats=False):
+    def _predicted_prompts(self, x, targets, return_stats=False, pred=None):
         """Detached detector prompts with existing GT ownership and hard negatives.
 
         Select a detector peak inside the selected GT target and derive its
         width from predicted rays. Empty targets use a detector peak on GT background.
         No arbitrary positive instance is mislabeled as a negative.
+        pred: prob / dist of both heads for x if already computed, else a detector pass computes them.
         """
-        pred = self.prompt_detector(x, training=False)
+        if pred is None:
+            pred = self.prompt_detector(x, training=False)
         nd, batch = self.config.ndim, tf.shape(x)[0]
         shape = tf.shape(x)[1:nd+1]
         axes = tf.meshgrid(*[tf.cast(tf.range(shape[a]), tf.float32) for a in range(nd)], indexing='ij')
@@ -784,7 +834,8 @@ class CytoNucsTrainer:
                 train_generator.set_epoch(epoch)
                 prefetch = _Prefetcher(train_generator,
                     depth=int(getattr(self.config, 'prefetch_depth', 3)),
-                    workers=int(getattr(self.config, 'prefetch_workers', 3)), count=steps_per_epoch)
+                    workers=int(getattr(self.config, 'prefetch_workers', 3)), count=steps_per_epoch,
+                    convert=batch_tensors)
                 component_sums = {}
                 # Reset metrics
                 self.train_loss_metric.reset_state()
@@ -794,25 +845,9 @@ class CytoNucsTrainer:
                 train_pbar = tqdm(range(steps_per_epoch), desc='Training')
                 try:
                     for step in train_pbar:
-                        # Get batch
-                        x_batch, y_batch = prefetch.next()
-
-                        # Конвертируем x в tensor
-                        x_batch = tf.convert_to_tensor(x_batch, dtype=tf.float32)
-                        stepper = CytoNucsTrainer._pair(self, y_batch)
-
-                        # Конвертируем y_batch ЦЕЛИКОМ (включая instance masks)
-                        y_batch_tf = {}
-                        for k, v in y_batch.items():
-                            if isinstance(v, np.ndarray):
-                                if v.dtype.kind == 'f':  # float
-                                    y_batch_tf[k] = tf.convert_to_tensor(v, dtype=tf.float32)
-                                elif v.dtype.kind in ['i', 'u']:  # int/uint
-                                    y_batch_tf[k] = tf.convert_to_tensor(v, dtype=tf.int32)
-                                else:
-                                    y_batch_tf[k] = tf.convert_to_tensor(v)
-                            else:
-                                y_batch_tf[k] = v
+                        # Get batch: tensors already (converted in the prefetch workers), instance masks included
+                        x_batch, y_batch_tf = prefetch.next()
+                        stepper = CytoNucsTrainer._pair(self, y_batch_tf)
 
 
                         # Train step
@@ -865,22 +900,8 @@ class CytoNucsTrainer:
                     val_sums = {}
                     val_pbar = tqdm(range(len(val_generator)), desc='Validation')
                     for step in val_pbar:
-                        x_batch, y_batch = val_generator[step]
-
-                        x_batch = tf.convert_to_tensor(x_batch, dtype=tf.float32)
-                        stepper = CytoNucsTrainer._pair(self, y_batch)
-
-                        y_batch_tf = {}
-                        for k, v in y_batch.items():
-                            if isinstance(v, np.ndarray):
-                                if v.dtype.kind == 'f':
-                                    y_batch_tf[k] = tf.convert_to_tensor(v, dtype=tf.float32)
-                                elif v.dtype.kind in ['i', 'u']:
-                                    y_batch_tf[k] = tf.convert_to_tensor(v, dtype=tf.int32)
-                                else:
-                                    y_batch_tf[k] = tf.convert_to_tensor(v)
-                            else:
-                                y_batch_tf[k] = v
+                        x_batch, y_batch_tf = batch_tensors(val_generator[step])
+                        stepper = CytoNucsTrainer._pair(self, y_batch_tf)
 
                         _, components = stepper.val_step(x_batch, y_batch_tf)
                         accumulate_components(val_sums, components)

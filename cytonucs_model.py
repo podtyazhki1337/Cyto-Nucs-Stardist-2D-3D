@@ -799,6 +799,18 @@ class CytoNucsStarDistModel:
                 inputs=[feature_tensors[i] for i in (1, 2, 5, 6)] + [prompt_cyto_full[0]],
                 outputs=[_cyto_logits[0]] + quality[1:] + [fine_runtime['cytoplasm']],
                 name='cytoplasm_fine_runtime')
+        # The training step in two calls (cytonucs_trainer.train_step): detection_model is everything that does not
+        # read the prompts (backbone, prob / dist and the other dense heads, and the features the refinement reads);
+        # prompted_model is the rest, from those features and the input with its prompts. The trainer builds its
+        # detector prompts from the prob / dist of the first call instead of a second pass through the backbone.
+        # Same layers and weights as the model returned below; the gradient crosses the two calls on the tape.
+        cut = feature_tensors + ([fine_source] if cfg.refinement_full_resolution else [])
+        prompted = {key: value for key, value in outputs.items()
+                    if any(part in key for part in ('_mask', '_quality', 'fine_'))}
+        self.detection_model = Model(
+            inputs=inputs_all, name='detection_step',
+            outputs={'outputs': {key: value for key, value in outputs.items() if key not in prompted}, 'features': cut})
+        self.prompted_model = Model(inputs=[inputs_all] + cut, outputs=prompted, name='prompted_step')
         return Model(inputs=inputs_all, outputs=outputs, name=self.name)
 
     def summary(self):

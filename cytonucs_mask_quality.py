@@ -1,6 +1,6 @@
 """Detached training targets for the candidate actually used by mask inference."""
 import numpy as np
-from cytonucs_postprocess import upsample_grid, prompt_component
+from cytonucs_postprocess import local_prompt_mask
 
 
 def gaussian_prompt_geometry(prompt):
@@ -60,8 +60,10 @@ def component_quality_targets(probabilities, targets, prompts, grid, threshold):
         geometry = gaussian_prompt_geometry(prompt)
         if geometry is None:
             continue
-        p = upsample_grid(prob[..., 0], target.shape, grid)
-        mask = prompt_component(p > threshold, *geometry)
-        union = np.count_nonzero(mask | target)
-        values[i] = np.count_nonzero(mask & target) / max(union, 1)
+        # The same mask as prompt_component(upsample_grid(prob) > threshold), evaluated only in the window that can
+        # hold it (local_prompt_mask, as at inference): the whole crop upsampled for every prompt was most of the cost.
+        lo, _, _, mask, _ = local_prompt_mask(prob[..., 0], target.shape, grid, *geometry, threshold)
+        inside = np.count_nonzero(mask & target[tuple(slice(int(a), int(a) + n) for a, n in zip(lo, mask.shape))])
+        union = np.count_nonzero(mask) + np.count_nonzero(target) - inside
+        values[i] = inside / max(union, 1)
     return values

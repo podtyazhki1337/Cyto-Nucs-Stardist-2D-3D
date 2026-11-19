@@ -9,6 +9,11 @@ settings that are 'auto' are chosen on the part of the validation set that fits 
   calibrated: with the peak proposals of the method the StarDist NMS does not run.)
 - inner_min_inside_outer / outer_min_inner_share: the nesting filters, applied to the same re-assembled labels.
 
+Without prompt refinement (refinement_mode other than 'mask', e.g. the ablation without the mask branch) there are no
+candidates to re-assemble: every volume is predicted once per threshold of the range with both heads at it, and a pair
+of thresholds takes each head's labels from its own threshold (the StarDist NMS runs per head; checked on the first
+volume).
+
 The objective is the checkpoint metric (JTPR weight of loss_params.checkpoint_w_jtpr, mean AP of the levels). A
 coordinate search keeps the given value unless another one is better by more than MIN_GAIN. The chosen values go to
 <weights>.inference.json, where cytonucs_config.resolve_auto_inference finds them for that checkpoint.
@@ -107,26 +112,88 @@ def reassemble(config, volume, values, quality_gates=None):
     return nuclei, cells, pairs
 
 
-def checkpoint_score(config, volumes, quality_gates, jtpr_weight):
-    """score for calibrate_inference: the checkpoint metric of the re-assembled labels of all volumes."""
+def metric(config, results, jtpr_weight):
+    """The checkpoint metric of (volume, nuclei, cells, pairs) for all volumes."""
     from cytonucs_inference import compute_jtpr
     levels = [h for h in ('nucleus', 'cytoplasm') if config.has_level(h)] if hasattr(config, 'has_level') else ['nucleus', 'cytoplasm']
+    counts = {h: np.zeros((len(TAUS), 3), np.int64) for h in levels}
+    joint = pairs_total = 0
+    for v, nuclei, cells, pairs in results:
+        for h, labels in (('nucleus', nuclei), ('cytoplasm', cells)):
+            if h in counts:
+                counts[h] += match_counts(v['gt'][h], labels)
+        if len(levels) == 2:
+            _, details = compute_jtpr(nuclei, cells, v['gt']['nucleus'], v['gt']['cytoplasm'], iou_thresh=0.5,
+                                      assignments_pred=pairs, assignments_gt=v.get('assignments'))
+            joint += int(details['joint_tp']); pairs_total += int(details['total_pairs'])
+    ap = sum(ap_of(c) for c in counts.values()) / 2
+    return jtpr_weight * joint / max(pairs_total, 1) + (1 - jtpr_weight) * ap
 
-    def score(values):
-        counts = {h: np.zeros((len(TAUS), 3), np.int64) for h in levels}
-        joint = pairs_total = 0
-        for v in volumes:
-            nuclei, cells, pairs = reassemble(config, v, values, quality_gates)
-            for h, labels in (('nucleus', nuclei), ('cytoplasm', cells)):
-                if h in counts:
-                    counts[h] += match_counts(v['gt'][h], labels)
-            if len(levels) == 2:
-                _, details = compute_jtpr(nuclei, cells, v['gt']['nucleus'], v['gt']['cytoplasm'], iou_thresh=0.5,
-                                          assignments_pred=pairs, assignments_gt=v.get('assignments'))
-                joint += int(details['joint_tp']); pairs_total += int(details['total_pairs'])
-        ap = sum(ap_of(c) for c in counts.values()) / 2
-        return jtpr_weight * joint / max(pairs_total, 1) + (1 - jtpr_weight) * ap
-    return score
+
+def checkpoint_score(config, volumes, quality_gates, jtpr_weight):
+    """score for calibrate_inference: the checkpoint metric of the re-assembled labels of all volumes."""
+    return lambda values: metric(config, ((v, *reassemble(config, v, values, quality_gates)) for v in volumes), jtpr_weight)
+
+
+def filtered(config, nuclei, cells, values):
+    """Labels after the nesting filters of `values`, and their pairs (the end of the polyhedron inference)."""
+    from cytonucs_inference import keep_outer_with_inner, keep_inner_inside_outer
+    from cytonucs_postprocess import assign_final_masks
+    shares = SimpleNamespace(inner_min_inside_outer=values['inner_min_inside_outer'],
+                             outer_min_inner_share=values['outer_min_inner_share'])
+    cells, _ = keep_outer_with_inner(shares, nuclei, cells)
+    nuclei, _ = keep_inner_inside_outer(shares, nuclei, cells)
+    return nuclei, cells, assign_final_masks(nuclei, cells, getattr(config, 'pair_min_overlap', 0.1))
+
+
+def label_score(config, volumes, jtpr_weight):
+    """score for calibrate_inference from the labels of predict_per_threshold."""
+    return lambda values: metric(config, ((v, *filtered(config, v['labels'][values['prob_thresh_nucleus']][0],
+                                                        v['labels'][values['prob_thresh_cytoplasm']][1], values))
+                                          for v in volumes), jtpr_weight)
+
+
+def predict_per_threshold(predictor, samples, thresholds, budget, start):
+    """Volumes for label_score: each volume predicted with both prob thresholds at each of `thresholds` and the nesting
+    filters off, until 60 % of the budget is spent. A head's labels must depend on its own threshold only; the first
+    volume is predicted again with the lowest threshold for one head and the highest for the other to check it."""
+    from cytonucs_trainer import DiceCallback
+    config = predictor.config
+    runner = SimpleNamespace(model=predictor.model)
+    saved = {k: getattr(predictor, k) for k in PROB_KEYS}
+    filters = {k: getattr(config, k) for k in FILTER_KEYS}
+
+    def predict(image, prob_n, prob_c):
+        predictor.prob_thresh_nucleus, predictor.prob_thresh_cytoplasm = prob_n, prob_c
+        nuclei, cells, _ = DiceCallback._predict_full_volume(runner, predictor, image)
+        return np.asarray(nuclei), np.asarray(cells)
+    volumes = []
+    try:
+        for key in FILTER_KEYS:
+            setattr(config, key, 0.0)
+        for sample in samples:
+            if volumes and time.time() - start > 0.6 * budget:
+                break
+            image = np.asarray(sample['image'], np.float32)
+            labels = {t: predict(image, t, t) for t in thresholds}
+            if not volumes:
+                lo, hi = thresholds[0], thresholds[-1]
+                mixed = [(prob_n, prob_c, predict(image, prob_n, prob_c)) for prob_n, prob_c in ((lo, hi), (hi, lo))]
+                if not all(np.array_equal(n, labels[prob_n][0]) and np.array_equal(c, labels[prob_c][1])
+                           for prob_n, prob_c, (n, c) in mixed):
+                    raise RuntimeError('inference calibration: the labels of a head depend on the threshold of the other '
+                                       'head, so thresholds cannot be combined from per-threshold predictions')
+            volumes.append(dict(name=sample.get('filename', str(len(volumes))), labels=labels,
+                                gt={'nucleus': np.asarray(sample['nucleus_mask']), 'cytoplasm': np.asarray(sample['cytoplasm_mask'])},
+                                assignments=sample.get('assignments')))
+            print(f"  [inference calibration] predicted {volumes[-1]['name']} at {len(thresholds)} thresholds "
+                  f"({time.time() - start:.0f} s)")
+    finally:
+        for key, value in saved.items():
+            setattr(predictor, key, value)
+        for key, value in filters.items():
+            setattr(config, key, value)
+    return volumes
 
 
 def calibrate_after_training(predictor, samples, keys, budget=300.0, weights_path=None):
@@ -142,6 +209,12 @@ def calibrate_after_training(predictor, samples, keys, budget=300.0, weights_pat
     current = {k: float(getattr(predictor, k)) for k in PROB_KEYS}
     current.update({k: float(getattr(config, k)) for k in FILTER_KEYS})
     prob_range = sorted({float(v) for v in config.prob_thresh_range})
+    gates = CytoNucsPredictor._active_quality_gates(predictor)
+    if getattr(config, 'refinement_mode', 'mask') != 'mask':
+        volumes = predict_per_threshold(predictor, samples, sorted(set(prob_range) | {current[k] for k in PROB_KEYS}),
+                                        budget, start)
+        return _search(config, keys, current, label_score(config, volumes, checkpoint_jtpr_weight(config)), prob_range,
+                       budget, start, volumes, weights_path)
     saved = {k: getattr(predictor, k) for k in PROB_KEYS}
     for key in PROB_KEYS:                                   # predict once with the lowest threshold searched
         if key in keys:
@@ -165,8 +238,12 @@ def calibrate_after_training(predictor, samples, keys, budget=300.0, weights_pat
     finally:
         for key, value in saved.items():
             setattr(predictor, key, value)
-    gates = CytoNucsPredictor._active_quality_gates(predictor)
-    score = checkpoint_score(config, volumes, gates, checkpoint_jtpr_weight(config))
+    return _search(config, keys, current, checkpoint_score(config, volumes, gates, checkpoint_jtpr_weight(config)),
+                   prob_range, budget, start, volumes, weights_path)
+
+
+def _search(config, keys, current, score, prob_range, budget, start, volumes, weights_path):
+    """calibrate_inference with `score`, reported and written as calibrate_after_training describes."""
     values, report = calibrate_inference(keys, current, score, prob_range, budget, start=start)
     report.update(volumes=len(volumes), volume_names=[v['name'] for v in volumes], before={k: current[k] for k in keys})
     print(f"  [inference calibration] {report['before']} -> {values} on {len(volumes)} volumes in {report['seconds']} s, "
