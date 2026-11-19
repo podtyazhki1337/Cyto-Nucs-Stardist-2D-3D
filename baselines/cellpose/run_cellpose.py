@@ -187,6 +187,13 @@ def predict_splits(chosen):
     return timing
 
 
+def weights_path(spec, out=None):
+    """The weights of a level in training.json: absolute as written by training, or relative to the run folder
+    (e.g. a downloaded model)."""
+    path = Path(spec['weights'])
+    return str(path if path.is_absolute() else Path(out or OUT) / path)
+
+
 def predict_only():
     """--predict-only: the trained (or pretrained) models of training.json with their chosen settings."""
     info = json.loads((OUT / 'training.json').read_text())
@@ -194,7 +201,7 @@ def predict_only():
     chosen = {}
     for level, spec in info['levels'].items():
         model = (models.Cellpose(gpu=gpu, model_type=spec['pretrained']) if info.get('pretrained_only') else
-                 models.CellposeModel(gpu=gpu, pretrained_model=spec['weights']))
+                 models.CellposeModel(gpu=gpu, pretrained_model=weights_path(spec)))
         chosen[level] = (model, spec['diameter'], (spec['cellprob_threshold'], spec['flow_threshold']))
     seconds = predict_splits(chosen)
     path = OUT / 'predict_seconds.json'

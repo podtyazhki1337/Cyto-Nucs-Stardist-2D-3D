@@ -25,6 +25,9 @@ shapes, nesting, packing and appearance. Only the nucleoli are assumed.
 
 ## The data set of the paper (`hela_v1`)
 
+Download: [Podtyazhki1337/cytonucs-synthetic](https://huggingface.co/datasets/Podtyazhki1337/cytonucs-synthetic)
+(`hela_v1` and its partly annotated variants).
+
 Source: the in-house HeLa spheroid volume at half XY resolution (`../downscale_split.py`), its 12 training blocks;
 the paths of the source data are the constants at the top of `measure_gt_statistics.py`.
 

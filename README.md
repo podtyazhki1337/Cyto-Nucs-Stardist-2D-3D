@@ -64,12 +64,14 @@ Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1
 
 ## Quick start
 
-Pretrained models of the paper (weights, calibrated inference settings and `geometry.json` per model): [Hugging Face
-link]. Download a model folder, e.g. `runs/helacytonuc_e7_clean/`, and segment a folder of images:
+Pretrained models of the paper are on Hugging Face: [Podtyazhki1337/cytonucs](https://huggingface.co/Podtyazhki1337/cytonucs)
+(TissueNet, HeLaCytoNuc, BBBC020, KiTS23, the HeLa spheroid, and the synthetic three-level and partial-annotation
+models; the model card lists their inputs and scores). Download one and segment a folder of images:
 
 ```bash
-python predict.py --config configs/helacytonuc_e7_clean.json \
-    --weights runs/helacytonuc_e7_clean/weights_best.weights.h5 --input my_images/ --output my_labels/
+hf download Podtyazhki1337/cytonucs --include "helacytonuc_e7_clean/*" --local-dir models
+python predict.py --config models/helacytonuc_e7_clean/config.json \
+    --weights models/helacytonuc_e7_clean/weights_best.weights.h5 --input my_images/ --output my_labels/
 ```
 
 This writes `my_labels/nucleus/<name>` and `my_labels/cytoplasm/<name>` (instance labels) and
@@ -113,7 +115,7 @@ dataset/
 | BBBC020 [12] | nucleus, cell (2D, DAPI + CD11b) | [Broad Bioimage Benchmark Collection](https://bbbc.broadinstitute.org/BBBC020) | `python dataset_prep/bbbc020_to_cytonucs.py --raw data/BBBC020/raw --output data/BBBC020/cytonucs_native --factor 1` |
 | KiTS23 [13] | mass (tumour or cyst), kidney (3D CT) | [KiTS23 repository](https://github.com/neheller/kits23) (CC BY-NC-SA 4.0) | `python dataset_prep/kits23_to_cytonucs.py --kits data/KiTS23/kits23 --output data/KiTS23/cytonucs_3x078`, then `python dataset_prep/subset_view.py --dataset data/KiTS23/cytonucs_3x078 --output data/KiTS23/cytonucs_3x078_val16 --keep val:16` |
 | HeLa spheroid | nucleus, cell (3D) | in-house; the annotations will be released with the paper | `dataset_prep/make_spatial_split_patches.py`, `add_train_regions.py`, `downscale_split.py` (half XY resolution) |
-| Synthetic | nucleolus, nucleus, cell (3D) | generated | `dataset_prep/synthetic/` (see its README) |
+| Synthetic | nucleolus, nucleus, cell (3D) | [Hugging Face: Podtyazhki1337/cytonucs-synthetic](https://huggingface.co/datasets/Podtyazhki1337/cytonucs-synthetic) (with the partly annotated variants) | or generate with `dataset_prep/synthetic/` (see its README) |
 
 **HeLaCytoNuc clean-up.** The CellProfiler masks of part of the training and validation images miss most cells, and
 three hand-drawn test masks are 8-bit with more than 255 nuclei. The cleaned split of the paper is a hard-link view
@@ -225,7 +227,9 @@ metrics). Changes to third-party code are marked in the code.
 | InstanSeg [9], trained and pretrained | `baselines/instanseg/run_instanseg.py` (one model for nuclei and cells, its own links) | `pip install instanseg-torch` (0.1.2 tested) |
 | nnU-Net v2 [14] (KiTS23) | `baselines/nnunet/prepare_kits.py`, `to_instances.py` | `pip install nnunetv2` (2.6.4 tested) |
 
-Each script prints its usage with `--help`; predictions go to `runs/<method>/<name>/predictions` by default.
+Each script prints its usage with `--help`; predictions go to `runs/<method>/<name>/predictions` by default. The trained
+baselines of the paper (seed 0) are on Hugging Face:
+[Podtyazhki1337/cytonucs-baselines](https://huggingface.co/Podtyazhki1337/cytonucs-baselines).
 
 ## Reproducing the paper
 

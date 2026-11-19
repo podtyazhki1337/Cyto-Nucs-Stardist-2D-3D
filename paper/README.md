@@ -14,12 +14,14 @@ need. Run them from the repository root (`python paper/<script>.py ...`); each p
 | How the KiTS23 masses sit in their kidneys | `paper/kits23_nesting.py` |
 | Three-level synthetic data | `dataset_prep/synthetic/` (data), `dataset_prep/sparse_tiles.py` (partly annotated variants), `score_hierarchy.py` |
 | Partial annotation (spheroid) | `dataset_prep/sparse_annotation.py`, `dataset_prep/hide_level_by_blocks.py`, `evaluate_blocks.py` |
-| Ablations; separate single-level networks | `score_hierarchy.py`; the two separate networks are paired by overlap with `score_predictions.py` (their saved labels in one folder per level) |
+| Ablations; separate single-level networks | `score_hierarchy.py`; the two separate networks are paired by overlap with `score_predictions.py` (their saved labels in one folder per level), and recalibrated jointly for CytoNucs' objective with `paper/recal_single_level_pairs.py` |
 | Inference time and memory | `paper/time_inference.py` (seconds per image and per stage), `paper/gpu_monitor.py` (GPU and host memory of a run) |
 | Why annotated pairs are missed (inner / outer / link) | `score_predictions.py` and `score_hierarchy.py` (`fail_inner_*`, `fail_outer_*`, `fail_link_*`) |
 | Linked JTPR at IoU 0.3 and 0.7 | `score_predictions.py --jtpr-ious 0.3 0.7` |
 | Metrics of the HydraStarDist paper | `score_hierarchy.py` / `score_predictions.py` (`paper_<pair>`: IoUR, AP and joint TP rates at τ 0.1-0.9) |
-| Bootstrap intervals | the per-image records (`records`) of every score file |
+| Bootstrap intervals of linked JTPR | `paper/bootstrap_jtpr.py` (2D test splits, paired over the annotated pairs), `paper/bootstrap_jtpr_blocks.py` (test blocks of the spheroid) |
+| KiTS23 masses found by size | `paper/kits_mass_recall_by_size.py` |
+| How children sit in their parents (nesting statistics of the datasets) | `paper/nesting_geometry.py` |
 | Operating points: quality gates for AP alone | `paper/recalibrate_gates.py` (gates from the full-validation log of a run, into `inference.quality_gates_override`) |
 | Boundary AP and AP by object size | `paper/boundary_ap.py` |
 | Learned merge / drop decisions for neighbouring objects | `paper/pair_decisions.py` |
