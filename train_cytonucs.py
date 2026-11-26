@@ -882,7 +882,10 @@ def main(config_path='config_cytonucs.json'):
     if init_weights and not config_dict['training'].get('resume_from_checkpoint'):
         if not Path(init_weights).exists():
             raise FileNotFoundError(f'init_weights not found: {init_weights}')
-        model.load_weights(init_weights)
+        if config_dict['training'].get('init_weights_partial'):
+            model.load_init_partial(init_weights)
+        else:
+            model.load_weights(init_weights)
         # Gates and mask thresholds belong to the other run's data: full validation calibrates new ones.
         model.loaded_quality_gates = None
         model.loaded_mask_thresholds = None

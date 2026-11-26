@@ -36,7 +36,12 @@ Spatially split 3D volumes (the HeLa spheroid) are scored on whole held-out bloc
 | `helacytonuc_e7_clean_k1` | final recipe with one prompt per crop |
 | `helacytonuc_e7_clean_nuc_only`, `helacytonuc_e7_clean_cells_only` | separate single-level networks (paired by overlap for the comparison) |
 | `tissuenet_e7_b32_nuc_only`, `tissuenet_e7_b32_cells_only` | the same on TissueNet |
+| `e_zaug_nuc_only`, `e_zaug_cells_only` | the same on the HeLa spheroid; initialised from `a1_syn_pre2` by layer name where the shapes agree (`training.init_weights_partial`) |
 | `tissuenet_e7_b32_nonest` | TissueNet without the nesting losses |
+
+Two ablations change only the inference of a trained model: `inference.outer_from_inner_prompts: false` (cells only
+from the cell head's own proposals) and `inference.outer_own_prompts: false` (cells only from nucleus prompts). Set
+either in a copy of the model's configuration and score it as usual.
 
 ## Partial annotation
 
@@ -72,5 +77,6 @@ The synthetic variants are made with `dataset_prep/sparse_tiles.py` (train split
 | `cyto_fullres_noref` | spheroid at full resolution without the mask refinement |
 | `kits_e7`, `kits_e9` | KiTS23 before `kits_e8` (no object-centred crops, no nesting filter) and after it (more negative prompts inside kidneys) |
 
-The HeLa spheroid and EA.hy926 volumes (`Cytonucs_Emese_Hela`) are in-house data; their annotations will be released
-with the paper.
+The source images and instance annotations of the HeLa-MRC-5 spheroid (`Cytonucs_Emese_Hela`) are available at
+https://doi.org/10.6084/m9.figshare.24982227 (Piccinini and Diosdi, 2024); see the datasets of the paper in the main
+README. The EA.hy926 volumes are in-house data; their annotations will be released with the paper.
