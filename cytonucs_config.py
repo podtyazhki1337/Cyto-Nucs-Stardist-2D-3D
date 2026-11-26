@@ -49,7 +49,7 @@ METHOD_SETTINGS = {
                       mask_overlap_nucleus=0.85, mask_overlap_cytoplasm=0.85, pair_min_overlap=0.1,
                       pair_min_mask_iou=0.25, refinement_adaptive_roi=True, refinement_roi_snap=True,
                       cell_roi_expansion_steps=2, refinement_batch=32, eval_splits=['val'], save_pred_tiff=True,
-                      max_prompts_per_head='auto', outer_from_inner_prompts=True),
+                      max_prompts_per_head='auto', outer_from_inner_prompts=True, outer_own_prompts=True),
     'output': dict(save_history=True, save_best_dice=True),
     'gpu_config': dict(allow_growth=True, memory_limit=None),
 }
@@ -183,7 +183,7 @@ class CytoNucsConfig:
                          dist_target_stride=None, tile_sampling_by_objects=0.0, object_crop_shares=None,
                          train_region_crops=False,
                          partial_annotation=False, unknown_label=None, annotated_anchor_share=0.0,
-                         init_weights=None, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0,
+                         init_weights=None, init_weights_partial=False, weight_decay=0.0, ema_decay=0.0, extra_train_dirs=[], extra_train_share=0.0,
                          val_loss_every_n_epochs=1, keep_epoch_checkpoints=1,
                          mask_prompt_fraction=0.0, mask_prompt_start_epoch=20),
         'inference': dict(refinement_mode='mask', refine_feature_cache_windows=1,
@@ -207,7 +207,7 @@ class CytoNucsConfig:
                           refinement_windows=False, max_prompts_per_head=0,
                           skip_covered_prompts=False, refinement_roi_stride=0, refinement_roi_size_step=0,
                           refinement_iterations=1, center_vote_grouping=False, center_vote_radius=0.25,
-                          outer_from_inner_prompts=True),
+                          outer_from_inner_prompts=True, outer_own_prompts=True),
         'augmentation': dict(cyto_center_prompt_prob=0.25, negative_prompt_prob=0.1, negative_prompt_inside_outer=0.0,
                              prompt_center_jitter=0.1, prompt_sigma_jitter=0.1,
                              repeat_cell_prompt_prob=0.0, prompt_inside_target=False,
@@ -586,7 +586,7 @@ class CytoNucsConfig:
                     'mask_quality_use_scores', 'prompt_inside_target', 'mask_ce_class_balance', 'refinement_stage_audit', 'nucleus_prob_grid_normalize',
                     'residual_proposals', 'object_losses_include_crop_cut', 'refinement_roi_snap', 'tta_flips',
                     'object_losses_min_area_from_gate', 'refinement_full_resolution', 'train_region_crops',
-                    'partial_annotation', 'outer_from_inner_prompts', 'jit_compile'):
+                    'partial_annotation', 'outer_from_inner_prompts', 'outer_own_prompts', 'jit_compile'):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(f'{key} must be boolean')
         # Residual prompts are added after the first object assembly into free voxels only.
@@ -689,6 +689,10 @@ class CytoNucsConfig:
         # training.init_weights: weights a new run starts from (fine-tuning); not a resume.
         if self.init_weights is not None and (not isinstance(self.init_weights, str) or not self.init_weights):
             raise ValueError('init_weights must be null or a path')
+        # training.init_weights_partial: take init_weights by layer name where the shapes agree (another
+        # architecture, e.g. a two-level pretraining for a one-level network); the rest stays freshly initialised.
+        if not isinstance(self.init_weights_partial, bool):
+            raise ValueError('init_weights_partial must be true or false')
         zoom_z = self.zoom_z_range
         if zoom_z is not None and (not isinstance(zoom_z, (list, tuple)) or len(zoom_z) != 2 or
                                    not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in zoom_z) or

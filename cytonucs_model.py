@@ -848,6 +848,29 @@ class CytoNucsStarDistModel:
         if missing:
             print(f'New heads added: checkpoint weights restored by name, {missing} initialized')
 
+    def load_init_partial(self, filepath):
+        """Initial weights from a checkpoint of another architecture (training.init_weights_partial): every layer
+        present in its by-name copy with the same shapes is loaded, the others keep their initialisation."""
+        import h5py
+        loaded, reshaped, absent = [], [], []
+        with h5py.File(filepath, 'r') as store:
+            if self.BY_NAME not in store:
+                raise ValueError(f'{filepath} has no by-name copy of its weights; partial initialisation needs one')
+            group = store[self.BY_NAME]
+            for path, layer in self._weighted_layers():
+                if f'{path}/0' not in group:
+                    absent.append(path)
+                    continue
+                values = [group[f'{path}/{i}'][()] for i in range(len(layer.weights))]
+                if any(v.shape != tuple(w.shape) for v, w in zip(values, layer.weights)):
+                    reshaped.append(path)
+                    continue
+                layer.set_weights(values)
+                loaded.append(path)
+        print(f'Partial initial weights from {filepath}: {len(loaded)} layers loaded; other shapes (fresh): '
+              f'{reshaped}; absent from the checkpoint (fresh): {absent}')
+        return dict(loaded=loaded, reshaped=reshaped, absent=absent)
+
     def architecture_signature(self):
         import json
         keys = ('ndim', 'n_rays', 'n_channel_in', 'shared_encoder', 'unet_n_depth',

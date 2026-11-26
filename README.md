@@ -65,7 +65,7 @@ Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1
 ## Quick start
 
 Pretrained models of the paper are on Hugging Face: [Podtyazhki1337/cytonucs](https://huggingface.co/Podtyazhki1337/cytonucs)
-(TissueNet, HeLaCytoNuc, BBBC020, KiTS23, the HeLa spheroid, and the synthetic three-level and partial-annotation
+(TissueNet, HeLaCytoNuc, BBBC020, KiTS23, the HeLa-MRC-5 spheroid, and the synthetic three-level and partial-annotation
 models; the model card lists their inputs and scores). Download one and segment a folder of images:
 
 ```bash
@@ -114,7 +114,7 @@ dataset/
 | HeLaCytoNuc [11] | nucleus, cell (2D RGB) | [RODARE 10.14278/rodare.3001](https://doi.org/10.14278/rodare.3001) (CC BY 4.0) | `python dataset_prep/helacytonuc_to_cytonucs.py --extracted data/HeLaCytoNuc/extracted --output data/HeLaCytoNuc/cytonucs`, then the clean-up below |
 | BBBC020 [12] | nucleus, cell (2D, DAPI + CD11b) | [Broad Bioimage Benchmark Collection](https://bbbc.broadinstitute.org/BBBC020) | `python dataset_prep/bbbc020_to_cytonucs.py --raw data/BBBC020/raw --output data/BBBC020/cytonucs_native --factor 1` |
 | KiTS23 [13] | mass (tumour or cyst), kidney (3D CT) | [KiTS23 repository](https://github.com/neheller/kits23) (CC BY-NC-SA 4.0) | `python dataset_prep/kits23_to_cytonucs.py --kits data/KiTS23/kits23 --output data/KiTS23/cytonucs_3x078`, then `python dataset_prep/subset_view.py --dataset data/KiTS23/cytonucs_3x078 --output data/KiTS23/cytonucs_3x078_val16 --keep val:16` |
-| HeLa spheroid | nucleus, cell (3D) | in-house; the annotations will be released with the paper | `dataset_prep/make_spatial_split_patches.py`, `add_train_regions.py`, `downscale_split.py` (half XY resolution) |
+| HeLa-MRC-5 spheroid [15] | nucleus, cell (3D) | [figshare 10.6084/m9.figshare.24982227](https://doi.org/10.6084/m9.figshare.24982227) (Piccinini and Diosdi, 2024; GPL 3.0+): acquisition 012, the four source RGB stacks in `channels.zip`, the nuclear and whole-cell instance labels in `masks2.zip` (files ending in `ch00_mask.tif` and `ch03_mask.tif`) | `dataset_prep/make_spatial_split_patches.py`, `add_train_regions.py`, `downscale_split.py` (half XY resolution) |
 | Synthetic | nucleolus, nucleus, cell (3D) | [Hugging Face: Podtyazhki1337/cytonucs-synthetic](https://huggingface.co/datasets/Podtyazhki1337/cytonucs-synthetic) (with the partly annotated variants) | or generate with `dataset_prep/synthetic/` (see its README) |
 
 **HeLaCytoNuc clean-up.** The CellProfiler masks of part of the training and validation images miss most cells, and
@@ -156,7 +156,8 @@ The run folder `output.basedir/experiment.name` (e.g. `runs/my_run/`) holds:
 The levels and their order, the image channels, sparse annotation and the number of training images kept in memory
 (15 % of the host memory) are read from the training data when the configuration leaves them out. Training resumes
 from the last epoch checkpoint with `training.resume_from_checkpoint`; `training.init_weights` fine-tunes from
-another run.
+another run (with `training.init_weights_partial: true` from a run of another architecture, e.g. a two-level
+pretraining for a one-level network: every layer with the same name and shapes is loaded, the rest starts fresh).
 
 ## Inference
 
@@ -211,6 +212,7 @@ notice.
 | inference | `quality_gates_override` | per-level quality / size gates replacing the calibrated ones (e.g. from `paper/recalibrate_gates.py`) |
 | inference | `refinement_iterations` | refinement passes per candidate (needs `mask_prompt_fraction` in training) |
 | inference | `outer_from_inner_prompts` | an inner prompt's outer mask is also an outer candidate (default true; false is an ablation) |
+| inference | `outer_own_prompts` | the outer head prompts objects of its own (default true; false is an ablation: every outer object comes from an inner prompt) |
 | inference | `semantic_scores`, `semantic_min_*` | mean semantic foreground probability of every object; objects below the minimum are removed |
 | inference | `skip_covered_prompts`, `refinement_windows`, `refinement_roi_stride` | speed of the prompt refinement |
 
@@ -304,3 +306,5 @@ Contact: mayurovm@gmail.com
 14. F. Isensee, P. F. Jaeger, S. A. A. Kohl, J. Petersen, K. H. Maier-Hein. nnU-Net: a self-configuring method for
     deep learning-based biomedical image segmentation. Nature Methods 18, 203-211 (2021).
     [doi:10.1038/s41592-020-01008-z](https://doi.org/10.1038/s41592-020-01008-z)
+15. F. Piccinini, A. Diosdi. 2024_Hollandi-4_Co_culture_images_and_masks. figshare (2024).
+    [doi:10.6084/m9.figshare.24982227](https://doi.org/10.6084/m9.figshare.24982227)

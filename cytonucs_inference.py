@@ -1100,6 +1100,10 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
         return [items[i] for i in keep]
     anchored = [('nucleus', ctr, d, score) for ctr, d, score in capped('nucleus', anchors(nuc_labels, nuc_coords, nuc_probs, nuc_dists))]
     anchored += [('cytoplasm', ctr, d, score) for ctr, d, score in capped('cytoplasm', anchors(cyto_labels, cyto_coords, cyto_probs, cyto_dists))]
+    # inference.outer_own_prompts false (an ablation, the inverse of outer_from_inner_prompts false): the outer head
+    # prompts nothing of its own; every outer object comes from an inner prompt.
+    if not bool(getattr(config, 'outer_own_prompts', True)):
+        anchored = [a for a in anchored if a[0] != 'cytoplasm']
     jobs = [job[:3] for job in anchored]
     results = [None] * len(jobs)
     if batched:
@@ -1160,7 +1164,8 @@ def predict_instances_prompted(model, config, img_full, nuc_coords, nuc_probs,
     # Second pass: window-suppressed peaks that no first-pass object covers.
     residual_heads = [h for h in ('nucleus', 'cytoplasm')
                       if residual and residual.get(h) is not None and len(residual[h]['coords'])
-                      and getattr(config, 'mask_assembly_' + h) != 'voxel']
+                      and getattr(config, 'mask_assembly_' + h) != 'voxel'
+                      and (h != 'cytoplasm' or bool(getattr(config, 'outer_own_prompts', True)))]
     if residual_heads and prompt_sigmas is None:
         def flag(candidate):
             if candidate is not None:
