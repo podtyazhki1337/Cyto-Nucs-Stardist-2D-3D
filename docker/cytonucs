@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Entry point of the CytoNucs image (see "Docker" in README.md).
+set -euo pipefail
+
+code=/opt/cytonucs
+models=${CYTONUCS_MODELS_DIR:-$code/models}
+repo=${CYTONUCS_HF_REPO:-Podtyazhki1337/cytonucs}
+
+usage() {
+    cat <<EOF
+CytoNucs image. Commands:
+
+  segment MODEL INPUT OUTPUT [predict.py options]
+      Segment a folder of images with a pretrained model of the paper. On first use the model is downloaded
+      from Hugging Face ($repo) into models/MODEL. Example:
+          segment helacytonuc_e7_clean my_images my_labels
+  download MODEL [MODEL ...]
+      Download pretrained models into models/.
+  models
+      List the pretrained models on Hugging Face (the model card gives their inputs and scores).
+  help
+      This text.
+
+Anything else is run as it is in $code, where the configurations expect data/ and runs/:
+      python train_cytonucs.py configs/helacytonuc_e7_clean.json
+      python score_hierarchy.py --help
+      bash
+
+Mount points: $code/data (datasets), $code/runs (run folders), $code/models (pretrained models).
+docker/run.sh of the repository mounts them from the current folder, and the current folder itself at /work;
+the INPUT and OUTPUT of segment are then relative to the current folder.
+EOF
+}
+
+download() {
+    python - "$repo" "$models" "$@" <<'PY'
+import sys
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
+
+repo, root, names = sys.argv[1], Path(sys.argv[2]), sys.argv[3:]
+for name in names:
+    if (root / name / 'config.json').is_file():
+        continue
+    print(f'downloading {name} from {repo} into {root / name}', flush=True)
+    snapshot_download(repo, allow_patterns=[f'{name}/*'], local_dir=root)
+    if not (root / name / 'config.json').is_file():
+        sys.exit(f'{name}: no such model in {repo} (the command "models" lists them)')
+PY
+}
+
+case "${1:-help}" in
+    help|-h|--help)
+        usage
+        ;;
+    models)
+        python - "$repo" <<'PY'
+import sys
+
+from huggingface_hub import HfApi
+
+for entry in HfApi().list_repo_tree(sys.argv[1]):
+    if type(entry).__name__ == 'RepoFolder':
+        print(entry.path)
+PY
+        ;;
+    download)
+        shift
+        [ $# -ge 1 ] || { usage; exit 2; }
+        download "$@"
+        ;;
+    segment)
+        shift
+        [ $# -ge 3 ] || { usage; exit 2; }
+        name=$1 input=$2 output=$3
+        shift 3
+        download "$name"
+        config=$models/$name/config.json
+        weights=$models/$(python -c 'import json, sys; print(json.load(open(sys.argv[1]))["inference"]["checkpoint_path"])' "$config")
+        cd "${CYTONUCS_CWD:-$PWD}"
+        exec python "$code/predict.py" --config "$config" --weights "$weights" --input "$input" --output "$output" "$@"
+        ;;
+    *)
+        exec "$@"
+        ;;
+esac

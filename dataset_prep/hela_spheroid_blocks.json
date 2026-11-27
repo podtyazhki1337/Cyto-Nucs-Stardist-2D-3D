@@ -1,0 +1,143 @@
+{
+ "description": "XY blocks of the HeLa-MRC-5 spheroid split of the paper (patches_split_hela) and the split of every block; for dataset_prep/make_spatial_split_patches.py --blocks",
+ "volumes": [
+  {
+   "name": "HeLa_MRC_DLS_Acquire_2_012_Target_z00_merged_rgb_plain_stack",
+   "shape": [
+    45,
+    2048,
+    2048
+   ],
+   "blocks": [
+    {
+     "index": 0,
+     "y0": 0,
+     "y1": 512,
+     "x0": 0,
+     "x1": 512,
+     "split": "train"
+    },
+    {
+     "index": 1,
+     "y0": 0,
+     "y1": 512,
+     "x0": 512,
+     "x1": 1024,
+     "split": "train"
+    },
+    {
+     "index": 2,
+     "y0": 0,
+     "y1": 512,
+     "x0": 1024,
+     "x1": 1536,
+     "split": "train"
+    },
+    {
+     "index": 3,
+     "y0": 0,
+     "y1": 512,
+     "x0": 1536,
+     "x1": 2048,
+     "split": "train"
+    },
+    {
+     "index": 4,
+     "y0": 512,
+     "y1": 1024,
+     "x0": 0,
+     "x1": 512,
+     "split": "test"
+    },
+    {
+     "index": 5,
+     "y0": 512,
+     "y1": 1024,
+     "x0": 512,
+     "x1": 1024,
+     "split": "train"
+    },
+    {
+     "index": 6,
+     "y0": 512,
+     "y1": 1024,
+     "x0": 1024,
+     "x1": 1536,
+     "split": "test"
+    },
+    {
+     "index": 7,
+     "y0": 512,
+     "y1": 1024,
+     "x0": 1536,
+     "x1": 2048,
+     "split": "train"
+    },
+    {
+     "index": 8,
+     "y0": 1024,
+     "y1": 1536,
+     "x0": 0,
+     "x1": 512,
+     "split": "train"
+    },
+    {
+     "index": 9,
+     "y0": 1024,
+     "y1": 1536,
+     "x0": 512,
+     "x1": 1024,
+     "split": "train"
+    },
+    {
+     "index": 10,
+     "y0": 1024,
+     "y1": 1536,
+     "x0": 1024,
+     "x1": 1536,
+     "split": "train"
+    },
+    {
+     "index": 11,
+     "y0": 1024,
+     "y1": 1536,
+     "x0": 1536,
+     "x1": 2048,
+     "split": "train"
+    },
+    {
+     "index": 12,
+     "y0": 1536,
+     "y1": 2048,
+     "x0": 0,
+     "x1": 512,
+     "split": "train"
+    },
+    {
+     "index": 13,
+     "y0": 1536,
+     "y1": 2048,
+     "x0": 512,
+     "x1": 1024,
+     "split": "val"
+    },
+    {
+     "index": 14,
+     "y0": 1536,
+     "y1": 2048,
+     "x0": 1024,
+     "x1": 1536,
+     "split": "val"
+    },
+    {
+     "index": 15,
+     "y0": 1536,
+     "y1": 2048,
+     "x0": 1536,
+     "x1": 2048,
+     "split": "train"
+    }
+   ]
+  }
+ ]
+}

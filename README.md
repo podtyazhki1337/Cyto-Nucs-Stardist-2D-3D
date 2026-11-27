@@ -60,7 +60,44 @@ pip install -r requirements.txt
 pip install --no-deps edt      # optional: several times faster StarDist targets
 ```
 
-Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1.26. A Docker image will follow.
+Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1.26.
+
+### Docker
+
+The image holds the code and the exact versions of the tested environment (`docker/constraints.txt`); the host needs
+only the NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+(without a GPU, leave out `--gpus`, or set `CYTONUCS_GPUS=none`, and it runs on the CPU).
+
+```bash
+docker build -t cytonucs .
+docker/run.sh segment helacytonuc_e7_clean my_images my_labels
+```
+
+`docker/run.sh` runs a command of the image as the current user, with the folders `data/` (datasets), `runs/` (run
+folders) and `models/` (pretrained models) of the current folder mounted where the configurations expect them.
+`segment MODEL INPUT OUTPUT` downloads a model of [Podtyazhki1337/cytonucs](https://huggingface.co/Podtyazhki1337/cytonucs)
+into `models/` on first use and runs `predict.py` (`docker/run.sh models` lists the models). Any other command runs in
+the code folder of the image, so the commands of this README work as they are:
+
+```bash
+docker/run.sh python train_cytonucs.py configs/helacytonuc_e7_clean.json
+docker/run.sh python score_hierarchy.py --config configs/helacytonuc_e7_clean.json \
+    --weights runs/helacytonuc_e7_clean/weights_best.weights.h5 --split test --output runs/helacytonuc_e7_clean/hierarchy_test.json
+docker/run.sh bash
+```
+
+Files of the current folder are under `/work` inside the container (e.g. `--config /work/my_config.json`).
+`CYTONUCS_GPUS=device=1` picks a GPU; `CYTONUCS_DATA`, `CYTONUCS_RUNS` and `CYTONUCS_MODELS` mount other folders.
+Without the script, the same is (the mounted folders must exist, or Docker creates them owned by root):
+
+```bash
+mkdir -p models my_labels
+docker run --rm --gpus all --user "$(id -u):$(id -g)" -v "$PWD/models:/opt/cytonucs/models" \
+    -v "$PWD/my_images:/in:ro" -v "$PWD/my_labels:/out" cytonucs segment helacytonuc_e7_clean /in /out
+```
+
+The image covers CytoNucs, StarDist and HydraStarDist. Cellpose, InstanSeg and nnU-Net need environments of their
+own (see [Baselines](#baselines)).
 
 ## Quick start
 
@@ -114,7 +151,7 @@ dataset/
 | HeLaCytoNuc [11] | nucleus, cell (2D RGB) | [RODARE 10.14278/rodare.3001](https://doi.org/10.14278/rodare.3001) (CC BY 4.0) | `python dataset_prep/helacytonuc_to_cytonucs.py --extracted data/HeLaCytoNuc/extracted --output data/HeLaCytoNuc/cytonucs`, then the clean-up below |
 | BBBC020 [12] | nucleus, cell (2D, DAPI + CD11b) | [Broad Bioimage Benchmark Collection](https://bbbc.broadinstitute.org/BBBC020) | `python dataset_prep/bbbc020_to_cytonucs.py --raw data/BBBC020/raw --output data/BBBC020/cytonucs_native --factor 1` |
 | KiTS23 [13] | mass (tumour or cyst), kidney (3D CT) | [KiTS23 repository](https://github.com/neheller/kits23) (CC BY-NC-SA 4.0) | `python dataset_prep/kits23_to_cytonucs.py --kits data/KiTS23/kits23 --output data/KiTS23/cytonucs_3x078`, then `python dataset_prep/subset_view.py --dataset data/KiTS23/cytonucs_3x078 --output data/KiTS23/cytonucs_3x078_val16 --keep val:16` |
-| HeLa-MRC-5 spheroid [15] | nucleus, cell (3D) | [figshare 10.6084/m9.figshare.24982227](https://doi.org/10.6084/m9.figshare.24982227) (Piccinini and Diosdi, 2024; GPL 3.0+): acquisition 012, the four source RGB stacks in `channels.zip`, the nuclear and whole-cell instance labels in `masks2.zip` (files ending in `ch00_mask.tif` and `ch03_mask.tif`) | `dataset_prep/make_spatial_split_patches.py`, `add_train_regions.py`, `downscale_split.py` (half XY resolution) |
+| HeLa-MRC-5 spheroid [15] | nucleus, cell (3D) | [figshare 10.6084/m9.figshare.24982227](https://doi.org/10.6084/m9.figshare.24982227) (Piccinini and Diosdi, 2024; GPL 3.0+): acquisition 012, the four source RGB stacks in `channels.zip`, the nuclear and whole-cell instance labels in `masks2.zip` (files ending in `ch00_mask.tif` and `ch03_mask.tif`) | `python dataset_prep/hela_spheroid_from_figshare.py --download data/Cytonucs_Emese_Hela/figshare --output data/Cytonucs_Emese_Hela` (downloads the record and merges the four stacks into one RGB volume), then the spatial split below |
 | Synthetic | nucleolus, nucleus, cell (3D) | [Hugging Face: Podtyazhki1337/cytonucs-synthetic](https://huggingface.co/datasets/Podtyazhki1337/cytonucs-synthetic) (with the partly annotated variants) | or generate with `dataset_prep/synthetic/` (see its README) |
 
 **HeLaCytoNuc clean-up.** The CellProfiler masks of part of the training and validation images miss most cells, and
@@ -129,6 +166,28 @@ python dataset_prep/fix_label_overflow.py --dataset data/HeLaCytoNuc/cytonucs_cl
 
 They write `excluded.json` (the dropped images, with annotated and visible nuclei) and `label_overflow.json` (the
 relabelled test masks) at the top of the view.
+
+**HeLa-MRC-5 spheroid split.** The merged volume is cut into 16 XY blocks of 512 px, each block in one split over
+the full Z (`patches_split_hela`). `--blocks` keeps the blocks of the paper (`dataset_prep/hela_spheroid_blocks.json`:
+12 train, 2 val, 2 test blocks). `add_train_regions.py` adds the whole volume for training crops inside the train
+blocks. `downscale_split.py` writes the copy at half XY resolution that the 3D models of the paper are trained on
+(`patches_split_hela_xy2`):
+
+```bash
+python dataset_prep/make_spatial_split_patches.py --image data/Cytonucs_Emese_Hela/images \
+    --nucleus-mask data/Cytonucs_Emese_Hela/nuc_masks --cytoplasm-mask data/Cytonucs_Emese_Hela/cyto_masks \
+    --output data/Cytonucs_Emese_Hela/patches_split_hela --blocks dataset_prep/hela_spheroid_blocks.json
+python dataset_prep/add_train_regions.py --dataset data/Cytonucs_Emese_Hela/patches_split_hela
+python dataset_prep/downscale_split.py --dataset data/Cytonucs_Emese_Hela/patches_split_hela \
+    --output data/Cytonucs_Emese_Hela/patches_split_hela_xy2
+```
+
+From the figshare files, these commands give the paper's merged volume, masks, val and test tiles and whole-volume
+training regions, byte for byte (at both resolutions). The 3D models train on crops of the whole volume
+(`training.train_region_crops`) and are scored on the whole held-out blocks, so they use the same data. The train
+tiles differ slightly: a few almost empty tiles are kept at random, and the augmented copies differ, because the
+random generator of the paper's run also served in-house volumes. They enter only the geometry measured at the start
+of training and the train-side metric.
 
 **Partial annotation variants** (paper, Tables 6 and 7): `dataset_prep/sparse_annotation.py` (nuclei in k cells),
 `dataset_prep/hide_level_by_blocks.py` (each level in different blocks), `dataset_prep/sparse_tiles.py` (levels
@@ -265,6 +324,7 @@ configs/                     configurations of the paper's models
 baselines/                   StarDist, HydraStarDist, Cellpose, InstanSeg and nnU-Net on the same splits
 dataset_prep/                converters of public datasets, clean-up, splits, partial annotation, synthetic data
 paper/                       analyses of the paper (inference timing, operating points, semantic gate, ...)
+Dockerfile, docker/          the Docker image, its entry point (docker/cytonucs) and docker/run.sh
 ```
 
 ## License, citation, contact

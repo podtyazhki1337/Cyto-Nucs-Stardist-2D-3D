@@ -7,6 +7,9 @@
 !/requirements.txt
 !/*.py
 !/config_cytonucs.json
+!/Dockerfile
+!/.dockerignore
+!/docker/
 /overfit.py
 /paper_queue.py
 /run_inference.py
@@ -24,6 +27,7 @@
 !/dataset_prep/
 /dataset_prep/*
 !/dataset_prep/*.py
+!/dataset_prep/hela_spheroid_blocks.json
 !/dataset_prep/synthetic/
 /dataset_prep/synthetic/*
 !/dataset_prep/synthetic/*.py
