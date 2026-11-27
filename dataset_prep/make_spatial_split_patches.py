@@ -18,6 +18,9 @@ Usage (all volumes of a folder; masks are found by name in their folders):
       --cytoplasm-mask CYTO_DIR --output OUT_DIR
 --image also takes one or several files. A mask folder is searched without subfolders for the file named like
 the image: same name, same stem, or the longest stem the image name starts with; else its only TIFF.
+--blocks FILE keeps the XY blocks and their splits of an earlier split instead of choosing them (the
+split_manifest.json of that split, or a file of the same form); the paper's HeLa-MRC-5 spheroid split is
+dataset_prep/hela_spheroid_blocks.json. The augmented train copies still follow --seed and the order of the volumes.
 """
 import argparse
 import itertools
@@ -249,8 +252,9 @@ def channel_signal(image, nucleus, cytoplasm):
 
 
 def build(volumes, output, patch_size=(16, 512, 512), train_stride=(8, 448, 448), augmentations=4,
-          val_fraction=0.15, test_fraction=0.15, seed=42):
-    """volumes: iterable of dict(name, image, nucleus ZYX, cytoplasm ZYX[, source]); it is read one volume at a time."""
+          val_fraction=0.15, test_fraction=0.15, seed=42, fixed_blocks=None):
+    """volumes: iterable of dict(name, image, nucleus ZYX, cytoplasm ZYX[, source]); it is read one volume at a time.
+    fixed_blocks: {volume name: [dict(y0, y1, x0, x1, split), ...]} to keep instead of choosing the blocks."""
     output = Path(output)
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f'{output} is not empty: choose a new output folder')
@@ -279,7 +283,15 @@ def build(volumes, output, patch_size=(16, 512, 512), train_stride=(8, 448, 448)
         image, nucleus, cytoplasm = pad_to_minimum_size(image, nucleus, cytoplasm, patch_size)
         depth, plane = nucleus.shape[0], nucleus.shape[1:]
         labelled = (nucleus > 0) | (cytoplasm > 0)
-        blocks, assignment = split_blocks(labelled.sum(0), patch_size[1:], val_fraction, test_fraction, seed + number)
+        if fixed_blocks is None:
+            blocks, assignment = split_blocks(labelled.sum(0), patch_size[1:], val_fraction, test_fraction, seed + number)
+        else:
+            if name not in fixed_blocks:
+                raise ValueError(f'{name}: the given blocks have no entry for this volume')
+            blocks = [(int(b['y0']), int(b['y1']), int(b['x0']), int(b['x1'])) for b in fixed_blocks[name]]
+            assignment = [b['split'] for b in fixed_blocks[name]]
+            if blocks != block_grid(plane, patch_size[1:]) or not set(assignment) <= set(SPLITS):
+                raise ValueError(f'{name}: the given blocks are not the block grid of this volume and patch size')
         region, block_of = {s: np.zeros(plane, bool) for s in SPLITS}, np.zeros(plane, int)
         for index, ((y0, y1, x0, x1), split) in enumerate(zip(blocks, assignment)):
             region[split][y0:y1, x0:x1] = True
@@ -346,8 +358,8 @@ def build(volumes, output, patch_size=(16, 512, 512), train_stride=(8, 448, 448)
     total = {s: {k: sum(d['summary'][s][k] for d in described) for k in ('blocks', 'files', 'originals', 'source_nuclei', 'source_cells')}
              for s in SPLITS}
     manifest = dict(patch_size=list(patch_size), train_stride=list(train_stride), augmentations_per_train_patch=augmentations,
-                    val_fraction=val_fraction, test_fraction=test_fraction, seed=seed, volumes=described, summary=total,
-                    skipped=skipped, files=rows)
+                    val_fraction=val_fraction, test_fraction=test_fraction, seed=seed, fixed_blocks=fixed_blocks is not None,
+                    volumes=described, summary=total, skipped=skipped, files=rows)
     (output / 'split_manifest.json').write_text(json.dumps(manifest, indent=2))
     return manifest
 
@@ -419,7 +431,11 @@ def main():
     parser.add_argument('--val-fraction', type=float, default=0.15)
     parser.add_argument('--test-fraction', type=float, default=0.15)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--blocks', help='keep the XY blocks and splits of this split_manifest.json (or a file of its form)')
     args = parser.parse_args()
+    fixed_blocks = None
+    if args.blocks:
+        fixed_blocks = {v['name']: v['blocks'] for v in json.loads(Path(args.blocks).read_text())['volumes']}
     images = source_images(args.image)
     if not images:
         parser.error('no TIFF found for --image')
@@ -441,7 +457,7 @@ def main():
                        source={k: dict(path=str(v), bytes=v.stat().st_size) for k, v in item.items()})
 
     manifest = build(volumes(), args.output, tuple(args.patch_size), tuple(args.train_stride), args.augmentations,
-                     args.val_fraction, args.test_fraction, args.seed)
+                     args.val_fraction, args.test_fraction, args.seed, fixed_blocks)
     for volume in manifest['volumes']:
         print(f"\n{volume['name']}: volume {volume['shape']}, nuclei are brightest in channel {volume['nucleus_channel']}")
         for region, means in volume['channel_means'].items():

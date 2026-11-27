@@ -78,5 +78,5 @@ The synthetic variants are made with `dataset_prep/sparse_tiles.py` (train split
 | `kits_e7`, `kits_e9` | KiTS23 before `kits_e8` (no object-centred crops, no nesting filter) and after it (more negative prompts inside kidneys) |
 
 The source images and instance annotations of the HeLa-MRC-5 spheroid (`Cytonucs_Emese_Hela`) are available at
-https://doi.org/10.6084/m9.figshare.24982227 (Piccinini and Diosdi, 2024); see the datasets of the paper in the main
-README. The EA.hy926 volumes are in-house data; their annotations will be released with the paper.
+https://doi.org/10.6084/m9.figshare.24982227 (Piccinini and Diosdi, 2024); `dataset_prep/hela_spheroid_from_figshare.py`
+downloads them and merges the four channel stacks, and the main README (datasets of the paper) gives the split. The EA.hy926 volumes are in-house data; their annotations will be released with the paper.
