@@ -185,7 +185,8 @@ def cytonucs(split, limit, argv, blocks=False):
         from evaluate_blocks import block_windows
         manifest = json.loads((dataset / 'split_manifest.json').read_text())
         factor = int(manifest.get('xy_downscale', 1))
-        native = Path(manifest['downscaled_from']) if factor > 1 else dataset
+        from score_native_resolution import native_dataset
+        native = native_dataset(dataset, manifest) if factor > 1 else dataset
         predictor = CytoNucsPredictor(model=model, config=cfg, **settings)
         cfg.tta_flips = bool(getattr(cfg, 'tta_flips', False))
         runner = SimpleNamespace(model=predictor.model)

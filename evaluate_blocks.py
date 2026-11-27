@@ -28,7 +28,7 @@ import numpy as np
 import tifffile
 from scipy import ndimage as ndi
 
-from score_native_resolution import TAUS, enlarge_labels
+from score_native_resolution import TAUS, enlarge_labels, native_dataset
 
 LEVEL_FILES = {'nucleus': 'nucleus_masks', 'cytoplasm': 'cytoplasm_masks'}
 
@@ -80,7 +80,7 @@ def evaluate(config_path, weights, splits=('test', 'val'), margin=192, save=None
     dataset = Path(raw['data']['dataset_dir'])
     manifest = json.loads((dataset / 'split_manifest.json').read_text())
     factor = int(manifest.get('xy_downscale', 1))
-    native = Path(manifest['downscaled_from']) if factor > 1 else dataset
+    native = native_dataset(dataset, manifest) if factor > 1 else dataset
     native_manifest = json.loads((native / 'split_manifest.json').read_text())
     raw['mode'] = 'inference'
     raw['inference']['checkpoint_path'] = str(weights)

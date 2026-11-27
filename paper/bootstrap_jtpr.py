@@ -11,6 +11,9 @@ import numpy as np, tifffile
 from score_hierarchy import ground_truth, score_image
 from cytonucs_inference import compute_jtpr
 
+if len(sys.argv) < 5 or sys.argv[1] in ('-h', '--help'):
+    print(__doc__)
+    sys.exit(0 if sys.argv[1:2] in (['-h'], ['--help']) else 2)
 data, split, out = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
 methods = [a.split('=', 1) for a in sys.argv[4:]]
 levels = ['nucleus', 'cytoplasm']; pairs = [('nucleus', 'cytoplasm')]; key = 'nucleus_cytoplasm'
