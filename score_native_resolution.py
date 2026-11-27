@@ -27,13 +27,25 @@ import tifffile
 TAUS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
 
 
+def native_dataset(dataset, manifest=None):
+    """The native dataset of a downscaled copy: 'downscaled_from' of its split_manifest.json or, when that path is not
+    there (the data were moved, or a container mounts them elsewhere), the folder of the same name next to the copy."""
+    dataset = Path(dataset)
+    manifest = manifest or json.loads((dataset / 'split_manifest.json').read_text())
+    recorded = Path(manifest['downscaled_from'])
+    for candidate in (recorded, dataset.parent / recorded.name):
+        if (candidate / 'split_manifest.json').is_file():
+            return candidate
+    raise FileNotFoundError(f'{dataset}: its native dataset {recorded} is not there, nor next to it')
+
+
 def downscaling(dataset):
     """(native dataset, factor) recorded in split_manifest.json by dataset_prep/downscale_split.py."""
     manifest = json.loads((Path(dataset) / 'split_manifest.json').read_text())
     factor = int(manifest.get('xy_downscale', 1))
     if factor < 2 or not manifest.get('downscaled_from'):
         raise ValueError(f'{dataset} is not a downscaled copy (no xy_downscale / downscaled_from in split_manifest.json)')
-    return Path(manifest['downscaled_from']), factor
+    return native_dataset(dataset, manifest), factor
 
 
 def enlarge_labels(labels, factor, shape):

@@ -17,7 +17,7 @@ RUN apt-get update \
 # The versions of the tested environment (docker/constraints.txt) within the ranges of requirements.txt
 COPY requirements.txt docker/constraints.txt /tmp/build/
 RUN pip install --no-cache-dir -r /tmp/build/requirements.txt -c /tmp/build/constraints.txt \
- && pip install --no-cache-dir -c /tmp/build/constraints.txt nibabel huggingface_hub setuptools \
+ && pip install --no-cache-dir -c /tmp/build/constraints.txt nibabel setuptools \
  && pip install --no-cache-dir --no-deps -c /tmp/build/constraints.txt edt \
  && rm -rf /tmp/build
 

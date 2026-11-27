@@ -5,9 +5,12 @@ nuclei inside cells) in 2D images and 3D volumes, including anisotropic ones. Ev
 instance mask, and every child object is linked to its parent; a cell may hold several nuclei. Levels may be
 annotated in parts of the training data only.
 
-- [How it works](#how-it-works)
-- [Installation](#installation)
+![CytoNucs segments nested objects and links them across levels: a nucleus linked to its cell in a spheroid, a renal mass linked to its kidney in CT](docs/figures/graphical_abstract.png)
+
 - [Quick start](#quick-start)
+- [Installation](#installation)
+- [How it works](#how-it-works)
+- [Results of the paper](#results-of-the-paper)
 - [Data layout](#data-layout)
 - [Datasets of the paper](#datasets-of-the-paper)
 - [Training](#training)
@@ -19,9 +22,68 @@ annotated in parts of the training data only.
 - [Repository layout](#repository-layout)
 - [License, citation, contact](#license-citation-contact)
 
+## Quick start
+
+Segment a folder of images with a pretrained model of the paper (Linux, NVIDIA GPU, Docker with the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)):
+
+```bash
+git clone https://github.com/podtyazhki1337/Cyto-Nucs-Stardist-2D-3D.git
+cd Cyto-Nucs-Stardist-2D-3D
+docker/run.sh segment helacytonuc_e7_clean my_images my_labels
+```
+
+The first run pulls the image [podtyazhki1337/cytonucs](https://hub.docker.com/r/podtyazhki1337/cytonucs) and
+downloads the model from [Hugging Face](https://huggingface.co/Podtyazhki1337/cytonucs) into `models/`. It writes
+`my_labels/nucleus/<name>` and `my_labels/cytoplasm/<name>` (instance labels) and `my_labels/parents/<stem>.json` (the
+cell of every nucleus). `docker/run.sh models` lists the models: TissueNet, HeLaCytoNuc, BBBC020, KiTS23, the HeLa-MRC-5
+spheroid, the synthetic three-level and partial-annotation models. The images need the channels the model was trained
+on (see the [datasets](#datasets-of-the-paper) and the model card).
+
+Without Docker, after the [installation](#installation):
+
+```bash
+hf download Podtyazhki1337/cytonucs --include "helacytonuc_e7_clean/*" --local-dir models
+python predict.py --config models/helacytonuc_e7_clean/config.json \
+    --weights models/helacytonuc_e7_clean/weights_best.weights.h5 --input my_images/ --output my_labels/
+```
+
+## Installation
+
+**Docker.** Nothing to install besides Docker and the NVIDIA Container Toolkit. `docker/run.sh` runs any command of
+this README in the image, as the current user, with `data/` (datasets), `runs/` (run folders) and `models/` of the
+current folder mounted where the configurations expect them:
+
+```bash
+docker/run.sh python train_cytonucs.py configs/helacytonuc_e7_clean.json
+docker/run.sh bash                     # a shell in the image
+```
+
+- Other files of the current folder are under `/work` in the container (e.g. `--config /work/my_config.json`).
+- `CYTONUCS_GPUS=device=1` picks a GPU, `CYTONUCS_GPUS=none` runs on the CPU; `CYTONUCS_DATA`, `CYTONUCS_RUNS` and
+  `CYTONUCS_MODELS` mount other folders.
+- `docker build -t podtyazhki1337/cytonucs .` builds the image from this repository. On Docker Hub, `latest` follows
+  this repository; the other tags name the commit an image was built from.
+- The image holds CytoNucs, StarDist and HydraStarDist. Cellpose, InstanSeg and nnU-Net need environments of their
+  own (see [Baselines](#baselines)).
+
+**Python environment.** Python 3.10 and an NVIDIA GPU (tested on RTX A5000, 24 GB; inference also runs on the CPU,
+slowly):
+
+```bash
+conda create -n cytonucs python=3.10 && conda activate cytonucs
+pip install -r requirements.txt
+pip install --no-deps edt      # optional: several times faster StarDist targets
+```
+
+Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1.26 (the exact set of the paper is
+`docker/constraints.txt`).
+
 ## How it works
 
 CytoNucs keeps StarDist [1, 2] at its core and adds a promptable mask refinement:
+
+![Overview of CytoNucs: shared encoder and one decoder per level, proposal-guided mask refinement, assembly and linking](docs/figures/figure_2_overview.png)
 
 1. **Proposals.** A shared U-Net predicts, for every level, a StarDist object probability and star-convex ray
    distances. The peaks of the probability are the object proposals.
@@ -48,75 +110,29 @@ Training adds to the StarDist losses (probability BCE, ray MAE):
 After training, the inference thresholds (proposal probability, mask threshold, quality and size gates, nesting
 filters) are calibrated on the validation set for the checkpoint metric, half linked JTPR and half mean AP.
 
-## Installation
+## Results of the paper
 
-Python 3.10 and an NVIDIA GPU (tested on RTX A5000, 24 GB; inference also runs on the CPU, slowly).
+Figures of the paper (in preparation); [Evaluation](#evaluation) defines AP and linked JTPR.
 
-```bash
-git clone https://github.com/podtyazhki1337/Cyto-Nucs-Stardist-2D-3D.git
-cd Cyto-Nucs-Stardist-2D-3D
-conda create -n cytonucs python=3.10 && conda activate cytonucs
-pip install -r requirements.txt
-pip install --no-deps edt      # optional: several times faster StarDist targets
-```
+**2D microscopy.** AP against linked JTPR on TissueNet, HeLaCytoNuc and BBBC020, every method at its own settings and
+calibrated on validation for the same objective, and one annotated nucleus-cell pair per dataset.
 
-Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1.26.
+![Per-level accuracy and linked pair recovery in 2D microscopy](docs/figures/figure_3_2d_results.jpg)
 
-### Docker
+**3D.** A nucleus-cell pair of the HeLa-MRC-5 spheroid in three planes and in 3D (CytoNucs and StarDist-3D), and
+kidney-mass pairs in KiTS23 CT (CytoNucs and nnU-Net).
 
-The image [podtyazhki1337/cytonucs](https://hub.docker.com/r/podtyazhki1337/cytonucs) holds the code and the exact
-versions of the tested environment (`docker/constraints.txt`). The host needs only the NVIDIA driver and the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-(without a GPU, leave out `--gpus`, or set `CYTONUCS_GPUS=none`, and it runs on the CPU).
+![Recovery of nested instances in a 3D spheroid and in abdominal CT](docs/figures/figure_4_3d_results.jpg)
 
-```bash
-docker pull podtyazhki1337/cytonucs          # or build it here: docker build -t podtyazhki1337/cytonucs .
-docker/run.sh segment helacytonuc_e7_clean my_images my_labels
-```
+**Partial annotation and a third level.** Nuclei annotated in a few training cells, or nuclei and cells in different
+blocks; nucleoli, nuclei and cells on synthetic volumes with sparse nucleolus annotation.
 
-The tag `latest` follows this repository; `8762717` is the image of that commit.
+![Learning from partial annotations and extending to a third hierarchy level](docs/figures/figure_5_partial_annotation.jpg)
 
-`docker/run.sh` runs a command of the image as the current user, with the folders `data/` (datasets), `runs/` (run
-folders) and `models/` (pretrained models) of the current folder mounted where the configurations expect them.
-`segment MODEL INPUT OUTPUT` downloads a model of [Podtyazhki1337/cytonucs](https://huggingface.co/Podtyazhki1337/cytonucs)
-into `models/` on first use and runs `predict.py` (`docker/run.sh models` lists the models). Any other command runs in
-the code folder of the image, so the commands of this README work as they are:
+**Joint or separate networks, and the parts of CytoNucs.** Separate nucleus and cell networks against the joint model
+at matched calibration, the sources of cell candidates, and the gain from the prompted mask refinement.
 
-```bash
-docker/run.sh python train_cytonucs.py configs/helacytonuc_e7_clean.json
-docker/run.sh python score_hierarchy.py --config configs/helacytonuc_e7_clean.json \
-    --weights runs/helacytonuc_e7_clean/weights_best.weights.h5 --split test --output runs/helacytonuc_e7_clean/hierarchy_test.json
-docker/run.sh bash
-```
-
-Files of the current folder are under `/work` inside the container (e.g. `--config /work/my_config.json`).
-`CYTONUCS_GPUS=device=1` picks a GPU; `CYTONUCS_DATA`, `CYTONUCS_RUNS` and `CYTONUCS_MODELS` mount other folders.
-Without the script, the same is (the mounted folders must exist, or Docker creates them owned by root):
-
-```bash
-mkdir -p models my_labels
-docker run --rm --gpus all --user "$(id -u):$(id -g)" -v "$PWD/models:/opt/cytonucs/models" \
-    -v "$PWD/my_images:/in:ro" -v "$PWD/my_labels:/out" podtyazhki1337/cytonucs segment helacytonuc_e7_clean /in /out
-```
-
-The image covers CytoNucs, StarDist and HydraStarDist. Cellpose, InstanSeg and nnU-Net need environments of their
-own (see [Baselines](#baselines)).
-
-## Quick start
-
-Pretrained models of the paper are on Hugging Face: [Podtyazhki1337/cytonucs](https://huggingface.co/Podtyazhki1337/cytonucs)
-(TissueNet, HeLaCytoNuc, BBBC020, KiTS23, the HeLa-MRC-5 spheroid, and the synthetic three-level and partial-annotation
-models; the model card lists their inputs and scores). Download one and segment a folder of images:
-
-```bash
-hf download Podtyazhki1337/cytonucs --include "helacytonuc_e7_clean/*" --local-dir models
-python predict.py --config models/helacytonuc_e7_clean/config.json \
-    --weights models/helacytonuc_e7_clean/weights_best.weights.h5 --input my_images/ --output my_labels/
-```
-
-This writes `my_labels/nucleus/<name>` and `my_labels/cytoplasm/<name>` (instance labels) and
-`my_labels/parents/<stem>.json` (the cell of every nucleus). The images need the channels the model was trained on
-(see the table of [datasets](#datasets-of-the-paper)).
+![Calibration of separate and joint models, sources of cell candidates, and prompted mask refinement](docs/figures/figure_6_ablations.jpg)
 
 ## Data layout
 
@@ -246,6 +262,8 @@ python evaluate_blocks.py --config my_config.json --weights runs/my_run/weights_
   are missed (`fail_inner`, `fail_outer`, `fail_link`) and, with `--jtpr-ious`, the JTPR at other IoU thresholds.
 - **Metrics of the HydraStarDist paper** [7]: IoUR, AP and the joint TP rates over children and over parents at
   τ = 0.1-0.9 (`paper_<pair>`), for comparison with that paper.
+
+![Linked JTPR: a pair counts only when both objects are matched and correctly linked](docs/figures/figure_1_linked_jtpr.png)
 
 Scores are kept per image (`records`), so bootstrap intervals and breakdowns are computed without predicting again.
 `calibrate_inference.py` calibrates the `auto` inference settings of a configuration for given weights again (e.g.

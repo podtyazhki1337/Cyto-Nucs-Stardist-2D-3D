@@ -17,10 +17,14 @@ import json
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
 import tifffile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # the repository root
+from score_native_resolution import native_dataset
 
 MASKS = dict(nucleus='nucleus_masks', cytoplasm='cytoplasm_masks')
 
@@ -47,7 +51,7 @@ def hide_levels(dataset, output, hide, unknown_label=65535):
         raise FileExistsError(output)
     manifest = json.loads((dataset / 'split_manifest.json').read_text())
     factor = int(manifest.get('xy_downscale', 1))
-    native = json.loads((Path(manifest['downscaled_from']) / 'split_manifest.json').read_text()) if factor > 1 else manifest
+    native = json.loads((native_dataset(dataset, manifest) / 'split_manifest.json').read_text()) if factor > 1 else manifest
     by_index = {b['index']: b for v in native['volumes'] for b in v['blocks']}
     blocks = {}
     for level, indices in hide.items():

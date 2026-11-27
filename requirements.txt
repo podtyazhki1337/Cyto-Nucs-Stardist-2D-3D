@@ -13,6 +13,7 @@ opencv-python
 matplotlib
 h5py
 pillow
+huggingface_hub   # pretrained models: hf download
 # Optional:
 #   edt        faster StarDist targets: pip install --no-deps edt
 #   nibabel    KiTS23 conversion (dataset_prep/kits23_to_cytonucs.py)
