@@ -1,0 +1,58 @@
+{
+  "title": "CytoNucs: Hierarchical Instance Segmentation in 2D and 3D with StarDist-Guided Mask Refinement (code)",
+  "upload_type": "software",
+  "description": "<p>Code of CytoNucs, a hierarchical instance segmentation framework with StarDist-guided mask refinement: training, inference, scoring (AP and linked JTPR), dataset converters, the baselines on the same splits and the analyses of the paper.</p><p>Many objects in biomedical images form hierarchies: nuclei belong to cells, nucleoli to nuclei, and lesions to organs. Quantitative analysis requires both instance masks and the links between related objects. A shared network generates object proposals whose locations and extents define prompts for jointly trained mask refinement branches. Each child prompt predicts masks for both the child and its parent. Separate parent proposals can recover parents without a detected child. The resulting instances are linked using spatial overlap and the masks predicted from the same prompt.</p><p>Pretrained models: https://huggingface.co/Podtyazhki1337/cytonucs (baselines: https://huggingface.co/Podtyazhki1337/cytonucs-baselines). Docker image: https://hub.docker.com/r/podtyazhki1337/cytonucs. Synthetic data: https://huggingface.co/datasets/Podtyazhki1337/cytonucs-synthetic.</p>",
+  "creators": [
+    {
+      "name": "Maiurov, Miroslav",
+      "orcid": "0009-0005-5935-6452"
+    },
+    {
+      "name": "Horváth, Péter",
+      "orcid": "0000-0002-4492-1798"
+    }
+  ],
+  "license": "MIT",
+  "keywords": [
+    "hierarchical instance segmentation",
+    "nested objects",
+    "StarDist",
+    "promptable segmentation",
+    "nucleus and cell segmentation",
+    "3D microscopy",
+    "computed tomography",
+    "deep learning"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/podtyazhki1337/Cyto-Nucs-Stardist-2D-3D",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://huggingface.co/Podtyazhki1337/cytonucs",
+      "relation": "isSupplementedBy",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://huggingface.co/Podtyazhki1337/cytonucs-baselines",
+      "relation": "isSupplementedBy",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://hub.docker.com/r/podtyazhki1337/cytonucs",
+      "relation": "isSupplementedBy",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://huggingface.co/datasets/Podtyazhki1337/cytonucs-synthetic",
+      "relation": "isSupplementedBy",
+      "scheme": "url"
+    },
+    {
+      "identifier": "10.6084/m9.figshare.24982227",
+      "relation": "references",
+      "scheme": "doi"
+    }
+  ]
+}
