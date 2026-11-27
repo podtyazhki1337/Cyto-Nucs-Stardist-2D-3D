@@ -1,5 +1,7 @@
 # CytoNucs: nested instance segmentation with StarDist and prompted mask refinement
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24581960.svg)](https://doi.org/10.5281/zenodo.24581960)
+
 CytoNucs segments objects that lie inside other objects (nuclei inside cells, tumours inside kidneys, nucleoli inside
 nuclei inside cells) in 2D images and 3D volumes, including anisotropic ones. Every object of every level gets an
 instance mask, and every child object is linked to its parent; a cell may hold several nuclei. Levels may be
@@ -353,7 +355,14 @@ Dockerfile, docker/          the Docker image, its entry point (docker/cytonucs)
 Code: MIT licence (`LICENSE`); the vendored HydraStarDist package keeps its BSD-3-Clause licence. The datasets have
 licences of their own (see the table above).
 
-The paper describing CytoNucs is in preparation; a citation will be added here.
+The paper describing CytoNucs is in preparation; a citation will be added here. To cite the code, use its Zenodo
+archive (`CITATION.cff`; GitHub shows it under "Cite this repository"):
+
+> Maiurov, M., Horváth, P. (2026). CytoNucs: Hierarchical Instance Segmentation in 2D and 3D with StarDist-Guided
+> Mask Refinement (code). Zenodo. https://doi.org/10.5281/zenodo.24581960
+
+This DOI covers all versions and resolves to the latest; release v.1.0.1 has its own DOI,
+[10.5281/zenodo.24582060](https://doi.org/10.5281/zenodo.24582060).
 
 Contact: mayurovm@gmail.com
 
