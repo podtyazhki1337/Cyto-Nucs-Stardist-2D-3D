@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "CytoNucs: Hierarchical Instance Segmentation in 2D and 3D with StarDist-Guided Mask Refinement"
+authors:
+  - family-names: Maiurov
+    given-names: Miroslav
+    orcid: "https://orcid.org/0009-0005-5935-6452"
+  - family-names: Horváth
+    given-names: Péter
+    orcid: "https://orcid.org/0000-0002-4492-1798"
+license: MIT
+repository-code: "https://github.com/podtyazhki1337/Cyto-Nucs-Stardist-2D-3D"
+url: "https://huggingface.co/Podtyazhki1337/cytonucs"
+keywords:
+  - hierarchical instance segmentation
+  - nested objects
+  - StarDist
+  - promptable segmentation
+  - nucleus and cell segmentation
+  - 3D microscopy
+  - computed tomography
+abstract: >-
+  CytoNucs segments objects that lie inside other objects (nuclei inside cells, nucleoli inside nuclei, renal masses
+  inside kidneys) in 2D images and 3D volumes and links every child to its parent. A shared network generates
+  StarDist object proposals whose locations and extents define prompts for jointly trained mask refinement branches;
+  each child prompt predicts masks for both the child and its parent.

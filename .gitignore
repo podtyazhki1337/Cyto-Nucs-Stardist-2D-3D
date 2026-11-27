@@ -4,6 +4,8 @@
 !/.gitignore
 !/README.md
 !/LICENSE
+!/CITATION.cff
+!/.zenodo.json
 !/requirements.txt
 !/*.py
 !/config_cytonucs.json
