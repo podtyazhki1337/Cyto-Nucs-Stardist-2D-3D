@@ -10,6 +10,9 @@
 !/Dockerfile
 !/.dockerignore
 !/docker/
+!/docs/
+/docs/*
+!/docs/figures/
 /overfit.py
 /paper_queue.py
 /run_inference.py

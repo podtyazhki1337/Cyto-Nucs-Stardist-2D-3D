@@ -5,9 +5,12 @@ nuclei inside cells) in 2D images and 3D volumes, including anisotropic ones. Ev
 instance mask, and every child object is linked to its parent; a cell may hold several nuclei. Levels may be
 annotated in parts of the training data only.
 
+![CytoNucs segments nested objects and links them across levels: a nucleus linked to its cell in a spheroid, a renal mass linked to its kidney in CT](docs/figures/graphical_abstract.png)
+
 - [Quick start](#quick-start)
 - [Installation](#installation)
 - [How it works](#how-it-works)
+- [Results of the paper](#results-of-the-paper)
 - [Data layout](#data-layout)
 - [Datasets of the paper](#datasets-of-the-paper)
 - [Training](#training)
@@ -80,6 +83,8 @@ Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1
 
 CytoNucs keeps StarDist [1, 2] at its core and adds a promptable mask refinement:
 
+![Overview of CytoNucs: shared encoder and one decoder per level, proposal-guided mask refinement, assembly and linking](docs/figures/figure_2_overview.png)
+
 1. **Proposals.** A shared U-Net predicts, for every level, a StarDist object probability and star-convex ray
    distances. The peaks of the probability are the object proposals.
 2. **Prompted refinement.** Each proposal becomes a prompt: a Gaussian at the peak, sized by its rays. A light
@@ -104,6 +109,30 @@ Training adds to the StarDist losses (probability BCE, ray MAE):
 
 After training, the inference thresholds (proposal probability, mask threshold, quality and size gates, nesting
 filters) are calibrated on the validation set for the checkpoint metric, half linked JTPR and half mean AP.
+
+## Results of the paper
+
+Figures of the paper (in preparation); [Evaluation](#evaluation) defines AP and linked JTPR.
+
+**2D microscopy.** AP against linked JTPR on TissueNet, HeLaCytoNuc and BBBC020, every method at its own settings and
+calibrated on validation for the same objective, and one annotated nucleus-cell pair per dataset.
+
+![Per-level accuracy and linked pair recovery in 2D microscopy](docs/figures/figure_3_2d_results.jpg)
+
+**3D.** A nucleus-cell pair of the HeLa-MRC-5 spheroid in three planes and in 3D (CytoNucs and StarDist-3D), and
+kidney-mass pairs in KiTS23 CT (CytoNucs and nnU-Net).
+
+![Recovery of nested instances in a 3D spheroid and in abdominal CT](docs/figures/figure_4_3d_results.jpg)
+
+**Partial annotation and a third level.** Nuclei annotated in a few training cells, or nuclei and cells in different
+blocks; nucleoli, nuclei and cells on synthetic volumes with sparse nucleolus annotation.
+
+![Learning from partial annotations and extending to a third hierarchy level](docs/figures/figure_5_partial_annotation.jpg)
+
+**Joint or separate networks, and the parts of CytoNucs.** Separate nucleus and cell networks against the joint model
+at matched calibration, the sources of cell candidates, and the gain from the prompted mask refinement.
+
+![Calibration of separate and joint models, sources of cell candidates, and prompted mask refinement](docs/figures/figure_6_ablations.jpg)
 
 ## Data layout
 
@@ -233,6 +262,8 @@ python evaluate_blocks.py --config my_config.json --weights runs/my_run/weights_
   are missed (`fail_inner`, `fail_outer`, `fail_link`) and, with `--jtpr-ious`, the JTPR at other IoU thresholds.
 - **Metrics of the HydraStarDist paper** [7]: IoUR, AP and the joint TP rates over children and over parents at
   τ = 0.1-0.9 (`paper_<pair>`), for comparison with that paper.
+
+![Linked JTPR: a pair counts only when both objects are matched and correctly linked](docs/figures/figure_1_linked_jtpr.png)
 
 Scores are kept per image (`records`), so bootstrap intervals and breakdowns are computed without predicting again.
 `calibrate_inference.py` calibrates the `auto` inference settings of a configuration for given weights again (e.g.
