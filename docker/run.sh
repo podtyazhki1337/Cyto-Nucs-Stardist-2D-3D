@@ -7,11 +7,12 @@
 #   docker/run.sh python train_cytonucs.py configs/helacytonuc_e7_clean.json
 #   docker/run.sh bash
 #
-# Environment: CYTONUCS_IMAGE (default cytonucs), CYTONUCS_GPUS (default all; e.g. device=1, or none for the CPU),
+# Environment: CYTONUCS_IMAGE (default podtyazhki1337/cytonucs from Docker Hub, pulled on first use),
+# CYTONUCS_GPUS (default all; e.g. device=1, or none for the CPU),
 # CYTONUCS_DATA, CYTONUCS_RUNS, CYTONUCS_MODELS (other host folders for data/, runs/, models/).
 set -euo pipefail
 
-image=${CYTONUCS_IMAGE:-cytonucs}
+image=${CYTONUCS_IMAGE:-podtyazhki1337/cytonucs}
 data=${CYTONUCS_DATA:-$PWD/data}
 runs=${CYTONUCS_RUNS:-$PWD/runs}
 models=${CYTONUCS_MODELS:-$PWD/models}

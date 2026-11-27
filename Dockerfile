@@ -2,8 +2,8 @@
 # (TensorFlow 2.18 with the CUDA libraries of its pip wheels; the host needs only the NVIDIA driver and the
 # NVIDIA Container Toolkit).
 #
-#   docker build -t cytonucs .
-#   docker run --rm cytonucs help
+#   docker build -t podtyazhki1337/cytonucs .      (or: docker pull podtyazhki1337/cytonucs)
+#   docker run --rm podtyazhki1337/cytonucs help
 #
 # docker/run.sh runs the image with the data/, runs/ and models/ folders of the current folder mounted;
 # see "Docker" in README.md.

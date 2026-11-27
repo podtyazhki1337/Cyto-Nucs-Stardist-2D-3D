@@ -64,14 +64,17 @@ Main versions: TensorFlow 2.18 (Keras 3), StarDist 0.9.1, CSBDeep 0.8.1, NumPy 1
 
 ### Docker
 
-The image holds the code and the exact versions of the tested environment (`docker/constraints.txt`); the host needs
-only the NVIDIA driver and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+The image [podtyazhki1337/cytonucs](https://hub.docker.com/r/podtyazhki1337/cytonucs) holds the code and the exact
+versions of the tested environment (`docker/constraints.txt`). The host needs only the NVIDIA driver and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 (without a GPU, leave out `--gpus`, or set `CYTONUCS_GPUS=none`, and it runs on the CPU).
 
 ```bash
-docker build -t cytonucs .
+docker pull podtyazhki1337/cytonucs          # or build it here: docker build -t podtyazhki1337/cytonucs .
 docker/run.sh segment helacytonuc_e7_clean my_images my_labels
 ```
+
+The tag `latest` follows this repository; `8762717` is the image of that commit.
 
 `docker/run.sh` runs a command of the image as the current user, with the folders `data/` (datasets), `runs/` (run
 folders) and `models/` (pretrained models) of the current folder mounted where the configurations expect them.
@@ -93,7 +96,7 @@ Without the script, the same is (the mounted folders must exist, or Docker creat
 ```bash
 mkdir -p models my_labels
 docker run --rm --gpus all --user "$(id -u):$(id -g)" -v "$PWD/models:/opt/cytonucs/models" \
-    -v "$PWD/my_images:/in:ro" -v "$PWD/my_labels:/out" cytonucs segment helacytonuc_e7_clean /in /out
+    -v "$PWD/my_images:/in:ro" -v "$PWD/my_labels:/out" podtyazhki1337/cytonucs segment helacytonuc_e7_clean /in /out
 ```
 
 The image covers CytoNucs, StarDist and HydraStarDist. Cellpose, InstanSeg and nnU-Net need environments of their
