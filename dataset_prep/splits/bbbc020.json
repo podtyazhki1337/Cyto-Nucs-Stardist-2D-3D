@@ -1,0 +1,31 @@
+{
+ "description": "BBBC020 as converted by dataset_prep/bbbc020_to_cytonucs.py --factor 1 (native resolution): images per split.",
+ "splits": {
+  "train": [
+   "jw-15min_1.tif",
+   "jw-15min_3.tif",
+   "jw-15min_4.tif",
+   "jw-15min_5.tif",
+   "jw-1h_2.tif",
+   "jw-1h_4.tif",
+   "jw-24h_1.tif",
+   "jw-24h_2.tif",
+   "jw-24h_3.tif",
+   "jw-24h_4.tif",
+   "jw-2h_2.tif",
+   "jw-Kontrolle3.tif"
+  ],
+  "val": [
+   "jw-1h_1.tif",
+   "jw-1h_3.tif",
+   "jw-Kontrolle1.tif",
+   "jw-Kontrolle2.tif"
+  ],
+  "test": [
+   "jw-15min_2.tif",
+   "jw-1h_5.tif",
+   "jw-24h_5.tif",
+   "jw-2h_1.tif"
+  ]
+ }
+}
