@@ -33,6 +33,10 @@
 /dataset_prep/*
 !/dataset_prep/*.py
 !/dataset_prep/hela_spheroid_blocks.json
+!/dataset_prep/splits/
+/dataset_prep/splits/*
+!/dataset_prep/splits/*.json
+!/dataset_prep/splits/README.md
 !/dataset_prep/synthetic/
 /dataset_prep/synthetic/*
 !/dataset_prep/synthetic/*.py
